@@ -233,11 +233,12 @@ void PrintSummary(const std::vector<BenchmarkResult>& all_results) {
 void RunBenchmarks() {
   // --- Define Benchmark Configurations ---
   std::vector<int> batch_sizes = {1, 2, 4, 8};
-  std::vector<int> vocab_sizes = {201088, 151646, 128256, 102400, 32000};  // GPT-OSS 201088, LLAMA2 32000, LLAMA3 128256, DeepSeek 102400, QWen3 1516465
-                                                                           //   std::vector<int> vocab_sizes;
-                                                                           //   for (int v = 10240; v < 4096*64; v += 10240){
-                                                                           //     vocab_sizes.push_back(v);
-                                                                           //   }
+  // std::vector<int> vocab_sizes = {201088, 151646, 128256, 102400, 32000};  // GPT-OSS 201088, LLAMA2 32000, LLAMA3 128256, DeepSeek 102400, QWen3 1516465
+  std::vector<int> vocab_sizes;
+  for (int v = 512*32; v < 4096*128; v += 10240){
+    vocab_sizes.push_back(v);
+  }
+
   std::vector<int> ks = {50, 1, 8, 16, 32, 64};
 
   // By default, only test the first combination. Change it to True to test all combinations.
