@@ -125,144 +125,113 @@ __global__ void FindBlockTopK_BitonicSort(const float* scores_in,
   }
 }
 
-// NEW KERNEL for pairwise on-device reduction.
-// Each thread block merges two sorted lists of size K into one sorted list of size K.
+// FUSED REDUCTION KERNEL: Each block reduces multiple partitions.
 template <int kBlockSize, int K>
-__global__ void PairwiseReduceTopK(const float* scores_in, const int* indices_in,
-                                   float* scores_out, int* indices_out,
-                                   int num_partitions_in) {
+__global__ void BlockReduceTopK(const float* scores_in, const int* indices_in,
+                                float* scores_out, int* indices_out,
+                                int num_partitions_in, int partitions_per_block) {
   const int batch_idx = blockIdx.y;
-  const int output_partition_idx = blockIdx.x;
+  const int block_start_partition = blockIdx.x * partitions_per_block;
 
-  // Each thread block handles the merge of two partitions into one.
-  const int input_partition_idx1 = output_partition_idx * 2;
-  const int input_partition_idx2 = output_partition_idx * 2 + 1;
+  // Determine how many partitions this block needs to process.
+  // The last block might have fewer than `partitions_per_block`.
+  const int num_partitions_to_process = min(partitions_per_block, num_partitions_in - block_start_partition);
 
-  // Shared memory to hold the 2*K candidates from the two partitions.
+  if (num_partitions_to_process <= 0) {
+    return;
+  }
+
+  // Shared memory for merging. Needs space for 2*K elements.
   __shared__ float smem_scores[K * 2];
   __shared__ int smem_indices[K * 2];
 
   const int in_base_offset = batch_idx * num_partitions_in * K;
-  const int num_output_partitions = (num_partitions_in + 1) / 2;
-  const int out_base_offset = (batch_idx * num_output_partitions + output_partition_idx) * K;
+  const int out_base_offset = (batch_idx * gridDim.x + blockIdx.x) * K;
 
-  // Step 1: Cooperatively load the 2*K elements into shared memory.
+  // Step 1: Load the first partition for this block directly into the first half of shared memory.
+  int first_partition_offset = in_base_offset + block_start_partition * K;
   for (int i = threadIdx.x; i < K; i += kBlockSize) {
-    // Load from first partition
-    int p1_offset = in_base_offset + input_partition_idx1 * K + i;
-    smem_scores[i] = scores_in[p1_offset];
-    smem_indices[i] = indices_in[p1_offset];
-
-    // Load from second partition (if it exists)
-    if (input_partition_idx2 < num_partitions_in) {
-      int p2_offset = in_base_offset + input_partition_idx2 * K + i;
-      smem_scores[K + i] = scores_in[p2_offset];
-      smem_indices[K + i] = indices_in[p2_offset];
-    } else {
-      // If there's an odd number of partitions, the last one is just passed through.
-      // Pad with minimum values.
-      smem_scores[K + i] = -std::numeric_limits<float>::max();
-      smem_indices[K + i] = -1;
-    }
+    smem_scores[i] = scores_in[first_partition_offset + i];
+    smem_indices[i] = indices_in[first_partition_offset + i];
   }
-  __syncthreads();
 
-  // Step 2: Perform a full bitonic sort on the 2*K elements in shared memory.
-  SharedMemBitonicSort<kBlockSize, K * 2>(smem_scores, smem_indices);
+  // Step 2: Iteratively merge the remaining partitions assigned to this block.
+  for (int p = 1; p < num_partitions_to_process; ++p) {
+    __syncthreads(); // Ensure the previous merge is complete.
 
-  // Step 3: Write the top K results back to global memory.
+    // Load the next partition into the second half of shared memory.
+    int current_partition_offset = in_base_offset + (block_start_partition + p) * K;
+    for (int i = threadIdx.x; i < K; i += kBlockSize) {
+      smem_scores[K + i] = scores_in[current_partition_offset + i];
+      smem_indices[K + i] = indices_in[current_partition_offset + i];
+    }
+    __syncthreads(); // Ensure data is loaded before sorting.
+
+    // Sort the combined 2*K elements. The top K will be at the beginning.
+    SharedMemBitonicSort<kBlockSize, K * 2>(smem_scores, smem_indices);
+  }
+
+  // Step 3: Write the final top K result for this block to global memory.
   for (int i = threadIdx.x; i < K; i += kBlockSize) {
     indices_out[out_base_offset + i] = smem_indices[i];
     scores_out[out_base_offset + i] = smem_scores[i];
   }
 }
 
+
 void RunTopKViaMapReduceBitonicSort(SamplingData* data, cudaStream_t stream, float* scores_in, float* scores_out, int* indices_out, int vocab_size, int batch_size, int k, float temperature, int num_partitions, int sort_size) {
   constexpr int block_size = 256;
   const int max_k = kBitonicSortMaxK; // The fixed size of intermediate results
 
   // Stage 1: Map Phase - Find top-k within each partition of the vocabulary.
-  // This produces `num_partitions` sorted lists of size `max_k`.
   dim3 grid_stage1(num_partitions, batch_size);
   dim3 block_stage1(block_size);
 
-  // Use scores_buffer for intermediate scores to avoid conflicts with ping-pong buffers.
   switch (sort_size) {
     case 512:
-      FindBlockTopK_BitonicSort<block_size, 512><<<grid_stage1, block_stage1, 0, stream>>>(
-          scores_in, data->indices_in.get(), data->scores_buffer.get(), vocab_size, num_partitions);
-      break;
+      FindBlockTopK_BitonicSort<block_size, 512><<<grid_stage1, block_stage1, 0, stream>>>(scores_in, data->indices_in.get(), data->scores_buffer.get(), vocab_size, num_partitions); break;
     case 1024:
-      FindBlockTopK_BitonicSort<block_size, 1024><<<grid_stage1, block_stage1, 0, stream>>>(
-          scores_in, data->indices_in.get(), data->scores_buffer.get(), vocab_size, num_partitions);
-      break;
+      FindBlockTopK_BitonicSort<block_size, 1024><<<grid_stage1, block_stage1, 0, stream>>>(scores_in, data->indices_in.get(), data->scores_buffer.get(), vocab_size, num_partitions); break;
     case 2048:
-      FindBlockTopK_BitonicSort<block_size, 2048><<<grid_stage1, block_stage1, 0, stream>>>(
-          scores_in, data->indices_in.get(), data->scores_buffer.get(), vocab_size, num_partitions);
-      break;
+      FindBlockTopK_BitonicSort<block_size, 2048><<<grid_stage1, block_stage1, 0, stream>>>(scores_in, data->indices_in.get(), data->scores_buffer.get(), vocab_size, num_partitions); break;
     case 4096:
-      FindBlockTopK_BitonicSort<block_size, 4096><<<grid_stage1, block_stage1, 0, stream>>>(
-          scores_in, data->indices_in.get(), data->scores_buffer.get(), vocab_size, num_partitions);
-      break;
+      FindBlockTopK_BitonicSort<block_size, 4096><<<grid_stage1, block_stage1, 0, stream>>>(scores_in, data->indices_in.get(), data->scores_buffer.get(), vocab_size, num_partitions); break;
     default:
-      assert(false && "Unsupported sort_size");
-      break;
+      assert(false && "Unsupported sort_size"); break;
   }
   CUDA_CHECK(cudaGetLastError());
 
-  // // --- DEBUG ---
-  // bool enable_debug_print = (batch_size == 1 && vocab_size >= 32000);
-  // if (enable_debug_print) {
-  //   DebugPrintDeviceData(stream, data->scores_buffer.get(), 64, batch_size, num_partitions * max_k, "After Stage 1 (Scores)");
-  //   DebugPrintDeviceData(stream, data->indices_in.get(), 64, batch_size, num_partitions * max_k, "After Stage 1 (Indices)");
-  // }
-
-  // Stage 2: Reduce Phase - OPTIMIZED with iterative pairwise reduction
+  // Stage 2: Reduce Phase - Fused iterative reduction
   int current_num_partitions = num_partitions;
-
-  // Set up ping-pong buffers. The initial input is the output of Stage 1.
   float* input_scores = data->scores_buffer.get();
   int* input_indices = data->indices_in.get();
-  // Use scores_temp and indices_sorted for the ping-pong outputs.
   float* output_scores = data->scores_temp.get();
   int* output_indices = data->indices_sorted.get();
 
-  int loop_count = 0;
   while (current_num_partitions > 1) {
-    int next_num_partitions = (current_num_partitions + 1) / 2;
-    dim3 grid_reduce(next_num_partitions, batch_size);
+    constexpr int partitions_per_block = 8; // Reduction factor per block
+    int num_blocks = (current_num_partitions + partitions_per_block - 1) / partitions_per_block;
+    
+    dim3 grid_reduce(num_blocks, batch_size);
     dim3 block_reduce(block_size);
 
-    PairwiseReduceTopK<block_size, max_k><<<grid_reduce, block_reduce, 0, stream>>>(
+    BlockReduceTopK<block_size, max_k><<<grid_reduce, block_reduce, 0, stream>>>(
         input_scores, input_indices,
         output_scores, output_indices,
-        current_num_partitions);
+        current_num_partitions, partitions_per_block);
     CUDA_CHECK(cudaGetLastError());
 
-    // // --- DEBUG ---
-    // if (enable_debug_print) {
-    //   char msg_s[100];
-    //   sprintf(msg_s, "After Reduce Iter %d (Scores) - %d partitions", loop_count, next_num_partitions);
-    //   DebugPrintDeviceData(stream, output_scores, 64, batch_size, next_num_partitions * max_k, msg_s);
-    //   char msg_i[100];
-    //   sprintf(msg_i, "After Reduce Iter %d (Indices) - %d partitions", loop_count, next_num_partitions);
-    //   DebugPrintDeviceData(stream, output_indices, 64, batch_size, next_num_partitions * max_k, msg_i);
-    // }
-
-    // Swap buffers for the next iteration.
     std::swap(input_scores, output_scores);
     std::swap(input_indices, output_indices);
 
-    current_num_partitions = next_num_partitions;
-    loop_count++;
+    current_num_partitions = num_blocks;
   }
 
-  // After the loop, the final reduced results are in the `input` buffers
+  // Final results are now in the `input` buffers
   float* final_reduced_scores = input_scores;
   int* final_reduced_indices = input_indices;
 
   // Stage 3: Final Copy and Softmax
-  // This stage now operates on the much smaller, fully reduced list of top-k candidates.
   CopyAndSoftmax<false>(stream, batch_size, indices_out, scores_out, final_reduced_indices, final_reduced_scores, k, temperature, max_k);
 }
 
@@ -271,7 +240,6 @@ void GetTopKSubset(SamplingData* data, cudaStream_t stream, float* scores_in, fl
   if (k <= 8) {
     chosen_config.algorithm = TopKAlgorithm::SELECTION_SORT;
   } else if (k <= 64) {
-    // TODO: replace it by a lookup table from offline benchmark.
     chosen_config = BenchmarkAndGetBestAlgorithm(data, stream, vocab_size, batch_size, k);
   }
 
