@@ -247,24 +247,39 @@ __global__ void BlockReduceTopK(const float* scores_in, const int* indices_in,
 
 
 void RunTopKViaMapReduceBitonicSort(SamplingData* data, cudaStream_t stream, float* scores_in, float* scores_out, int* indices_out, int vocab_size, int batch_size, int k, float temperature, int num_partitions, int sort_size) {
-  constexpr int block_size = 256;
   const int max_k = kBitonicSortMaxK; // The fixed size of intermediate results
 
   // Stage 1: Map Phase - Find top-k within each partition of the vocabulary.
   dim3 grid_stage1(num_partitions, batch_size);
-  dim3 block_stage1(block_size);
-
+  
   switch (sort_size) {
-    case 512:
-      FindBlockTopK_BitonicSort<block_size, 512><<<grid_stage1, block_stage1, 0, stream>>>(scores_in, data->indices_in.get(), data->scores_buffer.get(), vocab_size, num_partitions); break;
-    case 1024:
-      FindBlockTopK_BitonicSort<block_size, 1024><<<grid_stage1, block_stage1, 0, stream>>>(scores_in, data->indices_in.get(), data->scores_buffer.get(), vocab_size, num_partitions); break;
-    case 2048:
-      FindBlockTopK_BitonicSort<block_size, 2048><<<grid_stage1, block_stage1, 0, stream>>>(scores_in, data->indices_in.get(), data->scores_buffer.get(), vocab_size, num_partitions); break;
-    case 4096:
-      FindBlockTopK_BitonicSort<block_size, 4096><<<grid_stage1, block_stage1, 0, stream>>>(scores_in, data->indices_in.get(), data->scores_buffer.get(), vocab_size, num_partitions); break;
+    case 512: {
+      constexpr int block_size = 256;
+      dim3 block_stage1(block_size);
+      FindBlockTopK_BitonicSort<block_size, 512><<<grid_stage1, block_stage1, 0, stream>>>(scores_in, data->indices_in.get(), data->scores_buffer.get(), vocab_size, num_partitions); 
+      break;
+    }
+    case 1024: {
+      constexpr int block_size = 256;
+      dim3 block_stage1(block_size);
+      FindBlockTopK_BitonicSort<block_size, 1024><<<grid_stage1, block_stage1, 0, stream>>>(scores_in, data->indices_in.get(), data->scores_buffer.get(), vocab_size, num_partitions); 
+      break;
+    }
+    case 2048: {
+      constexpr int block_size = 256;
+      dim3 block_stage1(block_size);
+      FindBlockTopK_BitonicSort<block_size, 2048><<<grid_stage1, block_stage1, 0, stream>>>(scores_in, data->indices_in.get(), data->scores_buffer.get(), vocab_size, num_partitions); 
+      break;
+    }
+    case 4096: {
+      constexpr int block_size = 512; // Use larger block size for larger sort size
+      dim3 block_stage1(block_size);
+      FindBlockTopK_BitonicSort<block_size, 4096><<<grid_stage1, block_stage1, 0, stream>>>(scores_in, data->indices_in.get(), data->scores_buffer.get(), vocab_size, num_partitions); 
+      break;
+    }
     default:
-      assert(false && "Unsupported sort_size"); break;
+      assert(false && "Unsupported sort_size"); 
+      break;
   }
   CUDA_CHECK(cudaGetLastError());
 
@@ -280,9 +295,10 @@ void RunTopKViaMapReduceBitonicSort(SamplingData* data, cudaStream_t stream, flo
     int num_blocks = (current_num_partitions + partitions_per_block - 1) / partitions_per_block;
     
     dim3 grid_reduce(num_blocks, batch_size);
-    dim3 block_reduce(block_size);
+    constexpr int reduce_block_size = 256;
+    dim3 block_reduce(reduce_block_size);
     
-    BlockReduceTopK<block_size, max_k, partitions_per_block><<<grid_reduce, block_reduce, 0, stream>>>(
+    BlockReduceTopK<reduce_block_size, max_k, partitions_per_block><<<grid_reduce, block_reduce, 0, stream>>>(
         input_scores, input_indices,
         output_scores, output_indices,
         current_num_partitions);
