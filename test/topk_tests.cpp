@@ -1,8 +1,6 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
-// This file is for macro-benchmarking the GetTopKSubset function.
-
 #include <iostream>
 #include <vector>
 #include <string>
@@ -17,13 +15,12 @@
 #include <map>
 #include <tuple>
 #include <limits>
+#include <gtest/gtest.h>
 
 #include "cuda_runtime.h"
-#include "../src/span.h"
-#include "models/onnxruntime_api.h"
-#include "../src/cuda/cuda_sampling.cuh"
-#include "smartptrs.h"  // For CudaMallocArray
-#include <gtest/gtest.h>
+#include "smartptrs.h"
+#include "../src/cuda/cuda_topk.h"
+
 
 // Robust CUDA error checking macro
 #define CUDA_CHECK(call)                                    \
@@ -35,17 +32,6 @@
       exit(EXIT_FAILURE);                                   \
     }                                                       \
   } while (0)
-
-// Forward declarations of the internal functions we want to benchmark,
-// as they are not in the .cuh header.
-namespace Generators {
-namespace cuda {
-
-void RunTopKViaSelectionSort(SamplingData* data, cudaStream_t stream, float* scores_in, float* scores_out, int* indices_out, int vocab_size, int batch_size, int k, float temperature);
-void RunTopKViaFullSort(SamplingData* data, cudaStream_t stream, float* scores_in, float* scores_out, int* indices_out, int vocab_size, int batch_size, int k, float temperature);
-void RunTopKViaMapReduceBitonicSort(SamplingData* data, cudaStream_t stream, float* scores_in, float* scores_out, int* indices_out, int vocab_size, int batch_size, int k, float temperature, int num_partitions, int sort_size);
-}  // namespace cuda
-}  // namespace Generators
 
 // A struct to hold the parameters for a benchmark configuration
 struct BenchmarkParams {
@@ -63,38 +49,24 @@ struct BenchmarkResult {
   float latency_ms;
 };
 
-// Global mutex to serialize benchmark tests and prevent parallel execution on the GPU
+// Global mutex to serialize benchmark tests
 static std::mutex benchmark_mutex;
 
 // Function to compare results between a test algorithm and a reference
-bool CompareResults(int batch_size, int k,
-                    const std::vector<float>& reference_scores, const std::vector<int>& reference_indices,
+bool CompareResults(const std::vector<float>& reference_scores, const std::vector<int>& reference_indices,
                     const std::vector<float>& actual_scores, const std::vector<int>& actual_indices,
                     const std::string& algo_name) {
   bool match = true;
   const float epsilon = 1e-5f;
 
   for (size_t i = 0; i < reference_scores.size(); ++i) {
-    // Compare indices
-    if (reference_indices[i] != actual_indices[i]) {
-      std::cerr << "Parity Test Failed for " << algo_name << ": Index mismatch at position " << i
-                << ". Expected: " << reference_indices[i] << ", Got: " << actual_indices[i] << std::endl;
+    if (reference_indices[i] != actual_indices[i] || std::abs(reference_scores[i] - actual_scores[i]) > epsilon) {
+       std::cerr << "Parity Test Failed for " << algo_name << ": Mismatch at position " << i
+                << ". Expected: (" << reference_indices[i] << ", " << std::fixed << std::setprecision(6) << reference_scores[i]
+                << "), Got: (" << actual_indices[i] << ", " << actual_scores[i] << ")" << std::endl;
       match = false;
       break;
     }
-    // Compare scores
-    if (std::abs(reference_scores[i] - actual_scores[i]) > epsilon) {
-      std::cerr << "Parity Test Failed for " << algo_name << ": Score mismatch at position " << i
-                << ". Expected: " << std::fixed << std::setprecision(6) << reference_scores[i]
-                << ", Got: " << actual_scores[i] << std::endl;
-      match = false;
-      break;
-    }
-  }
-  if (!match) {
-    // Optional: Dump full arrays on mismatch for debugging
-    // std::cout << "Reference Indices: "; for(int v : reference_indices) std::cout << v << " "; std::cout << std::endl;
-    // std::cout << "Actual Indices:    "; for(int v : actual_indices) std::cout << v << " "; std::cout << std::endl;
   }
   return match;
 }
@@ -108,22 +80,18 @@ void RunParityTests(const BenchmarkParams& params, float temperature) {
   cudaStream_t stream;
   CUDA_CHECK(cudaStreamCreate(&stream));
 
-  // --- Setup ---
   auto sampling_data = std::make_unique<Generators::cuda::SamplingData>(1234, params.batch_size, params.vocab_size, stream);
   auto scores_in_d = Generators::CudaMallocArray<float>(params.batch_size * params.vocab_size);
   auto scores_in_d_copy = Generators::CudaMallocArray<float>(params.batch_size * params.vocab_size);
 
-  // Use a fixed seed for reproducibility
   std::mt19937 gen(3407);
   std::uniform_real_distribution<float> dis(0.0f, 100.0f);
   std::vector<float> scores_in_h(params.batch_size * params.vocab_size);
-  for (auto& val : scores_in_h) {
-    val = dis(gen);
-  }
+  for (auto& val : scores_in_h) val = dis(gen);
+  
   CUDA_CHECK(cudaMemcpy(scores_in_d.get(), scores_in_h.data(), scores_in_h.size() * sizeof(float), cudaMemcpyHostToDevice));
   CUDA_CHECK(cudaMemcpy(scores_in_d_copy.get(), scores_in_d.get(), scores_in_h.size() * sizeof(float), cudaMemcpyDeviceToDevice));
 
-  // --- Get Reference Result using Full Sort ---
   auto ref_scores_d = Generators::CudaMallocArray<float>(params.batch_size * params.k);
   auto ref_indices_d = Generators::CudaMallocArray<int>(params.batch_size * params.k);
   Generators::cuda::RunTopKViaFullSort(sampling_data.get(), stream, scores_in_d.get(), ref_scores_d.get(), ref_indices_d.get(), params.vocab_size, params.batch_size, params.k, temperature);
@@ -134,7 +102,6 @@ void RunParityTests(const BenchmarkParams& params, float temperature) {
   CUDA_CHECK(cudaMemcpy(ref_scores_h.data(), ref_scores_d.get(), ref_scores_h.size() * sizeof(float), cudaMemcpyDeviceToHost));
   CUDA_CHECK(cudaMemcpy(ref_indices_h.data(), ref_indices_d.get(), ref_indices_h.size() * sizeof(int), cudaMemcpyDeviceToHost));
 
-  // --- Test Other Algorithms ---
   auto test_algo = [&](const std::string& name, auto func) {
     auto actual_scores_d = Generators::CudaMallocArray<float>(params.batch_size * params.k);
     auto actual_indices_d = Generators::CudaMallocArray<int>(params.batch_size * params.k);
@@ -146,16 +113,12 @@ void RunParityTests(const BenchmarkParams& params, float temperature) {
     CUDA_CHECK(cudaMemcpy(actual_scores_h.data(), actual_scores_d.get(), actual_scores_h.size() * sizeof(float), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(actual_indices_h.data(), actual_indices_d.get(), actual_indices_h.size() * sizeof(int), cudaMemcpyDeviceToHost));
 
-    if (CompareResults(params.batch_size, params.k, ref_scores_h, ref_indices_h, actual_scores_h, actual_indices_h, name)) {
-      std::cout << "  [PASS] " << name << std::endl;
-    } else {
-      std::cout << "  [FAIL] " << name << std::endl;
-    }
+    ASSERT_TRUE(CompareResults(ref_scores_h, ref_indices_h, actual_scores_h, actual_indices_h, name));
+    std::cout << "  [PASS] " << name << std::endl;
   };
 
   if (params.k <= 64) {
     test_algo("SELECTION_SORT", [&](float* s_d, int* i_d) {
-      // Selection Sort kernel will change scores_in inplace so we made a copy here.
       Generators::cuda::RunTopKViaSelectionSort(sampling_data.get(), stream, scores_in_d_copy.get(), s_d, i_d, params.vocab_size, params.batch_size, params.k, temperature);
     });
     test_algo("BITONIC_SORT (s=4096, p=128)", [&](float* s_d, int* i_d) {
@@ -166,7 +129,7 @@ void RunParityTests(const BenchmarkParams& params, float temperature) {
   CUDA_CHECK(cudaStreamDestroy(stream));
 }
 
-// New function to print the summary in CSV format
+// Function to print a summary of benchmark results in CSV format
 void PrintSummary(const std::vector<BenchmarkResult>& all_results) {
   // This struct holds the aggregated data for a unique key (batch_size, vocab_size, k)
   struct SummaryData {
@@ -238,7 +201,7 @@ void RunBenchmarks() {
 
   // Enable this to to find heuristics for kernel selection.
   // It lists vocabulary sizes within the range of 16K to 512K (32 data points using step of 16K).
-  constexpr bool comprehensive_vocab_size = true;
+  constexpr bool comprehensive_vocab_size = false;
   if constexpr (comprehensive_vocab_size) {
     vocab_sizes.clear();
     for (int v = 16 * 1024; v <= 512 * 1024; v += 16 * 1024) {
@@ -364,21 +327,15 @@ void RunBenchmarks() {
 
 TEST(TopKTests, ParityTests) {
   std::lock_guard<std::mutex> lock(benchmark_mutex);
-
-  std::vector<int> batch_sizes = {1, 2};
-  std::vector<int> vocab_sizes = {10000, 204800};
-  std::vector<int> ks = {1, 50, 64};
-  std::vector<float> temperatures = {1.0f, 0.5f};
-
-  for (int batch_size : batch_sizes) {
-    for (int vocab_size : vocab_sizes) {
-      for (int k : ks) {
-        for (float temperature : temperatures) {
-          BenchmarkParams params = {batch_size, vocab_size, k};
-          RunParityTests(params, temperature);
-        }
-      }
-    }
+  std::vector<BenchmarkParams> test_cases = {
+      {1, 10000, 50}, {2, 10000, 64},
+      {1, 32000, 1}, {1, 32000, 50},
+      {1, 512000, 50} // Test case for bitonic sort
+  };
+  
+  for (const auto& params : test_cases) {
+      RunParityTests(params, 1.0f);
+      RunParityTests(params, 0.7f);
   }
 }
 

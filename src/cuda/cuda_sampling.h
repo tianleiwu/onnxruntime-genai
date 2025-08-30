@@ -1,11 +1,11 @@
-// cuda_sampling.cuh
-
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
-#include <assert.h>
+#pragma once
+
 #include "cuda_common.h"
 #include <curand_kernel.h>
+#include <cuda_runtime.h>
 
 namespace Generators {
 namespace cuda {
@@ -13,6 +13,8 @@ namespace cuda {
 constexpr int kBitonicSortMaxPartitions = 256;
 constexpr int kBitonicSortMaxK = 64;
 
+// This struct holds all the device memory buffers required for both Top-K and Sampling operations.
+// It acts as a shared workspace to avoid reallocating memory between pipeline stages.
 struct SamplingData {
   SamplingData(unsigned long long random_seed, int batch_size, int vocab_size, cudaStream_t stream);
   cuda_unique_ptr<int> indices_sorted;
@@ -25,7 +27,6 @@ struct SamplingData {
   cuda_unique_ptr<float> thresholds;
   cuda_unique_ptr<int> indices_in;
   cuda_unique_ptr<int> offsets;
-  // Changed from float to unsigned char for byte-level allocation
   cuda_unique_ptr<unsigned char> temp_buffer;
   cuda_unique_ptr<curandState> curand_states;
   size_t temp_storage_bytes = 0;
@@ -34,10 +35,16 @@ struct SamplingData {
 void LaunchPopulateIndices(int* indices, int size, int batch_size, cudaStream_t stream);
 void GetSample(SamplingData* data, cudaStream_t stream, int32_t* d_next_token, float* d_scores, int vocab_size, int batch_size, int k, float p, float temperature);
 
+// Updated function signature to match the original implementation
+void LaunchSampleKernel(SamplingData* data, cudaStream_t stream, float* scores, int* indices, int* index_out, int sample_range, int batch_size, int indices_stride, float p, int k);
+
 template <bool is_log_softmax>
 void DispatchBlockwiseSoftmaxForward(cudaStream_t stream, float* output, const float* input, int softmax_elements, int input_stride, int output_stride, int batch_count);
 
-void RandomTopkInput(cudaStream_t stream, float* data, curandState* batch_state, int total_size, int batch_size);
+// Added new uniquely named function for the sampling use case.
+void DispatchBlockwiseSoftmaxForwardWithTemperature(cudaStream_t stream, float* output, const float* input, int softmax_elements, int input_stride, int output_stride, int batch_count, float temperature);
+
 
 }  // namespace cuda
 }  // namespace Generators
+
