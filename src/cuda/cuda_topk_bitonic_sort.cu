@@ -38,30 +38,34 @@ __global__ void FindBlockTopK_BitonicSort(const float* scores_in,
   }
   __syncthreads();
 
-  // --- In-place Bitonic Sort (descending) ---
+  // --- In-place Bitonic Sort (descending), optimized with register usage ---
   for (int k = 2; k <= kSortSize; k <<= 1) {
     for (int j = k >> 1; j > 0; j >>= 1) {
-      for (int i = threadIdx.x; i < kSortSize; i += kBlockSize) {
+      // Each thread processes its strided elements. Unrolling this loop allows
+      // the compiler to use registers effectively for the multiple operations.
+      constexpr int kOpsPerThread = kSortSize / kBlockSize;
+      #pragma unroll
+      for (int op = 0; op < kOpsPerThread; ++op) {
+        int i = threadIdx.x + op * kBlockSize;
         int ixj = i ^ j;
+
         if (ixj > i) {
-          if ((i & k) == 0) {  // Sort ascending
-            if (smem_scores[i] > smem_scores[ixj]) {
-              float temp_s = smem_scores[i];
-              smem_scores[i] = smem_scores[ixj];
-              smem_scores[ixj] = temp_s;
-              int temp_i = smem_indices[i];
-              smem_indices[i] = smem_indices[ixj];
-              smem_indices[ixj] = temp_i;
-            }
-          } else {  // Sort descending
-            if (smem_scores[i] < smem_scores[ixj]) {
-              float temp_s = smem_scores[i];
-              smem_scores[i] = smem_scores[ixj];
-              smem_scores[ixj] = temp_s;
-              int temp_i = smem_indices[i];
-              smem_indices[i] = smem_indices[ixj];
-              smem_indices[ixj] = temp_i;
-            }
+          // Load both elements to compare into registers
+          float score_i = smem_scores[i];
+          float score_ixj = smem_scores[ixj];
+          int index_i = smem_indices[i];
+          int index_ixj = smem_indices[ixj];
+
+          // Determine sort direction for this k-sized sub-block
+          bool sort_ascending = ((i & k) == 0);
+
+          // Perform comparison and potential swap
+          if ((score_i > score_ixj) != sort_ascending) {
+            // Write the swapped values back to shared memory
+            smem_scores[i] = score_ixj;
+            smem_scores[ixj] = score_i;
+            smem_indices[i] = index_ixj;
+            smem_indices[ixj] = index_i;
           }
         }
       }
