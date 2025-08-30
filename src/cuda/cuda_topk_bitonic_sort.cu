@@ -80,6 +80,40 @@ __device__ void SharedMemBitonicSort(float* smem_scores, int* smem_indices) {
     __syncthreads();
   }
 }
+
+// Sorts an array of `N` elements held in registers.
+template <int N>
+__device__ void RegisterBitonicSort(float scores[N], int indices[N]) {
+  // Build the bitonic sequence
+  for (int k = 2; k <= N; k <<= 1) {
+    for (int j = k >> 1; j > 0; j >>= 1) {
+      for (int i = 0; i < N; ++i) {
+        int ixj = i ^ j;
+        if (ixj > i) {
+          bool ascending = ((i & k) == 0);
+          bool is_greater = (scores[i] > scores[ixj]) || (scores[i] == scores[ixj] && indices[i] < indices[ixj]);
+          if (is_greater != ascending) {
+            float temp_s = scores[i]; scores[i] = scores[ixj]; scores[ixj] = temp_s;
+            int temp_i = indices[i]; indices[i] = indices[ixj]; indices[ixj] = temp_i;
+          }
+        }
+      }
+    }
+  }
+
+  // Sort the bitonic sequence descending
+  for (int j = N >> 1; j > 0; j >>= 1) {
+    for (int i = 0; i < N; ++i) {
+      int ixj = i ^ j;
+      if (ixj > i) {
+        if ((scores[i] < scores[ixj]) || (scores[i] == scores[ixj] && indices[i] > indices[ixj])) {
+          float temp_s = scores[i]; scores[i] = scores[ixj]; scores[ixj] = temp_s;
+          int temp_i = indices[i]; indices[i] = indices[ixj]; indices[ixj] = temp_i;
+        }
+      }
+    }
+  }
+}
 // --- END: New Device Helper Function ---
 
 
@@ -100,22 +134,65 @@ __global__ void FindBlockTopK_BitonicSort(const float* scores_in,
   const int partition_size = (vocab_size + num_partitions - 1) / num_partitions;
   const int partition_start = partition_idx * partition_size;
 
-  // Load data from global to shared memory
-  for (int i = threadIdx.x; i < kSortSize; i += kBlockSize) {
-    int global_idx = partition_start + i;
-    if (i < partition_size && global_idx < vocab_size) {
-      smem_scores[i] = batch_scores_in[global_idx];
-      smem_indices[i] = global_idx;
+  constexpr int ElementsPerThread = kSortSize / kBlockSize;
+  float reg_scores[ElementsPerThread];
+  int reg_indices[ElementsPerThread];
+
+  // Load data from global memory into registers
+  for (int i = 0; i < ElementsPerThread; ++i) {
+    int global_idx = partition_start + threadIdx.x * ElementsPerThread + i;
+    if (global_idx < partition_start + partition_size && global_idx < (batch_idx + 1) * vocab_size) {
+        reg_scores[i] = batch_scores_in[global_idx];
+        reg_indices[i] = global_idx;
     } else {
-      // Pad with minimum values to ensure they are sorted to the end
-      smem_scores[i] = -std::numeric_limits<float>::max();
-      smem_indices[i] = -1;
+        reg_scores[i] = -std::numeric_limits<float>::max();
+        reg_indices[i] = -1;
     }
+  }
+
+  // Sort the elements within registers
+  RegisterBitonicSort<ElementsPerThread>(reg_scores, reg_indices);
+  
+  // Write the sorted chunks from registers to shared memory
+  for (int i = 0; i < ElementsPerThread; ++i) {
+    smem_scores[threadIdx.x * ElementsPerThread + i] = reg_scores[i];
+    smem_indices[threadIdx.x * ElementsPerThread + i] = reg_indices[i];
   }
   __syncthreads();
 
-  // Perform a full sort on the data in shared memory.
-  SharedMemBitonicSort<kBlockSize, kSortSize>(smem_scores, smem_indices);
+  // Merge the pre-sorted chunks in shared memory
+  for (int k = ElementsPerThread * 2; k <= kSortSize; k <<= 1) {
+      for (int j = k >> 1; j > 0; j >>= 1) {
+          for (int i = threadIdx.x; i < kSortSize; i += kBlockSize) {
+              int ixj = i ^ j;
+              if (ixj > i) {
+                  bool ascending = ((i & k) == 0);
+                  bool is_greater = (smem_scores[i] > smem_scores[ixj]) || 
+                                    (smem_scores[i] == smem_scores[ixj] && smem_indices[i] < smem_indices[ixj]);
+                  if (is_greater != ascending) {
+                      float temp_s = smem_scores[i]; smem_scores[i] = smem_scores[ixj]; smem_scores[ixj] = temp_s;
+                      int temp_i = smem_indices[i]; smem_indices[i] = smem_indices[ixj]; smem_indices[ixj] = temp_i;
+                  }
+              }
+          }
+          __syncthreads();
+      }
+  }
+
+  // Sort the final bitonic sequence descending
+  for (int j = kSortSize >> 1; j > 0; j >>= 1) {
+    for (int i = threadIdx.x; i < kSortSize; i += kBlockSize) {
+      int ixj = i ^ j;
+      if (ixj > i) {
+        if ((smem_scores[i] < smem_scores[ixj]) ||
+            (smem_scores[i] == smem_scores[ixj] && smem_indices[i] > smem_indices[ixj])) {
+          float temp_s = smem_scores[i]; smem_scores[i] = smem_scores[ixj]; smem_scores[ixj] = temp_s;
+          int temp_i = smem_indices[i]; smem_indices[i] = smem_indices[ixj]; smem_indices[ixj] = temp_i;
+        }
+      }
+    }
+    __syncthreads();
+  }
 
   // Have the first `max_k` threads write out the top results
   if (threadIdx.x < kBitonicSortMaxK) {
