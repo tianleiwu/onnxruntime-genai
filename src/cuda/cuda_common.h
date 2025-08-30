@@ -1,3 +1,10 @@
+#pragma once
+
+#include <cuda_runtime.h>
+#include "span.h"
+#include <memory>
+#include <assert.h>
+
 namespace Generators {
 
 cudaStream_t GetStream();

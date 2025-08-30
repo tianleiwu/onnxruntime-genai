@@ -5,6 +5,7 @@
 #include <atomic>
 #include <memory>
 #include "span.h"
+#include "models/onnxruntime_api.h"
 
 namespace Ort {
 struct Allocator;
