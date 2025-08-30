@@ -137,9 +137,9 @@ __global__ void FindBlockTopK_BitonicSort(const float* scores_in,
   float reg_scores[ElementsPerThread];
   int reg_indices[ElementsPerThread];
 
-  // Load data from global memory into registers
+  // Load a contiguous chunk of data from global memory into registers (coalesced access)
   for (int i = 0; i < ElementsPerThread; ++i) {
-    int global_idx = partition_start + threadIdx.x + i * kBlockSize;
+    int global_idx = partition_start + threadIdx.x * ElementsPerThread + i;
     if (global_idx < partition_start + partition_size && global_idx < vocab_size) {
         reg_scores[i] = batch_scores_in[global_idx];
         reg_indices[i] = global_idx;
@@ -154,8 +154,8 @@ __global__ void FindBlockTopK_BitonicSort(const float* scores_in,
   
   // Write the sorted chunks from registers to shared memory
   for (int i = 0; i < ElementsPerThread; ++i) {
-    smem_scores[threadIdx.x + i * kBlockSize] = reg_scores[i];
-    smem_indices[threadIdx.x + i * kBlockSize] = reg_indices[i];
+    smem_scores[threadIdx.x * ElementsPerThread + i] = reg_scores[i];
+    smem_indices[threadIdx.x * ElementsPerThread + i] = reg_indices[i];
   }
   __syncthreads();
 
