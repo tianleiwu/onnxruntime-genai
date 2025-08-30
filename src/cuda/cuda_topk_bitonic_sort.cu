@@ -125,56 +125,47 @@ __global__ void FindBlockTopK_BitonicSort(const float* scores_in,
   }
 }
 
-// FUSED REDUCTION KERNEL: Each block reduces multiple partitions.
-template <int kBlockSize, int K>
+// "Mega Merge" FUSED REDUCTION KERNEL: Each block reduces multiple partitions in one go.
+template <int kBlockSize, int K, int PartitionsPerBlock>
 __global__ void BlockReduceTopK(const float* scores_in, const int* indices_in,
                                 float* scores_out, int* indices_out,
-                                int num_partitions_in, int partitions_per_block) {
+                                int num_partitions_in) {
   const int batch_idx = blockIdx.y;
-  const int block_start_partition = blockIdx.x * partitions_per_block;
+  const int block_start_partition = blockIdx.x * PartitionsPerBlock;
 
-  // Determine how many partitions this block needs to process.
-  // The last block might have fewer than `partitions_per_block`.
-  const int num_partitions_to_process = min(partitions_per_block, num_partitions_in - block_start_partition);
+  // Determine how many partitions this block actually needs to process.
+  const int num_partitions_to_process = min(PartitionsPerBlock, num_partitions_in - block_start_partition);
 
-  if (num_partitions_to_process <= 0) {
-    return;
-  }
-
-  // Shared memory for merging. Needs space for 2*K elements.
-  __shared__ float smem_scores[K * 2];
-  __shared__ int smem_indices[K * 2];
+  constexpr int SortSize = K * PartitionsPerBlock;
+  __shared__ float smem_scores[SortSize];
+  __shared__ int smem_indices[SortSize];
 
   const int in_base_offset = batch_idx * num_partitions_in * K;
   const int out_base_offset = (batch_idx * gridDim.x + blockIdx.x) * K;
 
-  // Step 1: Load the first partition for this block directly into the first half of shared memory.
-  int first_partition_offset = in_base_offset + block_start_partition * K;
-  for (int i = threadIdx.x; i < K; i += kBlockSize) {
-    smem_scores[i] = scores_in[first_partition_offset + i];
-    smem_indices[i] = indices_in[first_partition_offset + i];
+  // Step 1: Parallel load of all necessary partitions into shared memory.
+  for (int i = threadIdx.x; i < K * num_partitions_to_process; i += kBlockSize) {
+    int partition_idx = i / K;
+    int element_idx = i % K;
+    int global_offset = in_base_offset + (block_start_partition + partition_idx) * K + element_idx;
+    smem_scores[i] = scores_in[global_offset];
+    smem_indices[i] = indices_in[global_offset];
   }
 
-  // Step 2: Iteratively merge the remaining partitions assigned to this block.
-  for (int p = 1; p < num_partitions_to_process; ++p) {
-    __syncthreads(); // Ensure the previous merge is complete.
-
-    // Load the next partition into the second half of shared memory.
-    int current_partition_offset = in_base_offset + (block_start_partition + p) * K;
-    for (int i = threadIdx.x; i < K; i += kBlockSize) {
-      smem_scores[K + i] = scores_in[current_partition_offset + i];
-      smem_indices[K + i] = indices_in[current_partition_offset + i];
-    }
-    __syncthreads(); // Ensure data is loaded before sorting.
-
-    // Sort the combined 2*K elements. The top K will be at the beginning.
-    SharedMemBitonicSort<kBlockSize, K * 2>(smem_scores, smem_indices);
+  // Pad the rest of the shared memory if this block has fewer partitions than the max.
+  for (int i = K * num_partitions_to_process + threadIdx.x; i < SortSize; i += kBlockSize) {
+      smem_scores[i] = -std::numeric_limits<float>::max();
+      smem_indices[i] = -1;
   }
+  __syncthreads();
+
+  // Step 2: Perform a single, large sort on all loaded candidates.
+  SharedMemBitonicSort<kBlockSize, SortSize>(smem_scores, smem_indices);
 
   // Step 3: Write the final top K result for this block to global memory.
-  for (int i = threadIdx.x; i < K; i += kBlockSize) {
-    indices_out[out_base_offset + i] = smem_indices[i];
-    scores_out[out_base_offset + i] = smem_scores[i];
+  if (threadIdx.x < K) {
+    indices_out[out_base_offset + threadIdx.x] = smem_indices[threadIdx.x];
+    scores_out[out_base_offset + threadIdx.x] = smem_scores[threadIdx.x];
   }
 }
 
@@ -215,10 +206,10 @@ void RunTopKViaMapReduceBitonicSort(SamplingData* data, cudaStream_t stream, flo
     dim3 grid_reduce(num_blocks, batch_size);
     dim3 block_reduce(block_size);
 
-    BlockReduceTopK<block_size, max_k><<<grid_reduce, block_reduce, 0, stream>>>(
+    BlockReduceTopK<block_size, max_k, partitions_per_block><<<grid_reduce, block_reduce, 0, stream>>>(
         input_scores, input_indices,
         output_scores, output_indices,
-        current_num_partitions, partitions_per_block);
+        current_num_partitions);
     CUDA_CHECK(cudaGetLastError());
 
     std::swap(input_scores, output_scores);
