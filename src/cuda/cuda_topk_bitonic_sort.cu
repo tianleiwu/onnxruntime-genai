@@ -211,34 +211,45 @@ __global__ void BlockReduceTopK(const float* scores_in, const int* indices_in,
 
   const int batch_idx = blockIdx.y;
   const int block_start_partition = blockIdx.x * PartitionsPerBlock;
-
-  // Determine how many partitions this block actually needs to process.
   const int num_partitions_to_process = min(PartitionsPerBlock, num_partitions_in - block_start_partition);
 
   constexpr int SortSize = K * PartitionsPerBlock;
+  constexpr int ElementsPerThread = SortSize / kBlockSize;
+  float reg_scores[ElementsPerThread];
+  int reg_indices[ElementsPerThread];
+
   const int in_base_offset = batch_idx * num_partitions_in * K;
   const int out_base_offset = (batch_idx * gridDim.x + blockIdx.x) * K;
 
-  // Step 1: Parallel load of all necessary partitions into shared memory.
-  for (int i = threadIdx.x; i < K * num_partitions_to_process; i += kBlockSize) {
-    int partition_idx = i / K;
-    int element_idx = i % K;
-    int global_offset = in_base_offset + (block_start_partition + partition_idx) * K + element_idx;
-    smem_scores[i] = scores_in[global_offset];
-    smem_indices[i] = indices_in[global_offset];
+  // Step 1: Parallel load into registers.
+  for (int i = 0; i < ElementsPerThread; ++i) {
+    int smem_idx = threadIdx.x * ElementsPerThread + i;
+    if (smem_idx < K * num_partitions_to_process) {
+      int partition_idx = smem_idx / K;
+      int element_idx = smem_idx % K;
+      int global_offset = in_base_offset + (block_start_partition + partition_idx) * K + element_idx;
+      reg_scores[i] = scores_in[global_offset];
+      reg_indices[i] = indices_in[global_offset];
+    } else {
+      reg_scores[i] = -std::numeric_limits<float>::max();
+      reg_indices[i] = -1;
+    }
   }
 
-  // Pad the rest of the shared memory if this block has fewer partitions than the max.
-  for (int i = K * num_partitions_to_process + threadIdx.x; i < SortSize; i += kBlockSize) {
-      smem_scores[i] = -std::numeric_limits<float>::max();
-      smem_indices[i] = -1;
+  // Step 2: Sort within registers.
+  RegisterBitonicSort<ElementsPerThread>(reg_scores, reg_indices);
+
+  // Step 3: Write sorted chunks to shared memory.
+  for (int i = 0; i < ElementsPerThread; ++i) {
+    smem_scores[threadIdx.x * ElementsPerThread + i] = reg_scores[i];
+    smem_indices[threadIdx.x * ElementsPerThread + i] = reg_indices[i];
   }
   __syncthreads();
-
-  // Step 2: Perform a single, large sort on all loaded candidates.
+  
+  // Step 4: Merge pre-sorted chunks in shared memory.
   SharedMemBitonicSort<kBlockSize, SortSize>(smem_scores, smem_indices);
 
-  // Step 3: Write the final top K result for this block to global memory.
+  // Step 5: Write final top K result for this block to global memory.
   if (threadIdx.x < K) {
     indices_out[out_base_offset + threadIdx.x] = smem_indices[threadIdx.x];
     scores_out[out_base_offset + threadIdx.x] = smem_scores[threadIdx.x];
