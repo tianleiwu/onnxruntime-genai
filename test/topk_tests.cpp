@@ -289,9 +289,9 @@ void RunBenchmarks() {
 
       // This supports from vocabulary size in the range of (256 * 32 / 2, 4096 * 256], that is from 4K (exclusive) to 1M (inclusive).
       for (int sort_size : {256, 512, 1024, 2048, 4096}) {
-        for (int num_partitions : {32, 64, 128, 256}) {
+        for (int num_partitions : {32, 64, 128, 256, 512, 1024}) {
           assert(num_partitions <= Generators::cuda::kBitonicSortMaxPartitions);
-          if (params.vocab_size <= sort_size * num_partitions && params.vocab_size > sort_size * num_partitions / 2) {
+          if (params.vocab_size <= sort_size * num_partitions && params.vocab_size >= sort_size * num_partitions / 2) {
             std::string algo_name = "BITONIC (s=" + std::to_string(sort_size) + ",p=" + std::to_string(num_partitions) + ")";
             measure_latency(algo_name, num_partitions, 256, [&, sort_size, num_partitions]() {
               Generators::cuda::RunTopKViaMapReduceBitonicSort(sampling_data.get(), stream, scores_in.get(), scores_out.get(), indices_out.get(), params.vocab_size, params.batch_size, params.k, temperature, num_partitions, sort_size);

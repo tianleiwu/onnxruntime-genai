@@ -11,32 +11,6 @@
 namespace Generators {
 namespace cuda {
 
-// --- START: Added for debugging ---
-// Helper function to print the first N elements of a device array.
-template <typename T>
-void DebugPrintDeviceData(cudaStream_t stream, const T* d_array, int n, int batch_size, int stride, const char* name) {
-  int count = std::min(n * batch_size, 256); // Print at most 256 elements
-  std::vector<T> h_array(count);
-  CUDA_CHECK(cudaMemcpyAsync(h_array.data(), d_array, count * sizeof(T), cudaMemcpyDeviceToHost, stream));
-  CUDA_CHECK(cudaStreamSynchronize(stream));
-
-  printf("--- Debug Print: %s ---\n", name);
-  for (int b = 0; b < batch_size; ++b) {
-    if (b >= 2 && count > 128) continue; // Limit printing for large batches
-    printf("Batch %d:\n", b);
-    for (int i = 0; i < std::min(n, count); ++i) {
-      if constexpr (std::is_same_v<T, float>) {
-        printf("%d: %f, ", i, h_array[b * stride + i]);
-      } else if constexpr (std::is_same_v<T, int>) {
-        printf("%d: %d, ", i, h_array[b * stride + i]);
-      }
-    }
-    printf("\n");
-  }
-  printf("----------------------------------------\n");
-}
-// --- END: Added for debugging ---
-
 // --- START: New Device Helper Function ---
 // Performs a full bitonic sort in shared memory for `SortSize` elements.
 // The final result is sorted in descending order.
@@ -223,7 +197,7 @@ __global__ void BlockReduceTopK(const float* scores_in, const int* indices_in,
 
   // Step 1: Parallel load into registers.
   for (int i = 0; i < ElementsPerThread; ++i) {
-    int smem_idx = threadIdx.x * ElementsPerThread + i;
+    int smem_idx = threadIdx.x + i * kBlockSize;
     if (smem_idx < K * num_partitions_to_process) {
       int partition_idx = smem_idx / K;
       int element_idx = smem_idx % K;
@@ -241,8 +215,8 @@ __global__ void BlockReduceTopK(const float* scores_in, const int* indices_in,
 
   // Step 3: Write sorted chunks to shared memory.
   for (int i = 0; i < ElementsPerThread; ++i) {
-    smem_scores[threadIdx.x * ElementsPerThread + i] = reg_scores[i];
-    smem_indices[threadIdx.x * ElementsPerThread + i] = reg_indices[i];
+    smem_scores[threadIdx.x + i * kBlockSize] = reg_scores[i];
+    smem_indices[threadIdx.x + i * kBlockSize] = reg_indices[i];
   }
   __syncthreads();
   
@@ -259,35 +233,28 @@ __global__ void BlockReduceTopK(const float* scores_in, const int* indices_in,
 
 void RunTopKViaMapReduceBitonicSort(SamplingData* data, cudaStream_t stream, float* scores_in, float* scores_out, int* indices_out, int vocab_size, int batch_size, int k, float temperature, int num_partitions, int sort_size) {
   const int max_k = kBitonicSortMaxK; // The fixed size of intermediate results
+  constexpr int block_size = 256;
 
   // Stage 1: Map Phase - Find top-k within each partition of the vocabulary.
   dim3 grid_stage1(num_partitions, batch_size);
+  dim3 block_stage1(block_size);
   
   switch (sort_size) {
-    case 512: {
-      constexpr int block_size = 256;
-      dim3 block_stage1(block_size);
+    case 256:
+      FindBlockTopK_BitonicSort<block_size, 256><<<grid_stage1, block_stage1, 0, stream>>>(scores_in, data->indices_in.get(), data->scores_buffer.get(), vocab_size, num_partitions); 
+      break;
+    case 512:
       FindBlockTopK_BitonicSort<block_size, 512><<<grid_stage1, block_stage1, 0, stream>>>(scores_in, data->indices_in.get(), data->scores_buffer.get(), vocab_size, num_partitions); 
       break;
-    }
-    case 1024: {
-      constexpr int block_size = 256;
-      dim3 block_stage1(block_size);
+    case 1024:
       FindBlockTopK_BitonicSort<block_size, 1024><<<grid_stage1, block_stage1, 0, stream>>>(scores_in, data->indices_in.get(), data->scores_buffer.get(), vocab_size, num_partitions); 
       break;
-    }
-    case 2048: {
-      constexpr int block_size = 256;
-      dim3 block_stage1(block_size);
+    case 2048:
       FindBlockTopK_BitonicSort<block_size, 2048><<<grid_stage1, block_stage1, 0, stream>>>(scores_in, data->indices_in.get(), data->scores_buffer.get(), vocab_size, num_partitions); 
       break;
-    }
-    case 4096: {
-      constexpr int block_size = 512; // Use larger block size for larger sort size
-      dim3 block_stage1(block_size);
+    case 4096:
       FindBlockTopK_BitonicSort<block_size, 4096><<<grid_stage1, block_stage1, 0, stream>>>(scores_in, data->indices_in.get(), data->scores_buffer.get(), vocab_size, num_partitions); 
       break;
-    }
     default:
       assert(false && "Unsupported sort_size"); 
       break;
@@ -306,10 +273,9 @@ void RunTopKViaMapReduceBitonicSort(SamplingData* data, cudaStream_t stream, flo
     int num_blocks = (current_num_partitions + partitions_per_block - 1) / partitions_per_block;
     
     dim3 grid_reduce(num_blocks, batch_size);
-    constexpr int reduce_block_size = 256;
-    dim3 block_reduce(reduce_block_size);
+    dim3 block_reduce(block_size);
     
-    BlockReduceTopK<reduce_block_size, max_k, partitions_per_block><<<grid_reduce, block_reduce, 0, stream>>>(
+    BlockReduceTopK<block_size, max_k, partitions_per_block><<<grid_reduce, block_reduce, 0, stream>>>(
         input_scores, input_indices,
         output_scores, output_indices,
         current_num_partitions);
