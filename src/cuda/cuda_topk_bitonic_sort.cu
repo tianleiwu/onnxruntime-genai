@@ -51,12 +51,12 @@ __device__ void SharedMemBitonicSort(float* smem_scores, int* smem_indices) {
           bool ascending = ((i & k) == 0);
           
           // Stable sort condition: if scores are equal, use index as tie-breaker (smaller index is better).
-          bool is_greater = (smem_scores[i] > smem_scores[ixj]) ||
-                            (smem_scores[i] == smem_scores[ixj] && smem_indices[i] < smem_indices[ixj]);
+          bool is_greater = (smem_scores[i + (i >> 5)] > smem_scores[ixj + (ixj >> 5)]) ||
+                            (smem_scores[i + (i >> 5)] == smem_scores[ixj + (ixj >> 5)] && smem_indices[i + (i >> 5)] < smem_indices[ixj + (ixj >> 5)]);
 
           if (is_greater != ascending) {
-            float temp_s = smem_scores[i]; smem_scores[i] = smem_scores[ixj]; smem_scores[ixj] = temp_s;
-            int temp_i = smem_indices[i]; smem_indices[i] = smem_indices[ixj]; smem_indices[ixj] = temp_i;
+            float temp_s = smem_scores[i + (i >> 5)]; smem_scores[i + (i >> 5)] = smem_scores[ixj + (ixj >> 5)]; smem_scores[ixj + (ixj >> 5)] = temp_s;
+            int temp_i = smem_indices[i + (i >> 5)]; smem_indices[i + (i >> 5)] = smem_indices[ixj + (ixj >> 5)]; smem_indices[ixj + (ixj >> 5)] = temp_i;
           }
         }
       }
@@ -70,10 +70,10 @@ __device__ void SharedMemBitonicSort(float* smem_scores, int* smem_indices) {
       int ixj = i ^ j;
       if (ixj > i) {
         // Stable sort condition for final descending sort.
-        if ((smem_scores[i] < smem_scores[ixj]) ||
-            (smem_scores[i] == smem_scores[ixj] && smem_indices[i] > smem_indices[ixj])) {
-          float temp_s = smem_scores[i]; smem_scores[i] = smem_scores[ixj]; smem_scores[ixj] = temp_s;
-          int temp_i = smem_indices[i]; smem_indices[i] = smem_indices[ixj]; smem_indices[ixj] = temp_i;
+        if ((smem_scores[i + (i >> 5)] < smem_scores[ixj + (ixj >> 5)]) ||
+            (smem_scores[i + (i >> 5)] == smem_scores[ixj + (ixj >> 5)] && smem_indices[i + (i >> 5)] > smem_indices[ixj + (ixj >> 5)])) {
+          float temp_s = smem_scores[i + (i >> 5)]; smem_scores[i + (i >> 5)] = smem_scores[ixj + (ixj >> 5)]; smem_scores[ixj + (ixj >> 5)] = temp_s;
+          int temp_i = smem_indices[i + (i >> 5)]; smem_indices[i + (i >> 5)] = smem_indices[ixj + (ixj >> 5)]; smem_indices[ixj + (ixj >> 5)] = temp_i;
         }
       }
     }
@@ -123,9 +123,9 @@ __global__ void FindBlockTopK_BitonicSort(const float* scores_in,
                                           float* intermediate_scores,
                                           int vocab_size,
                                           int num_partitions) {
-  // Shared memory for sorting one partition. Its size must be a power of 2.
-  __shared__ float smem_scores[kSortSize];
-  __shared__ int smem_indices[kSortSize];
+  extern __shared__ unsigned char smem_buf[];
+  float* smem_scores = reinterpret_cast<float*>(smem_buf);
+  int* smem_indices = reinterpret_cast<int*>(smem_scores + (kSortSize + kSortSize / 32));
 
   const int batch_idx = blockIdx.y;
   const int partition_idx = blockIdx.x;
@@ -153,10 +153,11 @@ __global__ void FindBlockTopK_BitonicSort(const float* scores_in,
   // Sort the elements within registers
   RegisterBitonicSort<ElementsPerThread>(reg_scores, reg_indices);
   
-  // Write the sorted chunks from registers to shared memory
+  // Write the sorted chunks from registers to shared memory with padding
   for (int i = 0; i < ElementsPerThread; ++i) {
-    smem_scores[threadIdx.x * ElementsPerThread + i] = reg_scores[i];
-    smem_indices[threadIdx.x * ElementsPerThread + i] = reg_indices[i];
+    int write_idx = threadIdx.x * ElementsPerThread + i;
+    smem_scores[write_idx + (write_idx >> 5)] = reg_scores[i];
+    smem_indices[write_idx + (write_idx >> 5)] = reg_indices[i];
   }
   __syncthreads();
 
@@ -167,11 +168,11 @@ __global__ void FindBlockTopK_BitonicSort(const float* scores_in,
               int ixj = i ^ j;
               if (ixj > i) {
                   bool ascending = ((i & k) == 0);
-                  bool is_greater = (smem_scores[i] > smem_scores[ixj]) || 
-                                    (smem_scores[i] == smem_scores[ixj] && smem_indices[i] < smem_indices[ixj]);
+                  bool is_greater = (smem_scores[i + (i >> 5)] > smem_scores[ixj + (ixj >> 5)]) || 
+                                    (smem_scores[i + (i >> 5)] == smem_scores[ixj + (ixj >> 5)] && smem_indices[i + (i >> 5)] < smem_indices[ixj + (ixj >> 5)]);
                   if (is_greater != ascending) {
-                      float temp_s = smem_scores[i]; smem_scores[i] = smem_scores[ixj]; smem_scores[ixj] = temp_s;
-                      int temp_i = smem_indices[i]; smem_indices[i] = smem_indices[ixj]; smem_indices[ixj] = temp_i;
+                      float temp_s = smem_scores[i + (i >> 5)]; smem_scores[i + (i >> 5)] = smem_scores[ixj + (ixj >> 5)]; smem_scores[ixj + (ixj >> 5)] = temp_s;
+                      int temp_i = smem_indices[i + (i >> 5)]; smem_indices[i + (i >> 5)] = smem_indices[ixj + (ixj >> 5)]; smem_indices[ixj + (ixj >> 5)] = temp_i;
                   }
               }
           }
@@ -184,10 +185,10 @@ __global__ void FindBlockTopK_BitonicSort(const float* scores_in,
     for (int i = threadIdx.x; i < kSortSize; i += kBlockSize) {
       int ixj = i ^ j;
       if (ixj > i) {
-        if ((smem_scores[i] < smem_scores[ixj]) ||
-            (smem_scores[i] == smem_scores[ixj] && smem_indices[i] > smem_indices[ixj])) {
-          float temp_s = smem_scores[i]; smem_scores[i] = smem_scores[ixj]; smem_scores[ixj] = temp_s;
-          int temp_i = smem_indices[i]; smem_indices[i] = smem_indices[ixj]; smem_indices[ixj] = temp_i;
+        if ((smem_scores[i + (i >> 5)] < smem_scores[ixj + (ixj >> 5)]) ||
+            (smem_scores[i + (i >> 5)] == smem_scores[ixj + (ixj >> 5)] && smem_indices[i + (i >> 5)] > smem_indices[ixj + (ixj >> 5)])) {
+          float temp_s = smem_scores[i + (i >> 5)]; smem_scores[i + (i >> 5)] = smem_scores[ixj + (ixj >> 5)]; smem_scores[ixj + (ixj >> 5)] = temp_s;
+          int temp_i = smem_indices[i + (i >> 5)]; smem_indices[i + (i >> 5)] = smem_indices[ixj + (ixj >> 5)]; smem_indices[ixj + (ixj >> 5)] = temp_i;
         }
       }
     }
@@ -197,8 +198,8 @@ __global__ void FindBlockTopK_BitonicSort(const float* scores_in,
   // Have the first `max_k` threads write out the top results
   if (threadIdx.x < kBitonicSortMaxK) {
     int offset = (batch_idx * num_partitions + partition_idx) * kBitonicSortMaxK;
-    intermediate_scores[offset + threadIdx.x] = smem_scores[threadIdx.x];
-    intermediate_indices[offset + threadIdx.x] = smem_indices[threadIdx.x];
+    intermediate_scores[offset + threadIdx.x] = smem_scores[threadIdx.x + (threadIdx.x >> 5)];
+    intermediate_indices[offset + threadIdx.x] = smem_indices[threadIdx.x + (threadIdx.x >> 5)];
   }
 }
 
@@ -207,15 +208,16 @@ template <int kBlockSize, int K, int PartitionsPerBlock>
 __global__ void BlockReduceTopK(const float* scores_in, const int* indices_in,
                                 float* scores_out, int* indices_out,
                                 int num_partitions_in) {
+  extern __shared__ unsigned char smem_buf[];
+  constexpr int SortSize = K * PartitionsPerBlock;
+  float* smem_scores = reinterpret_cast<float*>(smem_buf);
+  int* smem_indices = reinterpret_cast<int*>(smem_scores + (SortSize + SortSize / 32));
+
   const int batch_idx = blockIdx.y;
   const int block_start_partition = blockIdx.x * PartitionsPerBlock;
 
   // Determine how many partitions this block actually needs to process.
   const int num_partitions_to_process = min(PartitionsPerBlock, num_partitions_in - block_start_partition);
-
-  constexpr int SortSize = K * PartitionsPerBlock;
-  __shared__ float smem_scores[SortSize];
-  __shared__ int smem_indices[SortSize];
 
   const int in_base_offset = batch_idx * num_partitions_in * K;
   const int out_base_offset = (batch_idx * gridDim.x + blockIdx.x) * K;
@@ -225,14 +227,16 @@ __global__ void BlockReduceTopK(const float* scores_in, const int* indices_in,
     int partition_idx = i / K;
     int element_idx = i % K;
     int global_offset = in_base_offset + (block_start_partition + partition_idx) * K + element_idx;
-    smem_scores[i] = scores_in[global_offset];
-    smem_indices[i] = indices_in[global_offset];
+    int smem_idx = i + (i >> 5);
+    smem_scores[smem_idx] = scores_in[global_offset];
+    smem_indices[smem_idx] = indices_in[global_offset];
   }
 
   // Pad the rest of the shared memory if this block has fewer partitions than the max.
   for (int i = K * num_partitions_to_process + threadIdx.x; i < SortSize; i += kBlockSize) {
-      smem_scores[i] = -std::numeric_limits<float>::max();
-      smem_indices[i] = -1;
+      int smem_idx = i + (i >> 5);
+      smem_scores[smem_idx] = -std::numeric_limits<float>::max();
+      smem_indices[smem_idx] = -1;
   }
   __syncthreads();
 
@@ -241,8 +245,9 @@ __global__ void BlockReduceTopK(const float* scores_in, const int* indices_in,
 
   // Step 3: Write the final top K result for this block to global memory.
   if (threadIdx.x < K) {
-    indices_out[out_base_offset + threadIdx.x] = smem_indices[threadIdx.x];
-    scores_out[out_base_offset + threadIdx.x] = smem_scores[threadIdx.x];
+    int smem_idx = threadIdx.x + (threadIdx.x >> 5);
+    indices_out[out_base_offset + threadIdx.x] = smem_indices[smem_idx];
+    scores_out[out_base_offset + threadIdx.x] = smem_scores[smem_idx];
   }
 }
 
@@ -250,6 +255,7 @@ __global__ void BlockReduceTopK(const float* scores_in, const int* indices_in,
 void RunTopKViaMapReduceBitonicSort(SamplingData* data, cudaStream_t stream, float* scores_in, float* scores_out, int* indices_out, int vocab_size, int batch_size, int k, float temperature, int num_partitions, int sort_size) {
   constexpr int block_size = 256;
   const int max_k = kBitonicSortMaxK; // The fixed size of intermediate results
+  size_t smem_size = (sort_size + sort_size / 32) * (sizeof(float) + sizeof(int));
 
   // Stage 1: Map Phase - Find top-k within each partition of the vocabulary.
   dim3 grid_stage1(num_partitions, batch_size);
@@ -257,13 +263,13 @@ void RunTopKViaMapReduceBitonicSort(SamplingData* data, cudaStream_t stream, flo
 
   switch (sort_size) {
     case 512:
-      FindBlockTopK_BitonicSort<block_size, 512><<<grid_stage1, block_stage1, 0, stream>>>(scores_in, data->indices_in.get(), data->scores_buffer.get(), vocab_size, num_partitions); break;
+      FindBlockTopK_BitonicSort<block_size, 512><<<grid_stage1, block_stage1, smem_size, stream>>>(scores_in, data->indices_in.get(), data->scores_buffer.get(), vocab_size, num_partitions); break;
     case 1024:
-      FindBlockTopK_BitonicSort<block_size, 1024><<<grid_stage1, block_stage1, 0, stream>>>(scores_in, data->indices_in.get(), data->scores_buffer.get(), vocab_size, num_partitions); break;
+      FindBlockTopK_BitonicSort<block_size, 1024><<<grid_stage1, block_stage1, smem_size, stream>>>(scores_in, data->indices_in.get(), data->scores_buffer.get(), vocab_size, num_partitions); break;
     case 2048:
-      FindBlockTopK_BitonicSort<block_size, 2048><<<grid_stage1, block_stage1, 0, stream>>>(scores_in, data->indices_in.get(), data->scores_buffer.get(), vocab_size, num_partitions); break;
+      FindBlockTopK_BitonicSort<block_size, 2048><<<grid_stage1, block_stage1, smem_size, stream>>>(scores_in, data->indices_in.get(), data->scores_buffer.get(), vocab_size, num_partitions); break;
     case 4096:
-      FindBlockTopK_BitonicSort<block_size, 4096><<<grid_stage1, block_stage1, 0, stream>>>(scores_in, data->indices_in.get(), data->scores_buffer.get(), vocab_size, num_partitions); break;
+      FindBlockTopK_BitonicSort<block_size, 4096><<<grid_stage1, block_stage1, smem_size, stream>>>(scores_in, data->indices_in.get(), data->scores_buffer.get(), vocab_size, num_partitions); break;
     default:
       assert(false && "Unsupported sort_size"); break;
   }
@@ -282,8 +288,11 @@ void RunTopKViaMapReduceBitonicSort(SamplingData* data, cudaStream_t stream, flo
     
     dim3 grid_reduce(num_blocks, batch_size);
     dim3 block_reduce(block_size);
+    
+    constexpr int reduce_sort_size = max_k * partitions_per_block;
+    size_t reduce_smem_size = (reduce_sort_size + reduce_sort_size / 32) * (sizeof(float) + sizeof(int));
 
-    BlockReduceTopK<block_size, max_k, partitions_per_block><<<grid_reduce, block_reduce, 0, stream>>>(
+    BlockReduceTopK<block_size, max_k, partitions_per_block><<<grid_reduce, block_reduce, reduce_smem_size, stream>>>(
         input_scores, input_indices,
         output_scores, output_indices,
         current_num_partitions);
