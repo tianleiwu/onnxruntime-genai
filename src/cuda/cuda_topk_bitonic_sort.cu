@@ -76,6 +76,7 @@ __device__ void RegisterBitonicSort(float scores[N], int indices[N]) {
   // Build the bitonic sequence
   for (int k = 2; k <= N; k <<= 1) {
     for (int j = k >> 1; j > 0; j >>= 1) {
+      // #pragma unroll
       for (int i = 0; i < N; ++i) {
         int ixj = i ^ j;
         if (ixj > i) {
@@ -92,6 +93,7 @@ __device__ void RegisterBitonicSort(float scores[N], int indices[N]) {
 
   // Sort the bitonic sequence descending
   for (int j = N >> 1; j > 0; j >>= 1) {
+    // #pragma unroll
     for (int i = 0; i < N; ++i) {
       int ixj = i ^ j;
       if (ixj > i) {

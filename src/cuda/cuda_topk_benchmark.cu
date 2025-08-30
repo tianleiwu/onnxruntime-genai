@@ -108,8 +108,8 @@ TopKConfig BenchmarkAndGetBestAlgorithm(SamplingData* data, cudaStream_t stream,
 
   benchmark_algorithm({TopKAlgorithm::SELECTION_SORT}, [&]() { RunTopKViaSelectionSort(data, stream, d_rand_scores.get(), d_rand_out.get(), d_rand_indices.get(), vocab_size, batch_size, k, temperature); });
 
-  for (int sort_size : {512, 1024, 2048, 4096}) {
-    for (int num_partitions : {32, 64, 128, 256}) {
+  for (int sort_size : {256, 512, 1024, 2048, 4096}) {
+    for (int num_partitions : {16, 32, 64, 128, 256, 512, 1024}) {
       assert(num_partitions <= kBitonicSortMaxPartitions);
       // Check if the partition size is valid for the given sort_size
       if (vocab_size <= sort_size * num_partitions && vocab_size > sort_size * num_partitions / 2) {

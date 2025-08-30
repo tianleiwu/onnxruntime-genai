@@ -4,6 +4,7 @@
 #pragma once
 
 #include "cuda_sampling.h"
+#include "cuda_topk_bitonic_sort_v0.h" 
 
 namespace Generators {
 namespace cuda {
