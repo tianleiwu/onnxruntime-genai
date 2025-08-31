@@ -3,9 +3,11 @@
 
 #include "cuda_topk_helper.h"
 #include "cuda_sampling.h"
+#include "cuda_topk_baseline.h"
 
 namespace Generators {
 namespace cuda {
+namespace baseline {
 
 // START of improved Top-K kernel (Selection Sort approach)
 struct TopK_2 {
@@ -77,7 +79,7 @@ void LaunchGetTopK(cudaStream_t stream, float* scores_in, float* scores_out, int
   CUDA_CHECK(cudaGetLastError());
 }
 
-void RunTopKViaSelectionSort(SamplingData* data, cudaStream_t stream, float* scores_in, float* scores_out, int* indices_out, int vocab_size, int batch_size, int k, float temperature) {
+void RunTopKViaBaseline(SamplingData* data, cudaStream_t stream, float* scores_in, float* scores_out, int* indices_out, int vocab_size, int batch_size, int k, float temperature) {
   // The output of the kernel will be the top-k raw scores. We'll store
   // these in another pre-allocated buffer, `scores_buffer`.
   float* raw_topk_scores = data->scores_buffer.get();
@@ -91,6 +93,7 @@ void RunTopKViaSelectionSort(SamplingData* data, cudaStream_t stream, float* sco
   ApplySoftmaxToSortedTopK<false>(stream, scores_out, nullptr, raw_topk_scores, nullptr, k, batch_size, k, temperature);
 }
 
-}  // namespace cuda
-}  // namespace Generators
+} // namespace baseline
+} // namespace cuda
+} // namespace Generators
 

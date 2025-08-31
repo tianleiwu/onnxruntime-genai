@@ -68,20 +68,13 @@ void LaunchSort(SamplingData* data, cudaStream_t stream, float* scores_in, float
 
 void RunTopKViaFullSort(SamplingData* data, cudaStream_t stream, float* scores_in, float* scores_out, int* indices_out, int vocab_size, int batch_size, int k, float temperature) {
   // Step 1: Perform a full, segmented sort on the input scores.
-  // The results (sorted scores and indices) are stored in temporary buffers.
   float* sorted_scores = data->scores_buffer.get();
   int* sorted_indices = data->indices_in.get();
   LaunchSort(data, stream, scores_in, sorted_scores, sorted_indices, vocab_size, batch_size);
 
-  // Step 2: Launch a specialized kernel to handle the final steps.
-  // This kernel will:
-  //   a) Copy the top 'k' indices for each batch item from the sorted temporary buffer to the final output buffer.
-  //   b) Read the corresponding top 'k' scores.
-  //   c) Apply the temperature scaling to these scores.
-  //   d) Compute the softmax on the scaled scores.
-  //   e) Write the final softmax probabilities to the output scores buffer.
-  // The 'vocab_size' is passed as the input_stride to correctly index into the sorted results for each batch item.
-  CopyAndSoftmax<false>(stream, batch_size, indices_out, scores_out, sorted_indices, sorted_scores, k, temperature, vocab_size);
+  // Step 2: Launch a specialized kernel that leverages the pre-sorted nature of the data.
+  // This is faster than the general-purpose `ApplySoftmaxToTopK` because it avoids a reduction.
+  ApplySoftmaxToSortedTopK<true>(stream, scores_out, indices_out, sorted_scores, sorted_indices, k, batch_size, vocab_size, temperature);
 }
 
 }

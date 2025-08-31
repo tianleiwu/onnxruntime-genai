@@ -126,14 +126,20 @@ void RunParityTests(const BenchmarkParams& params, float temperature) {
       Generators::cuda::RunTopKViaSelectionSort(sampling_data.get(), stream, scores_in_d_copy.get(), s_d, i_d, params.vocab_size, params.batch_size, params.k, temperature);
     });
 
+    test_algo("SELECTION_SORT", [&](float* s_d, int* i_d) {
+      // Selection Sort kernel will change scores_in inplace so we use a copy here.
+      Generators::cuda::baseline::RunTopKViaBaseline(sampling_data.get(), stream, scores_in_d_copy.get(), s_d, i_d, params.vocab_size, params.batch_size, params.k, temperature);
+    });
+
+
     for (int sort_size : {256, 512, 1024, 2048, 4096}) {
       for (int num_partitions : {16, 32, 64, 128, 256, 512, 1024}) {
         assert(num_partitions <= Generators::cuda::kBitonicSortMaxPartitions);
         if (params.vocab_size <= sort_size * num_partitions && params.vocab_size >= sort_size * num_partitions / 2) {
-          std::string algo_name_v0 = "BITONIC_V0 (s=" + std::to_string(sort_size) + ",p=" + std::to_string(num_partitions) + ")";
-          test_algo(algo_name_v0, [&](float* s_d, int* i_d) {
-            Generators::cuda::v0::RunTopKViaMapReduceBitonicSort_v0(sampling_data.get(), stream, scores_in_d.get(), s_d, i_d, params.vocab_size, params.batch_size, params.k, temperature, num_partitions, sort_size);
-          });
+          // std::string algo_name_v0 = "BITONIC_V0 (s=" + std::to_string(sort_size) + ",p=" + std::to_string(num_partitions) + ")";
+          // test_algo(algo_name_v0, [&](float* s_d, int* i_d) {
+          //   Generators::cuda::v0::RunTopKViaMapReduceBitonicSort_v0(sampling_data.get(), stream, scores_in_d.get(), s_d, i_d, params.vocab_size, params.batch_size, params.k, temperature, num_partitions, sort_size);
+          // });
 
           std::string algo_name = "BITONIC (s=" + std::to_string(sort_size) + ",p=" + std::to_string(num_partitions) + ")";
           test_algo(algo_name, [&](float* s_d, int* i_d) {
@@ -301,6 +307,10 @@ void RunBenchmarks() {
         Generators::cuda::RunTopKViaSelectionSort(sampling_data.get(), stream, scores_in.get(), scores_out.get(), indices_out.get(), params.vocab_size, params.batch_size, params.k, temperature);
       });
 
+      measure_latency("BASELINE", 0, 256, [&]() {
+        Generators::cuda::baseline::RunTopKViaBaseline(sampling_data.get(), stream, scores_in.get(), scores_out.get(), indices_out.get(), params.vocab_size, params.batch_size, params.k, temperature);
+      });
+
       // This supports from vocabulary size in the range of (256 * 32 / 2, 4096 * 256], that is from 4K (exclusive) to 1M (inclusive).
       for (int sort_size : {256, 512, 1024, 2048, 4096}) {
         for (int num_partitions : {16, 32, 64, 128, 256, 512, 1024}) {
@@ -311,10 +321,10 @@ void RunBenchmarks() {
               Generators::cuda::RunTopKViaMapReduceBitonicSort(sampling_data.get(), stream, scores_in.get(), scores_out.get(), indices_out.get(), params.vocab_size, params.batch_size, params.k, temperature, num_partitions, sort_size);
             });
 
-            std::string algo_name_v0 = "BITONIC_V0 (s=" + std::to_string(sort_size) + ",p=" + std::to_string(num_partitions) + ")";
-            measure_latency(algo_name_v0, num_partitions, 256, [&, sort_size, num_partitions]() {
-              Generators::cuda::v0::RunTopKViaMapReduceBitonicSort_v0(sampling_data.get(), stream, scores_in.get(), scores_out.get(), indices_out.get(), params.vocab_size, params.batch_size, params.k, temperature, num_partitions, sort_size);
-            });
+            // std::string algo_name_v0 = "BITONIC_V0 (s=" + std::to_string(sort_size) + ",p=" + std::to_string(num_partitions) + ")";
+            // measure_latency(algo_name_v0, num_partitions, 256, [&, sort_size, num_partitions]() {
+            //   Generators::cuda::v0::RunTopKViaMapReduceBitonicSort_v0(sampling_data.get(), stream, scores_in.get(), scores_out.get(), indices_out.get(), params.vocab_size, params.batch_size, params.k, temperature, num_partitions, sort_size);
+            // });
           }
         }
       }

@@ -278,7 +278,9 @@ void RunTopKViaMapReduceBitonicSort(SamplingData* data, cudaStream_t stream, flo
   int* final_reduced_indices = input_indices;
 
   // Stage 3: Final Copy and Softmax
-  CopyAndSoftmax<false>(stream, batch_size, indices_out, scores_out, final_reduced_indices, final_reduced_scores, k, temperature, max_k);
+  ApplySoftmaxToSortedTopK<true>(stream, scores_out, indices_out,
+                                 final_reduced_scores, final_reduced_indices,
+                                 k, batch_size, max_k, temperature);
 }
 
 void GetTopKSubset(SamplingData* data, cudaStream_t stream, float* scores_in, float* scores_out, int* indices_out, int vocab_size, int batch_size, int k, float temperature) {
@@ -304,4 +306,3 @@ void GetTopKSubset(SamplingData* data, cudaStream_t stream, float* scores_in, fl
 
 }  // namespace cuda
 }  // namespace Generators
-
