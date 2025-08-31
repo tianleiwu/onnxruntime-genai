@@ -19,6 +19,7 @@
 
 #include "cuda_runtime.h"
 #include "smartptrs.h"
+#include "statistics_helper.h"
 #include "../src/cuda/cuda_topk.h"
 
 // Robust CUDA error checking macro
@@ -45,7 +46,11 @@ struct BenchmarkResult {
   std::string algo_name;
   int num_partitions;
   int block_size;
+
   float latency_ms;
+  float latency_ms_stdev;
+  float latency_ms_median;
+  float latency_ms_95_percentile;
 };
 
 // Global mutex to serialize benchmark tests
@@ -123,23 +128,17 @@ void RunParityTests(const BenchmarkParams& params, float temperature) {
   if (params.k <= 64) {
     test_algo("SELECTION_SORT", [&](float* s_d, int* i_d) {
       // Selection Sort kernel will change scores_in inplace so we use a copy here.
-      Generators::cuda::RunTopKViaSelectionSort(sampling_data.get(), stream, scores_in_d_copy.get(), s_d, i_d, params.vocab_size, params.batch_size, params.k, temperature);
+        Generators::cuda::RunTopKViaSelectionSort(sampling_data.get(), stream, scores_in_d_copy.get(), s_d, i_d, params.vocab_size, params.batch_size, params.k, temperature);
     });
-
-    test_algo("SELECTION_SORT", [&](float* s_d, int* i_d) {
-      // Selection Sort kernel will change scores_in inplace so we use a copy here.
-      Generators::cuda::baseline::RunTopKViaBaseline(sampling_data.get(), stream, scores_in_d_copy.get(), s_d, i_d, params.vocab_size, params.batch_size, params.k, temperature);
-    });
-
 
     for (int sort_size : {256, 512, 1024, 2048, 4096}) {
       for (int num_partitions : {16, 32, 64, 128, 256, 512, 1024}) {
         assert(num_partitions <= Generators::cuda::kBitonicSortMaxPartitions);
         if (params.vocab_size <= sort_size * num_partitions && params.vocab_size >= sort_size * num_partitions / 2) {
-          // std::string algo_name_v0 = "BITONIC_V0 (s=" + std::to_string(sort_size) + ",p=" + std::to_string(num_partitions) + ")";
-          // test_algo(algo_name_v0, [&](float* s_d, int* i_d) {
-          //   Generators::cuda::v0::RunTopKViaMapReduceBitonicSort_v0(sampling_data.get(), stream, scores_in_d.get(), s_d, i_d, params.vocab_size, params.batch_size, params.k, temperature, num_partitions, sort_size);
-          // });
+          std::string new_algo_name = "HYBRID (s=" + std::to_string(sort_size) + ",p=" + std::to_string(num_partitions) + ")";
+          test_algo(new_algo_name, [&](float* s_d, int* i_d) {
+            Generators::cuda::RunTopKViaHybridSort(sampling_data.get(), stream, scores_in_d.get(), s_d, i_d, params.vocab_size, params.batch_size, params.k, temperature, num_partitions, sort_size);
+          });
 
           std::string algo_name = "BITONIC (s=" + std::to_string(sort_size) + ",p=" + std::to_string(num_partitions) + ")";
           test_algo(algo_name, [&](float* s_d, int* i_d) {
@@ -153,6 +152,12 @@ void RunParityTests(const BenchmarkParams& params, float temperature) {
   CUDA_CHECK(cudaStreamDestroy(stream));
 }
 
+inline std::string format_latency_ms_to_us(float value, int precision = 2) {
+    std::ostringstream oss;
+    oss << std::fixed << std::setprecision(precision) << value * 100;
+    return oss.str();
+}
+
 // Function to print a summary of benchmark results in CSV format
 void PrintSummary(const std::vector<BenchmarkResult>& all_results) {
   // This struct holds the aggregated data for a unique key (batch_size, vocab_size, k)
@@ -162,6 +167,7 @@ void PrintSummary(const std::vector<BenchmarkResult>& all_results) {
     float latency_full_sort = -1.0f;
     float latency_selection_sort = -1.0f;
     float latency_bitonic_sort = -1.0f;
+    float latency_hybrid_sort = -1.0f;
   };
 
   // Use a map to group results by their parameters
@@ -185,14 +191,18 @@ void PrintSummary(const std::vector<BenchmarkResult>& all_results) {
       summary_map[key].latency_full_sort = result.latency_ms;
     } else if (result.algo_name == "SELECTION_SORT") {
       summary_map[key].latency_selection_sort = result.latency_ms;
-    } else {
+    } else if (result.algo_name.rfind("BITONIC", 0) == 0) {
       summary_map[key].latency_bitonic_sort = summary_map[key].latency_bitonic_sort > 0 ? std::min(result.latency_ms, summary_map[key].latency_bitonic_sort) : result.latency_ms;
+    } else if (result.algo_name.rfind("HYBRID", 0) == 0) {
+      summary_map[key].latency_hybrid_sort = summary_map[key].latency_hybrid_sort > 0 ? std::min(result.latency_ms, summary_map[key].latency_hybrid_sort) : result.latency_ms;
+    } else {
+      std::cerr << "Unknown algo name:" << result.algo_name;
     }
   }
 
   // Print the CSV header
   std::cout << "\n--- Benchmark Summary (CSV) ---\n";
-  std::cout << "batch_size,vocab_size,k,full_sort,selection_sort,bitonic_sort,full/selection,full/bitonic,selection/bitonic,best\n";
+  std::cout << "batch_size,vocab_size,k,full_sort,selection_sort,bitonic_sort,hybrid_sort,selection/bitonic,hybrid/bitonic,best\n";
 
   // Print each row of the summary table
   for (const auto& pair : summary_map) {
@@ -200,18 +210,17 @@ void PrintSummary(const std::vector<BenchmarkResult>& all_results) {
     const auto& data = pair.second;
 
     // Calculate performance ratios against the baselines
-    float ratio_0 = (data.latency_full_sort > 0 && data.latency_selection_sort > 0) ? data.latency_full_sort / data.latency_selection_sort : 0.0f;
-    float ratio_1 = (data.latency_bitonic_sort > 0 && data.latency_full_sort > 0) ? data.latency_full_sort / data.latency_bitonic_sort : 0.0f;
-    float ratio_2 = (data.latency_bitonic_sort > 0 && data.latency_selection_sort > 0) ? data.latency_selection_sort / data.latency_bitonic_sort : 0.0f;
+    float ratio_1 = (data.latency_bitonic_sort > 0 && data.latency_selection_sort > 0) ? data.latency_selection_sort / data.latency_bitonic_sort : 0.0f;
+    float ratio_2 = (data.latency_bitonic_sort > 0 && data.latency_hybrid_sort > 0) ? data.latency_hybrid_sort / data.latency_bitonic_sort : 0.0f;
 
     std::cout << std::get<0>(key) << ","
               << std::get<1>(key) << ","
               << std::get<2>(key) << ","
-              << std::fixed << std::setprecision(4)
-              << (data.latency_full_sort > 0 ? std::to_string(data.latency_full_sort) : "N/A") << ","
-              << (data.latency_selection_sort > 0 ? std::to_string(data.latency_selection_sort) : "N/A") << ","
-              << (data.latency_bitonic_sort > 0 ? std::to_string(data.latency_bitonic_sort) : "N/A") << ","
-              << std::fixed << std::setprecision(2) << ratio_0 << "," << ratio_1 << "," << ratio_2 << ","
+              << (data.latency_full_sort > 0 ? format_latency_ms_to_us(data.latency_full_sort) : "N/A") << ","
+              << (data.latency_selection_sort > 0 ? format_latency_ms_to_us(data.latency_selection_sort) : "N/A") << ","
+              << (data.latency_bitonic_sort > 0 ? format_latency_ms_to_us(data.latency_bitonic_sort) : "N/A") << ","
+              << (data.latency_hybrid_sort > 0 ? format_latency_ms_to_us(data.latency_hybrid_sort) : "N/A") << ","
+              << std::fixed << std::setprecision(3) << ratio_1 << "," << ratio_2 << ","
               << "\"" << data.best_algo_full_name << "\"" << "\n";
   }
 }
@@ -246,14 +255,14 @@ void RunBenchmarks() {
   }
 
   constexpr int warmup_runs = 5;
-  constexpr int timing_runs = comprehensive ? 1000 : 10000;
+  constexpr int timing_runs = comprehensive ? 1000 : 2000;
   constexpr float temperature = 0.9f;
 
   std::vector<BenchmarkResult> all_results;
 
   cudaStream_t stream;
   CUDA_CHECK(cudaStreamCreate(&stream));
-
+  bool is_first_run = false;
   for (const auto& params : configs) {
     std::cout << "\nRunning benchmark for: batch_size=" << params.batch_size
               << ", vocab_size=" << params.vocab_size
@@ -273,7 +282,7 @@ void RunBenchmarks() {
 
     const int total_size = params.batch_size * params.vocab_size;
 
-    auto measure_latency = [&](const std::string& name, int num_partitions, int block_size, auto func) {
+    auto measure_latency = [&](const std::string& name, std::vector<double>& latency_list, int num_partitions, int block_size, auto func) {
       // Warmup
       for (int i = 0; i < warmup_runs; ++i) {
         // Regenerate data for each warmup run as well to ensure caches are not misleading
@@ -283,7 +292,7 @@ void RunBenchmarks() {
       CUDA_CHECK(cudaStreamSynchronize(stream));
 
       // Timing
-      float total_ms = 0.0f;
+      latency_list.resize(timing_runs);
       for (int i = 0; i < timing_runs; ++i) {
         // Regenerate random data before each timed run to bust caches
         Generators::cuda::RandomTopkInput(stream, scores_in.get(), sampling_data->curand_states.get(), total_size, params.batch_size);
@@ -295,20 +304,28 @@ void RunBenchmarks() {
         CUDA_CHECK(cudaEventSynchronize(stop));
         float ms = 0.0f;
         CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
-        total_ms += ms;
+        latency_list[i] = static_cast<double>(ms);
       }
-      all_results.push_back({params, name, num_partitions, block_size, total_ms / timing_runs});
+
+      all_results.push_back({params, name, num_partitions, block_size,
+                              static_cast<float>(mean(latency_list)),
+                              static_cast<float>(stdev(latency_list)),
+                              static_cast<float>(median(latency_list)),
+                              static_cast<float>(percentile(latency_list, 95))});
     };
 
     // --- Run Benchmarks for each algorithm ---
+    std::vector<double> latency_list;
+    if (is_first_run) {
+      measure_latency("SELECTION_SORT_FIRST_RUN", latency_list, 0, 256, [&]() {
+          Generators::cuda::RunTopKViaSelectionSort(sampling_data.get(), stream, scores_in.get(), scores_out.get(), indices_out.get(), params.vocab_size, params.batch_size, params.k, temperature);
+      });
+      is_first_run = false;
+    }
 
     if (params.k <= 64) {
-      measure_latency("SELECTION_SORT", 0, 256, [&]() {
-        Generators::cuda::RunTopKViaSelectionSort(sampling_data.get(), stream, scores_in.get(), scores_out.get(), indices_out.get(), params.vocab_size, params.batch_size, params.k, temperature);
-      });
-
-      measure_latency("BASELINE", 0, 256, [&]() {
-        Generators::cuda::baseline::RunTopKViaBaseline(sampling_data.get(), stream, scores_in.get(), scores_out.get(), indices_out.get(), params.vocab_size, params.batch_size, params.k, temperature);
+      measure_latency("SELECTION_SORT", latency_list, 0, 256, [&]() {
+          Generators::cuda::RunTopKViaSelectionSort(sampling_data.get(), stream, scores_in.get(), scores_out.get(), indices_out.get(), params.vocab_size, params.batch_size, params.k, temperature);
       });
 
       // This supports from vocabulary size in the range of (256 * 32 / 2, 4096 * 256], that is from 4K (exclusive) to 1M (inclusive).
@@ -316,21 +333,27 @@ void RunBenchmarks() {
         for (int num_partitions : {16, 32, 64, 128, 256, 512, 1024}) {
           assert(num_partitions <= Generators::cuda::kBitonicSortMaxPartitions);
           if (params.vocab_size <= sort_size * num_partitions && params.vocab_size >= sort_size * num_partitions / 2) {
+            std::vector<double> baseline_latency_list;
+            std::string new_algo_name = "HYBRID (s=" + std::to_string(sort_size) + ",p=" + std::to_string(num_partitions) + ")";
+            measure_latency(new_algo_name, baseline_latency_list, num_partitions, 256, [&, sort_size, num_partitions]() {
+              Generators::cuda::RunTopKViaHybridSort(sampling_data.get(), stream, scores_in.get(), scores_out.get(), indices_out.get(), params.vocab_size, params.batch_size, params.k, temperature, num_partitions, sort_size);
+            });
+
             std::string algo_name = "BITONIC (s=" + std::to_string(sort_size) + ",p=" + std::to_string(num_partitions) + ")";
-            measure_latency(algo_name, num_partitions, 256, [&, sort_size, num_partitions]() {
+            measure_latency(algo_name, latency_list, num_partitions, 256, [&, sort_size, num_partitions]() {
               Generators::cuda::RunTopKViaMapReduceBitonicSort(sampling_data.get(), stream, scores_in.get(), scores_out.get(), indices_out.get(), params.vocab_size, params.batch_size, params.k, temperature, num_partitions, sort_size);
             });
 
-            // std::string algo_name_v0 = "BITONIC_V0 (s=" + std::to_string(sort_size) + ",p=" + std::to_string(num_partitions) + ")";
-            // measure_latency(algo_name_v0, num_partitions, 256, [&, sort_size, num_partitions]() {
-            //   Generators::cuda::v0::RunTopKViaMapReduceBitonicSort_v0(sampling_data.get(), stream, scores_in.get(), scores_out.get(), indices_out.get(), params.vocab_size, params.batch_size, params.k, temperature, num_partitions, sort_size);
-            // });
+            // Compare two alogrithms to see whether there is significant difference.
+            if (sort_size == 512 && params.vocab_size == 201088) {
+              compare_statistics(baseline_latency_list, latency_list, new_algo_name, algo_name);
+            }
           }
         }
       }
     }
 
-    measure_latency("FULL_SORT", 0, 256, [&]() {
+    measure_latency("FULL_SORT", latency_list, 0, 256, [&]() {
       Generators::cuda::RunTopKViaFullSort(sampling_data.get(), stream, scores_in.get(), scores_out.get(), indices_out.get(), params.vocab_size, params.batch_size, params.k, temperature);
     });
 
@@ -346,7 +369,11 @@ void RunBenchmarks() {
             << std::setw(12) << "Vocab Size"
             << std::setw(5) << "K"
             << std::setw(28) << "Algorithm"
-            << "Latency (ms)\n";
+            << std::setw(12) <<"Latency(ms)"
+            << std::setw(12) <<"stdev"
+            << std::setw(12) <<"median"
+            << std::setw(12) <<"percentile_95"
+            << "\n";
   std::cout << std::string(97, '-') << "\n";
 
   for (const auto& result : all_results) {
@@ -354,7 +381,12 @@ void RunBenchmarks() {
               << std::setw(12) << result.params.vocab_size
               << std::setw(5) << result.params.k
               << std::setw(28) << result.algo_name
-              << std::fixed << std::setprecision(4) << result.latency_ms << "\n";
+              << std::fixed << std::setprecision(2)
+              << std::setw(12) << result.latency_ms * 1000.0f
+              << std::setw(12) << result.latency_ms_stdev * 1000.0f
+              << std::setw(12) << result.latency_ms_median * 1000.0f
+              << std::setw(12) << result.latency_ms_95_percentile * 1000.0f
+              << "\n";
   }
 
   // --- Print CSV Summary ---
@@ -364,7 +396,7 @@ void RunBenchmarks() {
 TEST(TopKTests, ParityTests) {
   std::lock_guard<std::mutex> lock(benchmark_mutex);
   std::vector<BenchmarkParams> test_cases = {
-      {1, 10000, 50}, {2, 10000, 64}, {1, 32000, 1}, {1, 32000, 50}, {1, 512000, 50}  // Test case for bitonic sort
+      {1, 10000, 50}, {2, 10000, 64}, {1, 32000, 1}, {1, 32000, 16}, {1, 512000, 50} 
   };
 
   for (const auto& params : test_cases) {
