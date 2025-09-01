@@ -1,6 +1,8 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
+#pragma once
+
 #include "cuda_topk.h"
 #include <cub/cub.cuh>
 #include <limits>
@@ -9,6 +11,7 @@
 #include <cstdlib>
 
 // Robust CUDA error checking macro
+#ifndef CUDA_CHECK
 #define CUDA_CHECK(call)                                    \
   do {                                                      \
     cudaError_t err = call;                                 \
@@ -18,6 +21,7 @@
       exit(EXIT_FAILURE);                                   \
     }                                                       \
   } while (0)
+#endif
 
 namespace Generators {
 namespace cuda {

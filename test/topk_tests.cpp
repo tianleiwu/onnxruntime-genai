@@ -12,6 +12,7 @@
 #include <mutex>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
 #include <map>
 #include <tuple>
 #include <limits>
@@ -335,18 +336,34 @@ void RunBenchmarks() {
           if (params.vocab_size <= sort_size * num_partitions && params.vocab_size >= sort_size * num_partitions / 2) {
             std::vector<double> baseline_latency_list;
             std::string new_algo_name = "HYBRID (s=" + std::to_string(sort_size) + ",p=" + std::to_string(num_partitions) + ")";
-            measure_latency(new_algo_name, baseline_latency_list, num_partitions, 256, [&, sort_size, num_partitions]() {
-              Generators::cuda::RunTopKViaHybridSort(sampling_data.get(), stream, scores_in.get(), scores_out.get(), indices_out.get(), params.vocab_size, params.batch_size, params.k, temperature, num_partitions, sort_size);
-            });
-
             std::string algo_name = "BITONIC (s=" + std::to_string(sort_size) + ",p=" + std::to_string(num_partitions) + ")";
-            measure_latency(algo_name, latency_list, num_partitions, 256, [&, sort_size, num_partitions]() {
-              Generators::cuda::RunTopKViaMapReduceBitonicSort(sampling_data.get(), stream, scores_in.get(), scores_out.get(), indices_out.get(), params.vocab_size, params.batch_size, params.k, temperature, num_partitions, sort_size);
-            });
+
+            bool baseline_first = std::time(nullptr) % 2;
+            if (baseline_first) {
+              measure_latency(new_algo_name, baseline_latency_list, num_partitions, 256, [&, sort_size, num_partitions]() {
+                Generators::cuda::RunTopKViaHybridSort(sampling_data.get(), stream, scores_in.get(), scores_out.get(), indices_out.get(), params.vocab_size, params.batch_size, params.k, temperature, num_partitions, sort_size);
+              });
+              measure_latency(algo_name, latency_list, num_partitions, 256, [&, sort_size, num_partitions]() {
+                Generators::cuda::RunTopKViaMapReduceBitonicSort(sampling_data.get(), stream, scores_in.get(), scores_out.get(), indices_out.get(), params.vocab_size, params.batch_size, params.k, temperature, num_partitions, sort_size);
+              });
+            } else {
+              measure_latency(algo_name, latency_list, num_partitions, 256, [&, sort_size, num_partitions]() {
+                Generators::cuda::RunTopKViaMapReduceBitonicSort(sampling_data.get(), stream, scores_in.get(), scores_out.get(), indices_out.get(), params.vocab_size, params.batch_size, params.k, temperature, num_partitions, sort_size);
+              });
+              measure_latency(new_algo_name, baseline_latency_list, num_partitions, 256, [&, sort_size, num_partitions]() {
+                Generators::cuda::RunTopKViaHybridSort(sampling_data.get(), stream, scores_in.get(), scores_out.get(), indices_out.get(), params.vocab_size, params.batch_size, params.k, temperature, num_partitions, sort_size);
+              });
+            }
+            
 
             // Compare two alogrithms to see whether there is significant difference.
             if (sort_size == 512 && params.vocab_size == 201088) {
-              compare_statistics(baseline_latency_list, latency_list, new_algo_name, algo_name);
+              std::string parameters = "(sort_size=" + std::to_string(sort_size) + ",num_partitions=" + std::to_string(num_partitions) + ")";
+              std::string baseline = Generators::cuda::GetBitonicBaselineDescription();
+              std::string treatment = Generators::cuda::GetBitonicTreatmentDescription();
+              baseline = baseline + parameters;
+              treatment = treatment + parameters;
+              compare_statistics(baseline_latency_list, latency_list, baseline, treatment);
             }
           }
         }

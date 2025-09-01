@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
 #include "cuda_topk_helper.h"
 #include <iostream>
 #include <cmath>
@@ -7,10 +10,10 @@
 
 namespace Generators {
 namespace cuda {
-namespace bitonic_v4 { // hybrid sorting strategy
+namespace bitonic_v6 { // chunk permutation
+static const char* kAlgoDescription = "Bitonic v6 (chunk permutation)";
 
 // --- START: Device Helper Functions ---
-
 // Performs a full bitonic sort in shared memory for `SortSize` elements.
 // The final result is sorted in descending order.
 template <int kBlockSize, int SortSize>
@@ -40,15 +43,15 @@ __device__ void SharedMemBitonicSort(float* smem_scores, int* smem_indices) {
   // Phase 2: Sort the single bitonic sequence into descending order.
   for (int j = SortSize >> 1; j > 0; j >>= 1) {
     for (int i = threadIdx.x; i < SortSize; i += kBlockSize) {
-      int ixj = i ^ j;
-      if (ixj > i) {
+       int ixj = i ^ j;
+       if (ixj > i) {
         // Stable sort condition for final descending sort.
         if ((smem_scores[i] < smem_scores[ixj]) ||
             (smem_scores[i] == smem_scores[ixj] && smem_indices[i] > smem_indices[ixj])) {
           float temp_s = smem_scores[i]; smem_scores[i] = smem_scores[ixj]; smem_scores[ixj] = temp_s;
           int temp_i = smem_indices[i]; smem_indices[i] = smem_indices[ixj]; smem_indices[ixj] = temp_i;
         }
-      }
+       }
     }
     __syncthreads();
   }
@@ -98,7 +101,6 @@ __global__ void FindBlockTopK_BitonicSort(const float* scores_in,
                                           float* intermediate_scores,
                                           int vocab_size,
                                           int num_partitions) {
-  // Shared memory for sorting one partition. Its size must be a power of 2.
   __shared__ float smem_scores[kSortSize];
   __shared__ int smem_indices[kSortSize];
 
@@ -115,8 +117,8 @@ __global__ void FindBlockTopK_BitonicSort(const float* scores_in,
 
   // Load data from global memory into registers
   for (int i = 0; i < ElementsPerThread; ++i) {
-    int global_idx = partition_start + threadIdx.x * ElementsPerThread + i;
-    if (global_idx < partition_start + partition_size && global_idx < (batch_idx + 1) * vocab_size) {
+    int global_idx = partition_start + threadIdx.x + i * kBlockSize;
+    if (global_idx < partition_start + partition_size && global_idx < vocab_size) {
         reg_scores[i] = batch_scores_in[global_idx];
         reg_indices[i] = global_idx;
     } else {
@@ -130,8 +132,8 @@ __global__ void FindBlockTopK_BitonicSort(const float* scores_in,
   
   // Write the sorted chunks from registers to shared memory
   for (int i = 0; i < ElementsPerThread; ++i) {
-    smem_scores[threadIdx.x * ElementsPerThread + i] = reg_scores[i];
-    smem_indices[threadIdx.x * ElementsPerThread + i] = reg_indices[i];
+    smem_scores[threadIdx.x + i * kBlockSize] = reg_scores[i];
+    smem_indices[threadIdx.x + i * kBlockSize] = reg_indices[i];
   }
   __syncthreads();
 
@@ -182,15 +184,15 @@ template <int kBlockSize, int K, int PartitionsPerBlock>
 __global__ void BlockReduceTopK(const float* scores_in, const int* indices_in,
                                 float* scores_out, int* indices_out,
                                 int num_partitions_in) {
+  constexpr int SortSize = K * PartitionsPerBlock;
+  __shared__ float smem_scores[SortSize];
+  __shared__ int smem_indices[SortSize];
+
   const int batch_idx = blockIdx.y;
   const int block_start_partition = blockIdx.x * PartitionsPerBlock;
 
   // Determine how many partitions this block actually needs to process.
   const int num_partitions_to_process = min(PartitionsPerBlock, num_partitions_in - block_start_partition);
-
-  constexpr int SortSize = K * PartitionsPerBlock;
-  __shared__ float smem_scores[SortSize];
-  __shared__ int smem_indices[SortSize];
 
   const int in_base_offset = batch_idx * num_partitions_in * K;
   const int out_base_offset = (batch_idx * gridDim.x + blockIdx.x) * K;
@@ -265,7 +267,7 @@ inline void RunTopKViaMapReduceBitonicSort(SamplingData* data, cudaStream_t stre
     
     dim3 grid_reduce(num_blocks, batch_size);
     dim3 block_reduce(block_size);
-
+    
     BlockReduceTopK<block_size, max_k, partitions_per_block><<<grid_reduce, block_reduce, 0, stream>>>(
         input_scores, input_indices,
         output_scores, output_indices,
@@ -287,11 +289,7 @@ inline void RunTopKViaMapReduceBitonicSort(SamplingData* data, cudaStream_t stre
                                  final_reduced_scores, final_reduced_indices,
                                  k, batch_size, max_k, temperature);
 }
-} // bitonic_v4
 
-void RunTopKViaHybridSort(SamplingData* data, cudaStream_t stream, float* scores_in, float* scores_out, int* indices_out, int vocab_size, int batch_size, int k, float temperature, int num_partitions, int sort_size)
-{
-  bitonic_v4::RunTopKViaMapReduceBitonicSort(data, stream, scores_in, scores_out, indices_out, vocab_size, batch_size, k, temperature, num_partitions, sort_size);
-}
+} // namespace bitonic_v6
 }  // namespace cuda
 }  // namespace Generators

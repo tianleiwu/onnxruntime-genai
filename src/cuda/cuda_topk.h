@@ -47,6 +47,7 @@ void RunTopKViaMapReduceBitonicSort(SamplingData* data, cudaStream_t stream, flo
 // It is a place holder for experiments of new algorithms.
 void RunTopKViaHybridSort(SamplingData* data, cudaStream_t stream, float* scores_in, float* scores_out, int* indices_out, int vocab_size, int batch_size, int k, float temperature, int num_partitions, int sort_size);
 
-
+const char* GetBitonicBaselineDescription();
+const char* GetBitonicTreatmentDescription();
 }  // namespace cuda
 }  // namespace Generators

@@ -265,7 +265,6 @@ double call_python_mannwhitney(const std::vector<double>& A,
 void compare_statistics(const std::vector<double>& A, const std::vector<double>& B, std::string& name_A, std::string& name_B, bool is_small_better=true) {
     SampleStats statsA = SampleStats::compute(A);
     SampleStats statsB = SampleStats::compute(B);
-    std::cout << "\n" << "----" << "\n";
     std::cout << "A:" << name_A << "\n";
     std::cout << "B:" << name_B << "\n";
 
@@ -287,7 +286,8 @@ void compare_statistics(const std::vector<double>& A, const std::vector<double>&
 
     auto [ci_low, ci_high] = bootstrap_CI(A, B);
     std::cout << "Bootstrap 95% CI for mean diff: ["
-                << ci_low << ", " << ci_high << "]\n";
+              << std::fixed << std::setprecision(4)
+              << ci_low << ", " << ci_high << "]\n";
 
 #if USE_PYTHON_SCIPY > 0
     double p_value = call_python_mannwhitney(A, B);
@@ -299,5 +299,8 @@ void compare_statistics(const std::vector<double>& A, const std::vector<double>&
     if (p_value < 0.05f) {
         char winner = ((mean_diff < 0) ? (is_small_better? 'A' : 'B') : (is_small_better? 'B' : 'A'));
         std::cout << "Winner:" << (winner == 'A' ? name_A : name_B) << "\n";
+    } else {
+        std::cout << "Winner: None (pvalue is too large)" << "\n";
     }
+    std::cout << "----" << "\n";
 }
