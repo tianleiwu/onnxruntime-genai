@@ -14,7 +14,6 @@ static const char* kAlgoDescription = "Bitonic v17 (Corrected Shared Memory Sort
 /*
 Coalesced Load: The kernel retains the efficient, coalesced memory load pattern from global to registers, followed by a write to shared memory.
 
-Analysis of v17 and Path to v18
 The current v17 kernel (FindBlockTopK_CorrectedSort) has one primary inefficiency:
 
 Memory Access Pattern: It loads the entire partition from global memory into shared memory. This involves a strided access pattern (e.g., thread 0 loads index 0, thread 1 loads index 256, etc.), which is not ideal for memory bandwidth as it's not coalesced.
@@ -23,7 +22,7 @@ Over-sorting: It still sorts the entire partition (e.g., 2048 elements) in share
 
 The clear next step is to combine the superior memory access pattern of v10 with a more intelligent in-block reduction that avoids sorting the entire partition.
 
-Strategy for v18: Coalesced Reads and Parallel Merge-Reduction
+Strategy for vnext: Coalesced Reads and Parallel Merge-Reduction
 
 Coalesced Load to Registers: We will revert to the highly efficient memory load from v10. Each thread will read a contiguous chunk of ElementsPerThread from global memory directly into its private registers.
 
