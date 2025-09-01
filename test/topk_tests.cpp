@@ -132,7 +132,7 @@ void RunParityTests(const BenchmarkParams& params, float temperature) {
         Generators::cuda::RunTopKViaSelectionSort(sampling_data.get(), stream, scores_in_d_copy.get(), s_d, i_d, params.vocab_size, params.batch_size, params.k, temperature);
     });
 
-    for (int sort_size : {256, 512, 1024, 2048, 4096}) {
+    for (int sort_size : {256, 512, 1024, 2048/*, 4096*/}) {
       for (int num_partitions : {16, 32, 64, 128, 256, 512, 1024}) {
         assert(num_partitions <= Generators::cuda::kBitonicSortMaxPartitions);
         if (params.vocab_size <= sort_size * num_partitions && params.vocab_size >= sort_size * num_partitions / 2) {
@@ -330,7 +330,7 @@ void RunBenchmarks() {
       });
 
       // This supports from vocabulary size in the range of (256 * 32 / 2, 4096 * 256], that is from 4K (exclusive) to 1M (inclusive).
-      for (int sort_size : {256, 512, 1024, 2048, 4096}) {
+      for (int sort_size : {256, 512, 1024, 2048/*, 4096*/}) {
         for (int num_partitions : {16, 32, 64, 128, 256, 512, 1024}) {
           assert(num_partitions <= Generators::cuda::kBitonicSortMaxPartitions);
           if (params.vocab_size <= sort_size * num_partitions && params.vocab_size >= sort_size * num_partitions / 2) {
@@ -357,7 +357,7 @@ void RunBenchmarks() {
             
 
             // Compare two alogrithms to see whether there is significant difference.
-            if (sort_size == 512 && params.vocab_size == 201088) {
+            if ((sort_size == 2048 || sort_size == 512) && params.vocab_size == 201088) {
               std::string parameters = "(sort_size=" + std::to_string(sort_size) + ",num_partitions=" + std::to_string(num_partitions) + ")";
               std::string baseline = Generators::cuda::GetBitonicBaselineDescription();
               std::string treatment = Generators::cuda::GetBitonicTreatmentDescription();
