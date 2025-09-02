@@ -193,6 +193,9 @@ void RunTopKViaMapReduceBitonicSort(SamplingData* data, cudaStream_t stream, flo
     case 2048:
       FindBlockTopK_Coalesced_FullSort<block_size, 2048, max_k><<<grid_stage1, block_stage1, 0, stream>>>(scores_in, data->indices_in.get(), data->scores_buffer.get(), vocab_size, num_partitions_effective); 
       break;
+    case 4096:
+      FindBlockTopK_Coalesced_FullSort<block_size, 4096, max_k><<<grid_stage1, block_stage1, 0, stream>>>(scores_in, data->indices_in.get(), data->scores_buffer.get(), vocab_size, num_partitions_effective); 
+      break;      
     default:
       assert(false && "Unsupported partition_size"); 
       break;

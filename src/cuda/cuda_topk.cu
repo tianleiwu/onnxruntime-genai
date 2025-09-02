@@ -17,11 +17,12 @@
 // #include "cuda_topk_bitonic_sort_v21.cuh"
 // #include "cuda_topk_bitonic_sort_v22.cuh"
 #include "cuda_topk_bitonic_sort_v23.cuh"
+#include "cuda_topk_bitonic_sort_v24.cuh"
 
 namespace Generators {
 namespace cuda {
 
-// baseline
+// baseline - The previous best version
 const char* GetBitonicBaselineDescription() {
   return bitonic_v19::kAlgoDescription;
 }
@@ -29,12 +30,12 @@ void RunTopKViaHybridSort(SamplingData* data, cudaStream_t stream, float* scores
   bitonic_v19::RunTopKViaMapReduceBitonicSort(data, stream, scores_in, scores_out, indices_out, vocab_size, batch_size, k, temperature, num_partitions, sort_size);
 }
 
-// treatment
+// treatment - Now using v24
 const char* GetBitonicTreatmentDescription(){
-  return bitonic_v23::kAlgoDescription;
+  return bitonic_v24::kAlgoDescription;
 }
 void RunTopKViaMapReduceBitonicSort(SamplingData* data, cudaStream_t stream, float* scores_in, float* scores_out, int* indices_out, int vocab_size, int batch_size, int k, float temperature, int num_partitions, int sort_size) {
-  bitonic_v23::RunTopKViaMapReduceBitonicSort(data, stream, scores_in, scores_out, indices_out, vocab_size, batch_size, k, temperature, num_partitions, sort_size);
+  bitonic_v24::RunTopKViaMapReduceBitonicSort(data, stream, scores_in, scores_out, indices_out, vocab_size, batch_size, k, temperature, num_partitions, sort_size);
 }
 
 void GetTopKSubset(SamplingData* data, cudaStream_t stream, float* scores_in, float* scores_out, int* indices_out, int vocab_size, int batch_size, int k, float temperature) {

@@ -9,25 +9,10 @@
 
 namespace Generators {
 namespace cuda {
-namespace bitonic_v23 {
-static const char* kAlgoDescription = "Bitonic v23 (CUB Register Sort)";
+namespace bitonic_v24 {
+static const char* kAlgoDescription = "Bitonic v24 (CUB Register Sort with Balanced Write)";
 
-// A simple Key-Value struct for sorting.
-struct KeyValue {
-  float key;
-  int value;
-};
-
-// Custom comparison operator for sorting KeyValue pairs in descending order.
-struct CompareKeys {
-  __device__ __forceinline__ bool operator()(const KeyValue& a, const KeyValue& b) const {
-    if (a.key > b.key) return true;
-    if (a.key < b.key) return false;
-    return a.value < b.value;
-  }
-};
-
-// Top-K kernel using cub::BlockRadixSort directly on register data.
+// Top-K kernel using cub::BlockRadixSort directly on register data, with a balanced final write.
 template <int kBlockSize, int kPartitionSize, int K>
 __global__ void FindBlockTopK_CubRegisterSort(const float* __restrict__ scores_in,
                                               int* __restrict__ intermediate_indices,
@@ -36,8 +21,7 @@ __global__ void FindBlockTopK_CubRegisterSort(const float* __restrict__ scores_i
                                               int num_partitions) {
     constexpr int ItemsPerThread = kPartitionSize / kBlockSize;
 
-    // Specialize BlockRadixSort for our KeyValue struct.
-    // It will operate on data held in registers.
+    // Specialize BlockRadixSort for our key-value pairs.
     typedef cub::BlockRadixSort<float, kBlockSize, ItemsPerThread, int> BlockRadixSort;
     __shared__ typename BlockRadixSort::TempStorage temp_storage;
 
@@ -63,17 +47,20 @@ __global__ void FindBlockTopK_CubRegisterSort(const float* __restrict__ scores_i
     }
 
     // 2. Sort the keys and values held in registers across the entire block.
-    // The result is a sorted, striped layout across the threads.
+    // The result is a sorted, striped layout across the threads. This means
+    // thread 0 has rank 0, thread 1 has rank 1, etc.
     BlockRadixSort(temp_storage).SortDescendingBlockedToStriped(thread_keys, thread_values);
 
-    // 3. The first K threads now hold the top K elements in their first item.
-    // Write the final top K results to global memory.
+    // 3. The first K threads now hold the top K elements in their first item slot (`[0]`).
+    // Write the final top K results to global memory. This write is naturally balanced
+    // across the first K threads.
     if (threadIdx.x < K) {
         int offset = (batch_idx * num_partitions + partition_idx) * K;
         intermediate_scores[offset + threadIdx.x] = thread_keys[0];
         intermediate_indices[offset + threadIdx.x] = thread_values[0];
     }
 }
+
 
 void RunTopKViaMapReduceBitonicSort(SamplingData* data, cudaStream_t stream, float* scores_in, float* scores_out, int* indices_out, int vocab_size, int batch_size, int k, float temperature, int num_partitions, int partition_size_param) {
   const int max_k = kBitonicSortMaxK;
@@ -98,7 +85,7 @@ void RunTopKViaMapReduceBitonicSort(SamplingData* data, cudaStream_t stream, flo
       break;
     case 4096:
       FindBlockTopK_CubRegisterSort<block_size, 4096, max_k><<<grid_stage1, block_stage1, 0, stream>>>(scores_in, data->indices_in.get(), data->scores_buffer.get(), vocab_size, num_partitions_effective); 
-      break;
+      break;      
     default:
       // Should not be reached given the test configurations.
       break;
@@ -119,7 +106,6 @@ void RunTopKViaMapReduceBitonicSort(SamplingData* data, cudaStream_t stream, flo
     dim3 grid_reduce(num_blocks, batch_size);
     dim3 block_reduce(block_size);
     
-    // Using v19's efficient reduction kernel
     bitonic_v19::reduction::BlockReduceTopK<block_size, max_k, partitions_per_block><<<grid_reduce, block_reduce, 0, stream>>>(
         input_scores, input_indices,
         output_scores, output_indices,
@@ -140,6 +126,6 @@ void RunTopKViaMapReduceBitonicSort(SamplingData* data, cudaStream_t stream, flo
                                  k, batch_size, max_k, temperature);
 }
 
-} // namespace bitonic_v23
+} // namespace bitonic_v24
 }  // namespace cuda
 }  // namespace Generators
