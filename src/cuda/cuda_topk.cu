@@ -22,20 +22,38 @@
 namespace Generators {
 namespace cuda {
 
-// baseline - The previous best version
 const char* GetBitonicBaselineDescription() {
-  return bitonic_v19::kAlgoDescription;
+  return bitonic_v24::kAlgoDescription;
 }
 void RunTopKViaHybridSort(SamplingData* data, cudaStream_t stream, float* scores_in, float* scores_out, int* indices_out, int vocab_size, int batch_size, int k, float temperature, int num_partitions, int sort_size) {
+  bitonic_v24::RunTopKViaMapReduceBitonicSort(data, stream, scores_in, scores_out, indices_out, vocab_size, batch_size, k, temperature, num_partitions, sort_size);
+}
+
+const char* GetBitonicTreatmentDescription(){
+  return bitonic_v19::kAlgoDescription;
+}
+void RunTopKViaMapReduceBitonicSort(SamplingData* data, cudaStream_t stream, float* scores_in, float* scores_out, int* indices_out, int vocab_size, int batch_size, int k, float temperature, int num_partitions, int sort_size) {
   bitonic_v19::RunTopKViaMapReduceBitonicSort(data, stream, scores_in, scores_out, indices_out, vocab_size, batch_size, k, temperature, num_partitions, sort_size);
 }
 
-// treatment - Now using v24
-const char* GetBitonicTreatmentDescription(){
-  return bitonic_v24::kAlgoDescription;
-}
-void RunTopKViaMapReduceBitonicSort(SamplingData* data, cudaStream_t stream, float* scores_in, float* scores_out, int* indices_out, int vocab_size, int batch_size, int k, float temperature, int num_partitions, int sort_size) {
-  bitonic_v24::RunTopKViaMapReduceBitonicSort(data, stream, scores_in, scores_out, indices_out, vocab_size, batch_size, k, temperature, num_partitions, sort_size);
+int GetBestSortSize(int vocab_size, int batch_size, int k) {
+      if (k <= 4)
+          return 0;
+      
+      if (vocab_size >= 147456)
+          return 4096;
+      else if (vocab_size < 49152) {
+        if (k <= 8)
+          return 0;
+      }
+      else {
+        if (k < 8)
+          return 0;
+        if (vocab_size >= 65536 || batch_size >= 4 and vocab_size >= 49152)
+            return 2048;
+      }
+          
+      return 1024;
 }
 
 void GetTopKSubset(SamplingData* data, cudaStream_t stream, float* scores_in, float* scores_out, int* indices_out, int vocab_size, int batch_size, int k, float temperature) {

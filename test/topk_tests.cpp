@@ -231,17 +231,17 @@ void RunBenchmarks() {
   // --- Define Benchmark Configurations ---
   std::vector<int> batch_sizes = {1};
   std::vector<int> vocab_sizes = {201088, 32000};  // GPT-OSS 201088, LLAMA2 32000, LLAMA3 128256, DeepSeek 102400, QWen3 1516465
-  std::vector<int> ks = {50, 1, 8, 16, 32, 64};
+  std::vector<int> ks = {50, 1, 4, 8, 16, 32, 64};
 
   // Enable this to to find heuristics for kernel selection.
-  // It lists vocabulary sizes within the range of 16K to 512K (32 data points using step of 16K).
+  // It lists vocabulary sizes within the range of 16K to 256 (16 data points using step of 16K).
   constexpr bool comprehensive = false;
   if constexpr (comprehensive) {
     vocab_sizes.clear();
-    for (int v = 16 * 1024; v <= 512 * 1024; v += 16 * 1024) {
+    for (int v = 16 * 1024; v <= 256 * 1024; v += 16 * 1024) {
       vocab_sizes.push_back(v);
     }
-     for (int b = 2; b <= 8; b *= 2) {
+     for (int b = 2; b <= 4; b *= 2) {
       batch_sizes.push_back(b);
     }
   }
@@ -357,7 +357,8 @@ void RunBenchmarks() {
             
 
             // Compare two alogrithms to see whether there is significant difference.
-            if ((sort_size == 2048 || sort_size == 512) && params.vocab_size == 201088) {
+            constexpr bool run_pair_wise_analysis = !comprehensive && false;
+            if (run_pair_wise_analysis && (sort_size == 4096) && params.vocab_size == 201088) {
               std::string parameters = "(sort_size=" + std::to_string(sort_size) + ",num_partitions=" + std::to_string(num_partitions) + ")";
               std::string baseline = Generators::cuda::GetBitonicBaselineDescription();
               std::string treatment = Generators::cuda::GetBitonicTreatmentDescription();
