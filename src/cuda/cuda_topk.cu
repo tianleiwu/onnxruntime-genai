@@ -39,7 +39,10 @@ void RunTopKViaMapReduceBitonicSort(SamplingData* data, cudaStream_t stream, flo
 int GetBestSortSize(int vocab_size, int batch_size, int k) {
       if (k <= 4)
           return 0;
-      
+
+      if (vocal_size > 256 * 1024)
+        return 8192;
+
       if (vocab_size >= 147456)
           return 4096;
       else if (vocab_size < 49152) {
@@ -49,7 +52,7 @@ int GetBestSortSize(int vocab_size, int batch_size, int k) {
       else {
         if (k < 8)
           return 0;
-        if (vocab_size >= 65536 || batch_size >= 4 and vocab_size >= 49152)
+        if (vocab_size >= 65536 || batch_size >= 4)
             return 2048;
       }
           

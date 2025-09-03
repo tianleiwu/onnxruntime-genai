@@ -63,8 +63,9 @@ __global__ void FindBlockTopK_CubRegisterSort(const float* __restrict__ scores_i
 
 
 void RunTopKViaMapReduceBitonicSort(SamplingData* data, cudaStream_t stream, float* scores_in, float* scores_out, int* indices_out, int vocab_size, int batch_size, int k, float temperature, int num_partitions, int partition_size_param) {
-  const int max_k = kBitonicSortMaxK;
+  constexpr int max_k = kBitonicSortMaxK;
   constexpr int block_size = 256;
+  static_assert(max_k <= block_size);
 
   const int num_partitions_effective = (vocab_size + partition_size_param - 1) / partition_size_param;
   dim3 grid_stage1(num_partitions_effective, batch_size);
@@ -85,7 +86,10 @@ void RunTopKViaMapReduceBitonicSort(SamplingData* data, cudaStream_t stream, flo
       break;
     case 4096:
       FindBlockTopK_CubRegisterSort<block_size, 4096, max_k><<<grid_stage1, block_stage1, 0, stream>>>(scores_in, data->indices_in.get(), data->scores_buffer.get(), vocab_size, num_partitions_effective); 
-      break;      
+      break;
+    case 8192: // for vocab_size > 256 * 1024
+      FindBlockTopK_CubRegisterSort<block_size, 8192, max_k><<<grid_stage1, block_stage1, 0, stream>>>(scores_in, data->indices_in.get(), data->scores_buffer.get(), vocab_size, num_partitions_effective); 
+      break;
     default:
       // Should not be reached given the test configurations.
       break;

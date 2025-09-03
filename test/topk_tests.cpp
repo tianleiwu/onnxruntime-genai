@@ -132,13 +132,22 @@ void RunParityTests(const BenchmarkParams& params, float temperature) {
         Generators::cuda::RunTopKViaSelectionSort(sampling_data.get(), stream, scores_in_d_copy.get(), s_d, i_d, params.vocab_size, params.batch_size, params.k, temperature);
     });
 
-    for (int sort_size : {256, 512, 1024, 2048, 4096}) {
-      int num_partitions = 0; // num_partitions is not used in v19+ kernel
+    int num_partitions = 0; // num_partitions is not used in v19+ kernel
+    for (int sort_size : {256, 512, 1024, 2048, 4096, 8192}) {
+      if (sort_size > params.vocab_size) {
+        continue;
+      }
+      
       std::string new_algo_name = "HYBRID (s=" + std::to_string(sort_size)  + ")";
       test_algo(new_algo_name, [&](float* s_d, int* i_d) {
         Generators::cuda::RunTopKViaHybridSort(sampling_data.get(), stream, scores_in_d.get(), s_d, i_d, params.vocab_size, params.batch_size, params.k, temperature, num_partitions, sort_size);
       });
+    }
 
+    for (int sort_size : {256, 512, 1024, 2048, 4096}) {
+      if (sort_size > params.vocab_size) {
+        continue;
+      }
       std::string algo_name = "BITONIC (s=" + std::to_string(sort_size)  + ")";
       test_algo(algo_name, [&](float* s_d, int* i_d) {
         Generators::cuda::RunTopKViaMapReduceBitonicSort(sampling_data.get(), stream, scores_in_d.get(), s_d, i_d, params.vocab_size, params.batch_size, params.k, temperature, num_partitions, sort_size);
@@ -243,19 +252,20 @@ void PrintSummary(const std::vector<BenchmarkResult>& all_results) {
 void RunBenchmarks() {
   // --- Define Benchmark Configurations ---
   std::vector<int> batch_sizes = {1, 2, 4, 8};
-  std::vector<int> vocab_sizes = {201088, 1516465, 128256, 102400, 50257, 32000};  // GPT-OSS 201088, LLAMA2 32000, LLAMA3 128256, DeepSeek 102400, QWen3 1516465, GPT2 50257
-  std::vector<int> ks = {50, 1, 2, 4, 8, 16, 32, 64};
+  std::vector<int> vocab_sizes = {288 * 1024 /*201088/*, 1516465, 128256, 102400, 50257, 32000*/};  // GPT-OSS 201088, LLAMA2 32000, LLAMA3 128256, DeepSeek 102400, QWen3 1516465, GPT2 50257
+  std::vector<int> ks = {50/*, 1, 2, 4, 8, 16, 32, 64*/};
 
   // Enable this to to find heuristics for kernel selection.
   // It lists vocabulary sizes within the range of 16K to 256 (16 data points using step of 16K).
-  constexpr bool comprehensive = true;
+  constexpr bool comprehensive = false;
   if constexpr (comprehensive) {
-    // vocab_sizes.clear();
-    // for (int v = 16 * 1024; v <= 256 * 1024; v += 16 * 1024) {
-    //   vocab_sizes.push_back(v);
-    // }
     batch_sizes = {1, 2, 4};
-    vocab_sizes = {1 * 1024, 2 * 1024, 4 * 1024, 8 * 1024, 16 * 1024, 32 * 1024, 64 * 1024, 128 * 1024, 256 * 1024};
+    
+    vocab_sizes = {1 * 1024, 2 * 1024, 4 * 1024, 8 * 1024, 16 * 1024};
+    for (int v = 32 * 1024; v <= 256 * 1024; v += 32 * 1024) {
+       vocab_sizes.push_back(v);
+    }
+
     ks = {1, 2, 4, 6, 8, 12, 16, 32, 64};
   }
 
@@ -343,8 +353,12 @@ void RunBenchmarks() {
       });
 
       // This supports from vocabulary size in the range of (256 * 32 / 2, 4096 * 256], that is from 4K (exclusive) to 1M (inclusive).
-      for (int sort_size : {256, 512, 1024, 2048, 4096}) {
-        int num_partitions = 0; // num_partitions is not used in v19+ kernel
+      int num_partitions = 0; // num_partitions is not used in v19+ kernel
+      for (int sort_size : {256, 512, 1024, 2048, 4096, 8192}) { // 8192 for v23/v24 only.
+        if (sort_size > params.vocab_size) {
+          continue;
+        }
+
         std::vector<double> baseline_latency_list;
         std::string new_algo_name = "HYBRID (s=" + std::to_string(sort_size)  + ")";
         std::string algo_name = "BITONIC (s=" + std::to_string(sort_size)  + ")";
@@ -354,13 +368,18 @@ void RunBenchmarks() {
           measure_latency(new_algo_name, baseline_latency_list, sort_size, 256, [&, sort_size, num_partitions]() {
             Generators::cuda::RunTopKViaHybridSort(sampling_data.get(), stream, scores_in.get(), scores_out.get(), indices_out.get(), params.vocab_size, params.batch_size, params.k, temperature, num_partitions, sort_size);
           });
-          measure_latency(algo_name, latency_list, sort_size, 256, [&, sort_size, num_partitions]() {
-            Generators::cuda::RunTopKViaMapReduceBitonicSort(sampling_data.get(), stream, scores_in.get(), scores_out.get(), indices_out.get(), params.vocab_size, params.batch_size, params.k, temperature, num_partitions, sort_size);
-          });
+
+          if (sort_size <= 4096) {
+            measure_latency(algo_name, latency_list, sort_size, 256, [&, sort_size, num_partitions]() {
+              Generators::cuda::RunTopKViaMapReduceBitonicSort(sampling_data.get(), stream, scores_in.get(), scores_out.get(), indices_out.get(), params.vocab_size, params.batch_size, params.k, temperature, num_partitions, sort_size);
+            });
+          }
         } else {
-          measure_latency(algo_name, latency_list, sort_size, 256, [&, sort_size, num_partitions]() {
-            Generators::cuda::RunTopKViaMapReduceBitonicSort(sampling_data.get(), stream, scores_in.get(), scores_out.get(), indices_out.get(), params.vocab_size, params.batch_size, params.k, temperature, num_partitions, sort_size);
-          });
+          if (sort_size <= 4096) {
+            measure_latency(algo_name, latency_list, sort_size, 256, [&, sort_size, num_partitions]() {
+              Generators::cuda::RunTopKViaMapReduceBitonicSort(sampling_data.get(), stream, scores_in.get(), scores_out.get(), indices_out.get(), params.vocab_size, params.batch_size, params.k, temperature, num_partitions, sort_size);
+            });
+          }
           measure_latency(new_algo_name, baseline_latency_list, sort_size, 256, [&, sort_size, num_partitions]() {
             Generators::cuda::RunTopKViaHybridSort(sampling_data.get(), stream, scores_in.get(), scores_out.get(), indices_out.get(), params.vocab_size, params.batch_size, params.k, temperature, num_partitions, sort_size);
           });

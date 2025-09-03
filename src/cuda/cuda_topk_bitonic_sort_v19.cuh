@@ -173,8 +173,9 @@ namespace reduction {
 
 
 void RunTopKViaMapReduceBitonicSort(SamplingData* data, cudaStream_t stream, float* scores_in, float* scores_out, int* indices_out, int vocab_size, int batch_size, int k, float temperature, int num_partitions, int partition_size_param) {
-  const int max_k = kBitonicSortMaxK;
+  constexpr int max_k = kBitonicSortMaxK;
   constexpr int block_size = 256;
+  static_assert(max_k <= block_size);
 
   const int num_partitions_effective = (vocab_size + partition_size_param - 1) / partition_size_param;
   dim3 grid_stage1(num_partitions_effective, batch_size);
