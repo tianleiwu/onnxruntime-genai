@@ -257,7 +257,7 @@ void RunBenchmarks() {
 
   // Enable this to to find heuristics for kernel selection.
   // It lists vocabulary sizes within the range of 16K to 256 (16 data points using step of 16K).
-  constexpr bool comprehensive = false;
+  constexpr bool comprehensive = true;
   if constexpr (comprehensive) {
     batch_sizes = {1, 2, 4};
     

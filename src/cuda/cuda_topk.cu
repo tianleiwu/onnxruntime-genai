@@ -40,7 +40,7 @@ int GetBestSortSize(int vocab_size, int batch_size, int k) {
       if (k <= 4)
           return 0;
 
-      if (vocal_size > 256 * 1024)
+      if (vocab_size > 256 * 1024)
         return 8192;
 
       if (vocab_size >= 147456)
