@@ -1,14 +1,15 @@
 import pandas as pd
 import numpy as np
 
+csv_path = "4090_dump_v3.csv"
 def analyze_and_evaluate_rules():
     """
     Loads the benchmark CSV, derives heuristic rules, and evaluates their accuracy.
     """
     try:
-        df = pd.read_csv('topk_4090_comprehensive_summary.csv')
+        df = pd.read_csv(csv_path)
     except FileNotFoundError:
-        print("Error: 'topk_4090_comprehensive_summary.csv' not found.")
+        print(f"Error: '{csv_path}' not found.")
         print("Please make sure the benchmark data file is in the same directory.")
         return
 
@@ -86,7 +87,7 @@ def analyze_and_evaluate_rules():
     # Calculate the accuracy
     accuracy = (df['best_sort_size'] == df['predicted_sort_size']).mean()
     
-    print(f"Analysis of 'topk_4090_comprehensive_summary.csv'")
+    print(f"Analysis of '{csv_path}'")
     print("-" * 50)
     print(f"Total number of benchmark configurations: {len(df)}")
     print(f"Accuracy of the derived rule-based function: {accuracy * 100:.2f}%")
