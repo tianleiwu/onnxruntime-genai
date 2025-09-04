@@ -2,44 +2,48 @@
 // Licensed under the MIT License.
 
 #pragma once
+#include <curand_kernel.h>
 
-#include "cuda_sampling.h"
+#include "cuda_common.h"
 
 namespace Generators {
 namespace cuda {
 
-constexpr int kBitonicSortMaxPartitions = 256;
-constexpr int kBitonicSortMaxK = 64;
-
 struct SamplingData;
 
-// Finds the top-k scores and their indices from the input scores.
-// This function internally benchmarks and selects the fastest algorithm (Selection, Bitonic, or Full Sort).
-void GetTopKSubset(SamplingData* data, cudaStream_t stream, float* scores_in, float* scores_out, int* indices_out, int vocab_size, int batch_size, int k, float temperature);
+// This struct holds all the device memory buffers required for Top-K operations.
+struct TopkData {
+  TopkData(int batch_size, int vocab_size, cudaStream_t stream);
+  cuda_unique_ptr<int> indices_in;
+  cuda_unique_ptr<float> scores_buffer;  // The raw scores (before temperature and softmax)
+  cuda_unique_ptr<float> scores_temp;
+  cuda_unique_ptr<unsigned char> temp_buffer;
+  cuda_unique_ptr<int> offsets;
+  size_t temp_storage_bytes = 0;
 
-void LaunchPopulateOffsets(int* offsets, int size, int batch_size, cudaStream_t stream);
+  // Buffers for top-k results, which are input to sampling
+  cuda_unique_ptr<float> scores_sorted;
+  cuda_unique_ptr<int> indices_sorted;
+};
+
+void GetTopKSubset(TopkData* topk_data, cudaStream_t stream, float* scores_in, float* scores_out, int* indices_out, int vocab_size, int batch_size, int k, float temperature);
 
 enum class TopKAlgorithm { SELECTION_SORT,
-                           BITONIC_SORT,
                            HYBRID_SORT,
                            FULL_SORT };
 
-// --- Functions below are exposed for testing/benchmarking purposes ---
+template <bool DoCopyIndices>
+void ApplySoftmaxToSortedTopK(cudaStream_t stream, float* final_scores,
+                              int* final_indices,
+                              const float* sorted_input_scores,
+                              const int* sorted_input_indices, int k,
+                              int batch_size, int input_stride,
+                              float temperature);
 
-// Fills a device buffer with random float data for testing purposes.
 void RandomTopkInput(cudaStream_t stream, float* data, curandState* batch_state, int total_size, int batch_size);
-
-// Runs the Top-K algorithm using an iterative selection sort approach.
-void RunTopKViaSelectionSort(SamplingData* data, cudaStream_t stream, float* scores_in, float* scores_out, int* indices_out, int vocab_size, int batch_size, int k, float temperature);
-
-// Runs the Top-K algorithm by performing a full sort on the vocabulary.
-void RunTopKViaFullSort(SamplingData* data, cudaStream_t stream, float* scores_in, float* scores_out, int* indices_out, int vocab_size, int batch_size, int k, float temperature);
-
-// Runs the Top-K algorithm using a map-reduce approach with bitonic sort in shared memory.
-void RunTopKViaBitonicSort(SamplingData* data, cudaStream_t stream, float* scores_in, float* scores_out, int* indices_out, int vocab_size, int batch_size, int k, float temperature, int partition_size);
-
-// Runs the Top-K algorithm using a map-reduce approach with a hybrid: Radix sort in merge, and Bitonic sort in reduction. 
-void RunTopKViaHybridSort(SamplingData* data, cudaStream_t stream, float* scores_in, float* scores_out, int* indices_out, int vocab_size, int batch_size, int k, float temperature, int partition_size);
+void RunTopKViaSelectionSort(TopkData* data, cudaStream_t stream, float* scores_in, float* scores_out, int* indices_out, int vocab_size, int batch_size, int k, float temperature);
+void RunTopKViaFullSort(TopkData* data, cudaStream_t stream, float* scores_in, float* scores_out, int* indices_out, int vocab_size, int batch_size, int k, float temperature);
+void RunTopKViaHybridSort(TopkData* data, cudaStream_t stream, float* scores_in, float* scores_out, int* indices_out, int vocab_size, int batch_size, int k, float temperature, int partition_size);
 
 }  // namespace cuda
 }  // namespace Generators

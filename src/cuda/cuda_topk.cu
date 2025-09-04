@@ -1,7 +1,11 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
-#include "cuda_topk_bitonic_sort.cuh"
+#include <cub/device/device_segmented_radix_sort.cuh>
+
+#include "cuda_topk.h"
+#include "cuda_topk_full_sort.cuh"
+#include "cuda_topk_select_sort.cuh"
 #include "cuda_topk_hybrid_sort.cuh"
 
 namespace Generators {
@@ -20,57 +24,66 @@ void RandomTopkInput(cudaStream_t stream, float* data, curandState* batch_state,
   CUDA_CHECK(cudaGetLastError());
 }
 
-TopKAlgorithm ChooseTopkAlgorithm(int vocab_size, int batch_size, int k, int &partition_size) {
-  if (k > 64) {
-    return TopKAlgorithm::FULL_SORT;
-  }
-
-  if (k <= 4) {
-    return TopKAlgorithm::SELECTION_SORT;
-  }     
-  
+int GetHybridSortPartitionSize(int vocab_size, int batch_size) {
   if (vocab_size >= 147456) {
-    partition_size = (vocab_size > 256 * 1024) ? 8192 : 4096;
-    return TopKAlgorithm::HYBRID_SORT;
-  }
-  else {
-    if (k <= 8)
-      return TopKAlgorithm::SELECTION_SORT;
-
+    return (vocab_size > 256 * 1024) ? 8192 : 4096;
+  } else {
     if (vocab_size >= 65536 || batch_size >= 4 && vocab_size > 49152) {
-      partition_size = 2048;
-      return TopKAlgorithm::HYBRID_SORT;
+      return 2048;
     }
   }
 
-  partition_size = 1024;
-  if (vocab_size <= partition_size) {
-    return TopKAlgorithm::SELECTION_SORT;
-  }
-
-  return TopKAlgorithm::HYBRID_SORT;
+  return 1024;
 }
 
-void GetTopKSubset(SamplingData* data, cudaStream_t stream, float* scores_in, float* scores_out, int* indices_out, int vocab_size, int batch_size, int k, float temperature) {
-  int partition_size = 0;
+bool UseSelectSort(int vocab_size, int batch_size, int k) {
+  assert(k <= 64);
 
-  auto algo = ChooseTopkAlgorithm(vocab_size, batch_size, k, partition_size);
-  switch (algo) {
-    case TopKAlgorithm::SELECTION_SORT:
-      RunTopKViaSelectionSort(data, stream, scores_in, scores_out, indices_out, vocab_size, batch_size, k, temperature);
-      break;      
-    case TopKAlgorithm::BITONIC_SORT:
-      RunTopKViaBitonicSort(data, stream, scores_in, scores_out, indices_out, vocab_size, batch_size, k, temperature, partition_size);
-      break;
-    case TopKAlgorithm::HYBRID_SORT:
-      RunTopKViaHybridSort(data, stream, scores_in, scores_out, indices_out, vocab_size, batch_size, k, temperature, partition_size);
-      break;      
-    default:
-      RunTopKViaFullSort(data, stream, scores_in, scores_out, indices_out, vocab_size, batch_size, k, temperature);
-      break;
+  if (k <= 4 || vocab_size < 1024 || (k <= 8 && vocab_size < 147456)) {
+    return true;
   }
+
+  return false;
+}
+
+TopkData::TopkData(int batch_size, int vocab_size, cudaStream_t stream) {
+  // The intermediate buffers are used by hybrid sort algorithms.
+  int partition_size = GetHybridSortPartitionSize(vocab_size, batch_size);
+  size_t intermediate_buffer_elements = GetHybridSortIntermediateSize(batch_size, vocab_size, partition_size);
+
+  size_t vocab_batch_size = static_cast<size_t>(vocab_size) * batch_size;
+
+  // Selection sort uses buffer of batch_size * 64 elements, which is smaller than intermediate_buffer_elements.
+  size_t max_buffer_elements = std::max(vocab_batch_size, intermediate_buffer_elements);
+
+  this->indices_in = CudaMallocArray<int>(max_buffer_elements);
+  this->scores_buffer = CudaMallocArray<float>(max_buffer_elements);
+  this->scores_temp = CudaMallocArray<float>(max_buffer_elements);
+  this->indices_sorted = CudaMallocArray<int>(max_buffer_elements);
+  this->scores_sorted = CudaMallocArray<float>(max_buffer_elements);
+  this->offsets = CudaMallocArray<int>(batch_size + 1);
+
+  this->temp_storage_bytes = GetFullSortCubTempStorageBytes(vocab_batch_size, batch_size, stream);
+  this->temp_buffer = CudaMallocArray<unsigned char>(this->temp_storage_bytes);
+}
+
+void GetTopKSubset(TopkData* topk_data, cudaStream_t stream, float* scores_in, float* scores_out, int* indices_out, int vocab_size, int batch_size, int k, float temperature) {
+  assert(topk_data != nullptr);
+  assert(topk_data->indices_in != nullptr);  // The caller shall allocate the buffer.
+
+  if (k > 64) {
+    RunTopKViaFullSort(topk_data, stream, scores_in, scores_out, indices_out, vocab_size, batch_size, k, temperature);
+    return;
+  }
+
+  if (UseSelectSort(vocab_size, batch_size, k)) {
+    RunTopKViaSelectionSort(topk_data, stream, scores_in, scores_out, indices_out, vocab_size, batch_size, k, temperature);
+    return;
+  }
+
+  int partition_size = GetHybridSortPartitionSize(vocab_size, batch_size);
+  RunTopKViaHybridSort(topk_data, stream, scores_in, scores_out, indices_out, vocab_size, batch_size, k, temperature, partition_size);
 }
 
 }  // namespace cuda
 }  // namespace Generators
-

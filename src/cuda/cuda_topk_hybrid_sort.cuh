@@ -3,12 +3,15 @@
 
 #pragma once
 
-#include "cuda_topk_helper.h"
 #include <cub/block/block_radix_sort.cuh>
+
+#include "cuda_topk.h"
 #include "cuda_topk_bitonic_sort_helper.cuh"
 
 namespace Generators {
 namespace cuda {
+
+constexpr int kHybridSortMaxK = 64;  // up to 256.
 
 // Top-K kernel using cub::BlockRadixSort directly on register data, with a balanced final write.
 template <int kBlockSize, int kPartitionSize, int K>
@@ -17,79 +20,83 @@ __global__ void FindBlockTopK_CubRegisterSort(const float* __restrict__ scores_i
                                               float* __restrict__ intermediate_scores,
                                               int vocab_size,
                                               int num_partitions) {
-    constexpr int ItemsPerThread = kPartitionSize / kBlockSize;
+  constexpr int ItemsPerThread = kPartitionSize / kBlockSize;
 
-    // Specialize BlockRadixSort for our key-value pairs.
-    typedef cub::BlockRadixSort<float, kBlockSize, ItemsPerThread, int> BlockRadixSort;
-    __shared__ typename BlockRadixSort::TempStorage temp_storage;
+  // Specialize BlockRadixSort for our key-value pairs.
+  typedef cub::BlockRadixSort<float, kBlockSize, ItemsPerThread, int> BlockRadixSort;
+  __shared__ typename BlockRadixSort::TempStorage temp_storage;
 
-    const int batch_idx = blockIdx.y;
-    const int partition_idx = blockIdx.x;
-    const int partition_start = partition_idx * kPartitionSize;
+  const int batch_idx = blockIdx.y;
+  const int partition_idx = blockIdx.x;
+  const int partition_start = partition_idx * kPartitionSize;
 
-    const float* batch_scores_in = scores_in + batch_idx * vocab_size;
+  const float* batch_scores_in = scores_in + batch_idx * vocab_size;
 
-    // 1. Coalesced load from global memory directly into per-thread registers.
-    float thread_keys[ItemsPerThread];
-    int thread_values[ItemsPerThread];
+  // 1. Coalesced load from global memory directly into per-thread registers.
+  float thread_keys[ItemsPerThread];
+  int thread_values[ItemsPerThread];
 
-    for (int i = 0; i < ItemsPerThread; ++i) {
-        int global_idx = partition_start + threadIdx.x + i * kBlockSize;
-        if (global_idx < vocab_size && global_idx < partition_start + kPartitionSize) {
-            thread_keys[i] = batch_scores_in[global_idx];
-            thread_values[i] = global_idx;
-        } else {
-            thread_keys[i] = -FLT_MAX;
-            thread_values[i] = -1;
-        }
+  for (int i = 0; i < ItemsPerThread; ++i) {
+    int global_idx = partition_start + threadIdx.x + i * kBlockSize;
+    if (global_idx < vocab_size && global_idx < partition_start + kPartitionSize) {
+      thread_keys[i] = batch_scores_in[global_idx];
+      thread_values[i] = global_idx;
+    } else {
+      thread_keys[i] = -FLT_MAX;
+      thread_values[i] = -1;
     }
+  }
 
-    // 2. Sort the keys and values held in registers across the entire block.
-    // The result is a sorted, striped layout across the threads. This means
-    // thread 0 has rank 0, thread 1 has rank 1, etc.
-    BlockRadixSort(temp_storage).SortDescendingBlockedToStriped(thread_keys, thread_values);
+  // 2. Sort the keys and values held in registers across the entire block.
+  // The result is a sorted, striped layout across the threads. This means
+  // thread 0 has rank 0, thread 1 has rank 1, etc.
+  BlockRadixSort(temp_storage).SortDescendingBlockedToStriped(thread_keys, thread_values);
 
-    // 3. The first K threads now hold the top K elements in their first item slot (`[0]`).
-    // Write the final top K results to global memory. This write is naturally balanced
-    // across the first K threads.
-    if (threadIdx.x < K) {
-        int offset = (batch_idx * num_partitions + partition_idx) * K;
-        intermediate_scores[offset + threadIdx.x] = thread_keys[0];
-        intermediate_indices[offset + threadIdx.x] = thread_values[0];
-    }
+  // 3. The first K threads now hold the top K elements in their first item slot (`[0]`).
+  // Write the final top K results to global memory. This write is naturally balanced
+  // across the first K threads.
+  if (threadIdx.x < K) {
+    int offset = (batch_idx * num_partitions + partition_idx) * K;
+    intermediate_scores[offset + threadIdx.x] = thread_keys[0];
+    intermediate_indices[offset + threadIdx.x] = thread_values[0];
+  }
 }
 
+// Max number of elements in intermediate_scores or intermediate_indices.
+inline size_t GetHybridSortIntermediateSize(int batch_size, int vocab_size, int partition_size) {
+  const int num_partitions = (vocab_size + partition_size - 1) / partition_size;
+  return static_cast<size_t>(batch_size) * num_partitions * kHybridSortMaxK;
+}
 
-void RunTopKViaHybridSort(SamplingData* data, cudaStream_t stream, float* scores_in, float* scores_out, int* indices_out, int vocab_size, int batch_size, int k, float temperature, int partition_size) {
-  constexpr int max_k = kBitonicSortMaxK;
+void RunTopKViaHybridSort(TopkData* data, cudaStream_t stream, float* scores_in, float* scores_out, int* indices_out,
+                          int vocab_size, int batch_size, int k, float temperature, int partition_size) {
+  constexpr int max_k = kHybridSortMaxK;
   constexpr int block_size = 256;
   static_assert(max_k <= block_size);
 
   const int num_partitions = (vocab_size + partition_size - 1) / partition_size;
   dim3 grid_stage1(num_partitions, batch_size);
   dim3 block_stage1(block_size);
-  
+
   switch (partition_size) {
-    // case 256:
-    //   FindBlockTopK_CubRegisterSort<block_size, 256, max_k><<<grid_stage1, block_stage1, 0, stream>>>(scores_in, data->indices_in.get(), data->scores_buffer.get(), vocab_size, num_partitions); 
-    //   break;
-    // case 512:
-    //   FindBlockTopK_CubRegisterSort<block_size, 512, max_k><<<grid_stage1, block_stage1, 0, stream>>>(scores_in, data->indices_in.get(), data->scores_buffer.get(), vocab_size, num_partitions); 
-    //   break;
     case 1024:
-      FindBlockTopK_CubRegisterSort<block_size, 1024, max_k><<<grid_stage1, block_stage1, 0, stream>>>(scores_in, data->indices_in.get(), data->scores_buffer.get(), vocab_size, num_partitions); 
+      FindBlockTopK_CubRegisterSort<block_size, 1024, max_k><<<grid_stage1, block_stage1, 0, stream>>>(
+          scores_in, data->indices_in.get(), data->scores_buffer.get(), vocab_size, num_partitions);
       break;
     case 2048:
-      FindBlockTopK_CubRegisterSort<block_size, 2048, max_k><<<grid_stage1, block_stage1, 0, stream>>>(scores_in, data->indices_in.get(), data->scores_buffer.get(), vocab_size, num_partitions); 
+      FindBlockTopK_CubRegisterSort<block_size, 2048, max_k><<<grid_stage1, block_stage1, 0, stream>>>(
+          scores_in, data->indices_in.get(), data->scores_buffer.get(), vocab_size, num_partitions);
       break;
     case 4096:
-      FindBlockTopK_CubRegisterSort<block_size, 4096, max_k><<<grid_stage1, block_stage1, 0, stream>>>(scores_in, data->indices_in.get(), data->scores_buffer.get(), vocab_size, num_partitions); 
+      FindBlockTopK_CubRegisterSort<block_size, 4096, max_k><<<grid_stage1, block_stage1, 0, stream>>>(
+          scores_in, data->indices_in.get(), data->scores_buffer.get(), vocab_size, num_partitions);
       break;
-    case 8192: // for vocab_size > 256 * 1024
-      FindBlockTopK_CubRegisterSort<block_size, 8192, max_k><<<grid_stage1, block_stage1, 0, stream>>>(scores_in, data->indices_in.get(), data->scores_buffer.get(), vocab_size, num_partitions); 
-      break;        
+    case 8192:  // for vocab_size > 256 * 1024
+      FindBlockTopK_CubRegisterSort<block_size, 8192, max_k><<<grid_stage1, block_stage1, 0, stream>>>(
+          scores_in, data->indices_in.get(), data->scores_buffer.get(), vocab_size, num_partitions);
+      break;
     default:
-      assert(false && "Unsupported partition_size"); 
+      assert(false && "Unsupported partition_size");
       break;
   }
   CUDA_CHECK(cudaGetLastError());
@@ -104,14 +111,12 @@ void RunTopKViaHybridSort(SamplingData* data, cudaStream_t stream, float* scores
   while (current_num_partitions > 1) {
     constexpr int partitions_per_block = 8;
     int num_blocks = (current_num_partitions + partitions_per_block - 1) / partitions_per_block;
-    
+
     dim3 grid_reduce(num_blocks, batch_size);
     dim3 block_reduce(block_size);
-    
+
     bitonic::reduction::BlockReduceTopK<block_size, max_k, partitions_per_block><<<grid_reduce, block_reduce, 0, stream>>>(
-        input_scores, input_indices,
-        output_scores, output_indices,
-        current_num_partitions);
+        input_scores, input_indices, output_scores, output_indices, current_num_partitions);
     CUDA_CHECK(cudaGetLastError());
 
     std::swap(input_scores, output_scores);
@@ -123,8 +128,7 @@ void RunTopKViaHybridSort(SamplingData* data, cudaStream_t stream, float* scores
   float* final_reduced_scores = input_scores;
   int* final_reduced_indices = input_indices;
 
-  ApplySoftmaxToSortedTopK<true>(stream, scores_out, indices_out,
-                                 final_reduced_scores, final_reduced_indices,
+  ApplySoftmaxToSortedTopK<true>(stream, scores_out, indices_out, final_reduced_scores, final_reduced_indices,
                                  k, batch_size, max_k, temperature);
 }
 

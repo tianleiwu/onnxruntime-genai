@@ -1,13 +1,15 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
-#include "cuda_topk_helper.h"
-#include "cuda_sampling.h"
+#include <float.h>  // For FLT_MAX
+
+#include <cub/cub.cuh>
+
+#include "cuda_topk.h"
 
 namespace Generators {
 namespace cuda {
 
-// START of improved Top-K kernel (Selection Sort approach)
 struct TopK_2 {
   int p = INT_MAX;
   float u = -FLT_MAX;
@@ -63,7 +65,6 @@ __global__ void GetTopKKernel(int* indices_out, float* scores_in, float* scores_
   }
 }
 
-// Launcher for the improved Top-K kernel.
 void LaunchGetTopK(cudaStream_t stream, float* scores_in, float* scores_out, int* indices_out, int vocab_size, int batch_size, int k) {
   dim3 grid(batch_size, 1, 1);
   // Use a larger block size for better hardware utilization.
@@ -72,20 +73,17 @@ void LaunchGetTopK(cudaStream_t stream, float* scores_in, float* scores_out, int
   CUDA_CHECK(cudaGetLastError());
 }
 
-void RunTopKViaSelectionSort(SamplingData* data, cudaStream_t stream, float* scores_in, float* scores_out, int* indices_out, int vocab_size, int batch_size, int k, float temperature) {
-  // The output of the kernel will be the top-k raw scores. We'll store
-  // these in another pre-allocated buffer, `scores_buffer`.
+void RunTopKViaSelectionSort(TopkData* data, cudaStream_t stream, float* scores_in, float* scores_out, int* indices_out, int vocab_size, int batch_size, int k, float temperature) {
+  // The output of the kernel will be the top-k raw scores. We'll store these in the pre-allocated buffer.
   float* raw_topk_scores = data->scores_buffer.get();
 
-  // Attention: The kernel modifies the `scores_in` tensor in-place.
-  // This might have unintended side effects on the original `scores_in` tensor if it is used elsewhere later.
+  // The kernel modifies the `scores_in` tensor in-place.
+  // The caller (e.g., test harness) is responsible for making a copy if the original data is needed.
   LaunchGetTopK(stream, scores_in, raw_topk_scores, indices_out, vocab_size, batch_size, k);
 
-  // Finally, apply softmax to the raw scores to get the final probabilities,
-  // writing the result to the `scores_out` buffer.
+  // Finally, apply softmax to the raw scores to get the final probabilities.
   ApplySoftmaxToSortedTopK<false>(stream, scores_out, nullptr, raw_topk_scores, nullptr, k, batch_size, k, temperature);
 }
 
 }  // namespace cuda
 }  // namespace Generators
-

@@ -1,9 +1,12 @@
 #pragma once
 
-#include <cuda_runtime.h>
-#include "span.h"
-#include <memory>
 #include <assert.h>
+#include <cuda_runtime.h>
+
+#include <cstdio>
+#include <memory>
+
+#include "span.h"
 
 namespace Generators {
 
@@ -97,5 +100,19 @@ cuda_unique_ptr<T> CudaMallocArray(size_t count, std::span<T>* p_span = nullptr)
     *p_span = std::span<T>(p, count);
   return cuda_unique_ptr<T>{p};
 }
+
+inline int CeilDiv(int a, int b) { return (a + (b - 1)) / b; }
+
+#ifndef CUDA_CHECK
+#define CUDA_CHECK(call)                                                    \
+  do {                                                                      \
+    cudaError_t err = (call);                                               \
+    if (err != cudaSuccess) {                                               \
+      fprintf(stderr, "CUDA Error: %s at %s:%d\n", cudaGetErrorString(err), \
+              __FILE__, __LINE__);                                          \
+      throw std::exception();                                               \
+    }                                                                       \
+  } while (0)
+#endif
 
 }  // namespace Generators

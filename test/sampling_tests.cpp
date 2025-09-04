@@ -532,12 +532,12 @@ TEST(SamplingTests, RandomizedSamplingTopKCuda) {
 
 TEST(SamplingTests, RandomizedSamplingTopPAndKCuda) {
   const int batch_size = 5;
-  const int k = 7;
+  const int k = 16;
   const float p = 0.75f;
-  const int vocab_size = 21;
+  const int vocab_size = 2048;
 
   auto config = OgaConfig::Create(MODEL_PATH "hf-internal-testing/tiny-random-gpt2-fp32");
-  config->Overlay(R"({ "model": { "vocab_size" : 21 } })");
+  config->Overlay(R"({ "model": { "vocab_size" : 2048 } })");
   config->ClearProviders();
   config->AppendProvider("cuda");
 
