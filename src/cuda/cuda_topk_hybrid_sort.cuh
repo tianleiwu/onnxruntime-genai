@@ -105,7 +105,7 @@ void RunTopKViaHybridSort(TopkData* data, cudaStream_t stream, float* scores_in,
   float* input_scores = data->intermediate_scores_1.get();
   int* input_indices = data->intermediate_indices.get();
   float* output_scores = data->intermediate_scores_2.get();
-  int* output_indices = data->topk_indices.get(); // Re-use final output buffer for intermediate indices
+  int* output_indices = data->topk_indices.get();  // Re-use final output buffer for intermediate indices
 
   while (current_num_partitions > 1) {
     constexpr int partitions_per_block = 8;
@@ -138,7 +138,7 @@ void RunTopKViaHybridSort(TopkData* data, cudaStream_t stream, float* scores_in,
     cudaMemcpyAsync(data->intermediate_scores_1.get(), final_reduced_scores,
                     static_cast<size_t>(batch_size) * max_k * sizeof(float),
                     cudaMemcpyDeviceToDevice, stream);
-    final_reduced_scores = data->intermediate_scores_1.get(); // Update pointer to the canonical buffer
+    final_reduced_scores = data->intermediate_scores_1.get();  // Update pointer to the canonical buffer
   }
   // --- END FIX ---
 
