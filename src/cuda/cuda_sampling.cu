@@ -30,7 +30,8 @@ __global__ void InitCurandStates(unsigned long long seed, curandState* states, i
   curand_init(seed, index, 0, &states[index]);
 }
 
-SamplingData::SamplingData(unsigned long long random_seed, int batch_size, int vocab_size, cudaStream_t stream) : TopkData(batch_size, vocab_size, stream) {
+SamplingData::SamplingData(unsigned long long random_seed, int batch_size, int vocab_size, cudaStream_t stream) : TopkData(batch_size, vocab_size, stream)
+{
   const size_t vocab_batch_size = static_cast<size_t>(vocab_size) * batch_size;
 
   prefix_sums = CudaMallocArray<float>(vocab_batch_size);
@@ -412,7 +413,8 @@ void LaunchSampleKernel(SamplingData* data, cudaStream_t stream, float* scores, 
 
   // The `FilterOnTopP` kernel reads from `scores` (which contains probabilities) and writes the filtered results to `prefix_sums`.
   // Values that do not meet the Top-P criteria are set to a large negative number.
-  FilterOnTopP<256><<<grid, block, 0, stream>>>(scores, data->prefix_sums.get(), data->scores_temp.get(), data->scores_buffer.get(), sample_range, batch_size, p);
+  // The `actual_values` parameter (`intermediate_scores_1`) must contain the raw scores that correspond to the probabilities in `scores`.
+  FilterOnTopP<256><<<grid, block, 0, stream>>>(scores, data->prefix_sums.get(), data->intermediate_scores_2.get(), data->intermediate_scores_1.get(), sample_range, batch_size, p);
   CUDA_CHECK(cudaGetLastError());
 
   // After Top-P filtering, the remaining probabilities must be re-normalized.
@@ -435,14 +437,14 @@ void GetSample(SamplingData* data, cudaStream_t stream, int32_t* next_token_out,
     k = vocab_size;
   }
 
-  // Stage 1: Get Top K candidates.
+  // Stage 1: Get Top K candidates. The results are the top-k probabilities and their corresponding indices.
   TopkData* topk_data = data;
-  GetTopKSubset(topk_data, stream, scores_in, data->scores_sorted.get(), data->indices_sorted.get(), vocab_size, batch_size, k, temperature);
+  GetTopKSubset(topk_data, stream, scores_in, data->topk_probs.get(), data->topk_indices.get(), vocab_size, batch_size, k, temperature);
 
   // Stage 2: Sample from the top k candidates.
   int sample_range = k;
   int indices_stride = k;
-  LaunchSampleKernel(data, stream, data->scores_sorted.get(), data->indices_sorted.get(), next_token_out, sample_range, batch_size, indices_stride, p, k, temperature);
+  LaunchSampleKernel(data, stream, data->topk_probs.get(), data->topk_indices.get(), next_token_out, sample_range, batch_size, indices_stride, p, k, temperature);
 }
 }  // namespace cuda
 }  // namespace Generators

@@ -56,20 +56,20 @@ TopkData::TopkData(int batch_size, int vocab_size, cudaStream_t stream) {
   // Selection sort uses buffer of batch_size * 64 elements, which is smaller than intermediate_buffer_elements.
   size_t max_buffer_elements = std::max(vocab_batch_size, intermediate_buffer_elements);
 
-  this->indices_in = CudaMallocArray<int>(max_buffer_elements);
-  this->scores_buffer = CudaMallocArray<float>(max_buffer_elements);
-  this->scores_temp = CudaMallocArray<float>(max_buffer_elements);
-  this->indices_sorted = CudaMallocArray<int>(max_buffer_elements);
-  this->scores_sorted = CudaMallocArray<float>(max_buffer_elements);
-  this->offsets = CudaMallocArray<int>(batch_size + 1);
+  this->intermediate_indices = CudaMallocArray<int>(max_buffer_elements);
+  this->intermediate_scores_1 = CudaMallocArray<float>(max_buffer_elements);
+  this->intermediate_scores_2 = CudaMallocArray<float>(max_buffer_elements);
+  this->topk_indices = CudaMallocArray<int>(max_buffer_elements);
+  this->topk_probs = CudaMallocArray<float>(max_buffer_elements);
+  this->batch_offsets = CudaMallocArray<int>(batch_size + 1);
 
-  this->temp_storage_bytes = GetFullSortCubTempStorageBytes(vocab_batch_size, batch_size, stream);
-  this->temp_buffer = CudaMallocArray<unsigned char>(this->temp_storage_bytes);
+  this->cub_temp_storage_bytes = GetFullSortCubTempStorageBytes(vocab_batch_size, batch_size, stream);
+  this->cub_temp_storage = CudaMallocArray<unsigned char>(this->cub_temp_storage_bytes);
 }
 
 void GetTopKSubset(TopkData* topk_data, cudaStream_t stream, float* scores_in, float* scores_out, int* indices_out, int vocab_size, int batch_size, int k, float temperature) {
   assert(topk_data != nullptr);
-  assert(topk_data->indices_in != nullptr);  // The caller shall allocate the buffer.
+  assert(topk_data->intermediate_indices != nullptr);  // The caller shall allocate the buffer.
 
   if (k > 64) {
     RunTopKViaFullSort(topk_data, stream, scores_in, scores_out, indices_out, vocab_size, batch_size, k, temperature);

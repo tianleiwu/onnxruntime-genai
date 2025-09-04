@@ -74,8 +74,8 @@ void LaunchGetTopK(cudaStream_t stream, float* scores_in, float* scores_out, int
 }
 
 void RunTopKViaSelectionSort(TopkData* data, cudaStream_t stream, float* scores_in, float* scores_out, int* indices_out, int vocab_size, int batch_size, int k, float temperature) {
-  // The output of the kernel will be the top-k raw scores. We'll store these in the pre-allocated buffer.
-  float* raw_topk_scores = data->scores_buffer.get();
+  // The output of the kernel will be the top-k raw scores. We'll store these in the primary intermediate buffer.
+  float* raw_topk_scores = data->intermediate_scores_1.get();
 
   // The kernel modifies the `scores_in` tensor in-place.
   // The caller (e.g., test harness) is responsible for making a copy if the original data is needed.

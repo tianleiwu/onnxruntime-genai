@@ -58,23 +58,25 @@ inline size_t GetFullSortCubTempStorageBytes(int num_items, int num_segments, cu
 void LaunchSort(TopkData* data, cudaStream_t stream,
                 float* scores_in, float* scores_out, int* indices_out, int vocab_size, int batch_size) {
   // Sort indices and scores
-  LaunchPopulateOffsets(data->offsets.get(), vocab_size, batch_size, stream);
-  LaunchPopulateIndices(data->indices_in.get(), vocab_size, batch_size, stream);
-  LaunchSortPairs(data->temp_buffer.get(), data->temp_storage_bytes,
-                  scores_in, scores_out, data->indices_in.get(),
+  LaunchPopulateOffsets(data->batch_offsets.get(), vocab_size, batch_size, stream);
+  LaunchPopulateIndices(data->intermediate_indices.get(), vocab_size, batch_size, stream);
+  LaunchSortPairs(data->cub_temp_storage.get(), data->cub_temp_storage_bytes,
+                  scores_in, scores_out, data->intermediate_indices.get(),
                   indices_out, vocab_size * batch_size, batch_size,
-                  data->offsets.get(), stream);
+                  data->batch_offsets.get(), stream);
 }
 
 void RunTopKViaFullSort(TopkData* data, cudaStream_t stream, float* scores_in,
                         float* scores_out, int* indices_out, int vocab_size,
                         int batch_size, int k, float temperature) {
   // Step 1: Perform a full, segmented sort on the input scores.
-  float* sorted_scores = data->scores_buffer.get();
-  int* sorted_indices = data->indices_in.get();
+  // The raw sorted scores are placed in intermediate_scores_1.
+  float* sorted_scores = data->intermediate_scores_1.get();
+  int* sorted_indices = data->intermediate_indices.get();
   LaunchSort(data, stream, scores_in, sorted_scores, sorted_indices, vocab_size, batch_size);
 
-  // Step 2: Launch a specialized kernel that leverages the pre-sorted nature of the data.
+  // Step 2: Launch a specialized kernel that reads the raw sorted scores, applies softmax, and
+  // writes the final probabilities and indices to the output buffers.
   ApplySoftmaxToSortedTopK<true>(stream, scores_out, indices_out, sorted_scores,
                                  sorted_indices, k, batch_size, vocab_size, temperature);
 }

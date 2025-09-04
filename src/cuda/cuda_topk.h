@@ -9,21 +9,42 @@
 namespace Generators {
 namespace cuda {
 
-struct SamplingData;
+constexpr int kHybridSortMaxK = 64;  // up to 256.
 
 // This struct holds all the device memory buffers required for Top-K operations.
 struct TopkData {
   TopkData(int batch_size, int vocab_size, cudaStream_t stream);
-  cuda_unique_ptr<int> indices_in;
-  cuda_unique_ptr<float> scores_buffer;  // The raw scores (before temperature and softmax)
-  cuda_unique_ptr<float> scores_temp;
-  cuda_unique_ptr<unsigned char> temp_buffer;
-  cuda_unique_ptr<int> offsets;
-  size_t temp_storage_bytes = 0;
 
-  // Buffers for top-k results, which are input to sampling
-  cuda_unique_ptr<float> scores_sorted;
-  cuda_unique_ptr<int> indices_sorted;
+  // --- Intermediate Buffers for Top-K Algorithms ---
+
+  // Used to hold initial vocabulary indices for full sort, and intermediate
+  // indices during the reduction phase of hybrid sort.
+  cuda_unique_ptr<int> intermediate_indices;
+
+  // Primary buffer for holding raw scores.
+  // - Full sort: Holds the fully sorted raw scores.
+  // - Selection sort: Holds the top-k raw scores.
+  // - Hybrid sort: Holds intermediate and final reduced raw scores.
+  // **IMPORTANT**: This buffer is read by the Top-P sampling stage.
+  cuda_unique_ptr<float> intermediate_scores_1;
+
+  // A secondary "ping-pong" buffer used by the hybrid sort's reduction phase.
+  cuda_unique_ptr<float> intermediate_scores_2;
+
+  // General-purpose temporary storage for CUB's DeviceSegmentedRadixSort (full sort).
+  cuda_unique_ptr<unsigned char> cub_temp_storage;
+  size_t cub_temp_storage_bytes = 0;
+
+  // Stores the start offset of each batch segment for CUB's segmented sort.
+  cuda_unique_ptr<int> batch_offsets;
+
+  // --- Final Output Buffers (Input to Sampling Stage) ---
+
+  // Stores the final top-k probabilities after softmax.
+  cuda_unique_ptr<float> topk_probs;
+
+  // Stores the final top-k indices.
+  cuda_unique_ptr<int> topk_indices;
 };
 
 void GetTopKSubset(TopkData* topk_data, cudaStream_t stream, float* scores_in, float* scores_out, int* indices_out, int vocab_size, int batch_size, int k, float temperature);

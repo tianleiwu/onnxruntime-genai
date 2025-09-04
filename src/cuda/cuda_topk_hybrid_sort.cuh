@@ -4,14 +4,13 @@
 #pragma once
 
 #include <cub/block/block_radix_sort.cuh>
+#include <cuda_runtime.h>
 
 #include "cuda_topk.h"
 #include "cuda_topk_bitonic_sort_helper.cuh"
 
 namespace Generators {
 namespace cuda {
-
-constexpr int kHybridSortMaxK = 64;  // up to 256.
 
 // Top-K kernel using cub::BlockRadixSort directly on register data, with a balanced final write.
 template <int kBlockSize, int kPartitionSize, int K>
@@ -81,19 +80,19 @@ void RunTopKViaHybridSort(TopkData* data, cudaStream_t stream, float* scores_in,
   switch (partition_size) {
     case 1024:
       FindBlockTopK_CubRegisterSort<block_size, 1024, max_k><<<grid_stage1, block_stage1, 0, stream>>>(
-          scores_in, data->indices_in.get(), data->scores_buffer.get(), vocab_size, num_partitions);
+          scores_in, data->intermediate_indices.get(), data->intermediate_scores_1.get(), vocab_size, num_partitions);
       break;
     case 2048:
       FindBlockTopK_CubRegisterSort<block_size, 2048, max_k><<<grid_stage1, block_stage1, 0, stream>>>(
-          scores_in, data->indices_in.get(), data->scores_buffer.get(), vocab_size, num_partitions);
+          scores_in, data->intermediate_indices.get(), data->intermediate_scores_1.get(), vocab_size, num_partitions);
       break;
     case 4096:
       FindBlockTopK_CubRegisterSort<block_size, 4096, max_k><<<grid_stage1, block_stage1, 0, stream>>>(
-          scores_in, data->indices_in.get(), data->scores_buffer.get(), vocab_size, num_partitions);
+          scores_in, data->intermediate_indices.get(), data->intermediate_scores_1.get(), vocab_size, num_partitions);
       break;
     case 8192:  // for vocab_size > 256 * 1024
       FindBlockTopK_CubRegisterSort<block_size, 8192, max_k><<<grid_stage1, block_stage1, 0, stream>>>(
-          scores_in, data->indices_in.get(), data->scores_buffer.get(), vocab_size, num_partitions);
+          scores_in, data->intermediate_indices.get(), data->intermediate_scores_1.get(), vocab_size, num_partitions);
       break;
     default:
       assert(false && "Unsupported partition_size");
@@ -103,10 +102,10 @@ void RunTopKViaHybridSort(TopkData* data, cudaStream_t stream, float* scores_in,
 
   // Stage 2: Reduce Phase
   int current_num_partitions = num_partitions;
-  float* input_scores = data->scores_buffer.get();
-  int* input_indices = data->indices_in.get();
-  float* output_scores = data->scores_temp.get();
-  int* output_indices = data->indices_sorted.get();
+  float* input_scores = data->intermediate_scores_1.get();
+  int* input_indices = data->intermediate_indices.get();
+  float* output_scores = data->intermediate_scores_2.get();
+  int* output_indices = data->topk_indices.get(); // Re-use final output buffer for intermediate indices
 
   while (current_num_partitions > 1) {
     constexpr int partitions_per_block = 8;
@@ -127,6 +126,21 @@ void RunTopKViaHybridSort(TopkData* data, cudaStream_t stream, float* scores_in,
 
   float* final_reduced_scores = input_scores;
   int* final_reduced_indices = input_indices;
+
+  // --- FIX ---
+  // The reduction phase uses a ping-pong buffer scheme. `final_reduced_scores` can
+  // point to either `intermediate_scores_1` or `intermediate_scores_2`.
+  // The subsequent Top-P sampling stage *requires* the raw scores to be
+  // in `intermediate_scores_1`. We must ensure this condition is met.
+  if (final_reduced_scores != data->intermediate_scores_1.get()) {
+    // The final results are in the temp buffer, so copy them back to the primary buffer.
+    // The size is batch_size * max_k because the reduction output has that stride.
+    cudaMemcpyAsync(data->intermediate_scores_1.get(), final_reduced_scores,
+                    static_cast<size_t>(batch_size) * max_k * sizeof(float),
+                    cudaMemcpyDeviceToDevice, stream);
+    final_reduced_scores = data->intermediate_scores_1.get(); // Update pointer to the canonical buffer
+  }
+  // --- END FIX ---
 
   ApplySoftmaxToSortedTopK<true>(stream, scores_out, indices_out, final_reduced_scores, final_reduced_indices,
                                  k, batch_size, max_k, temperature);
