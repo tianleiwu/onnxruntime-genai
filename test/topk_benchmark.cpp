@@ -64,7 +64,7 @@ void PrintSummary(const std::vector<BenchmarkResult>& results) {
   }
 }
 
-void RunBenchmarks(const BenchmarkParams& params, float temperature) {
+void RunBenchmarks(const BenchmarkParams& params) {
   std::cout << "\n--- Running Benchmarks with batch_size=" << params.batch_size << ", vocab_size=" << params.vocab_size
             << ", k=" << params.k << " ---\n";
 
@@ -108,8 +108,7 @@ void RunBenchmarks(const BenchmarkParams& params, float temperature) {
   {
     auto [mean_ms, stdev_ms, p95_ms] = bench_algo([&]() {
       Generators::cuda::RunTopKViaFullSort(data.get(), stream, scores_in_d.get(), scores_out_d.get(),
-                                           indices_out_d.get(), params.vocab_size, params.batch_size, params.k,
-                                           temperature);
+                                           indices_out_d.get(), params.vocab_size, params.batch_size, params.k);
     });
     all_results.push_back({params, "FULL_SORT", 0, mean_ms, stdev_ms, p95_ms});
   }
@@ -120,13 +119,11 @@ void RunBenchmarks(const BenchmarkParams& params, float temperature) {
       auto scores_in_copy_d =
           Generators::CudaMallocArray<float>(static_cast<size_t>(params.batch_size) * params.vocab_size);
       // Make a copy of input scores since Selection Sort modifies the input.
-      // Note that we exclude the copy from latency measurement to reflect the actual usage in sampling.
       cudaMemcpyAsync(scores_in_copy_d.get(), scores_in_d.get(), sizeof(float) * params.batch_size * params.vocab_size,
                       cudaMemcpyDeviceToDevice, stream);
       auto [mean_ms, stdev_ms, p95_ms] = bench_algo([&]() {
         Generators::cuda::RunTopKViaSelectionSort(data.get(), stream, scores_in_copy_d.get(), scores_out_d.get(),
-                                                  indices_out_d.get(), params.vocab_size, params.batch_size, params.k,
-                                                  temperature);
+                                                  indices_out_d.get(), params.vocab_size, params.batch_size, params.k);
       });
       all_results.push_back({params, "SELECTION_SORT", 0, mean_ms, stdev_ms, p95_ms});
     }
@@ -137,7 +134,7 @@ void RunBenchmarks(const BenchmarkParams& params, float temperature) {
       auto [mean_ms, stdev_ms, p95_ms] = bench_algo([&]() {
         Generators::cuda::RunTopKViaHybridSort(data.get(), stream, scores_in_d.get(), scores_out_d.get(),
                                                indices_out_d.get(), params.vocab_size, params.batch_size, params.k,
-                                               temperature, p_size);
+                                               p_size);
       });
       all_results.push_back({params, "HYBRID_SORT", p_size, mean_ms, stdev_ms, p95_ms});
     }
@@ -163,6 +160,6 @@ TEST(TopKBenchmarks, PerformanceTests) {
   }
 
   for (const auto& params : test_cases) {
-    RunBenchmarks(params, 1.0f);
+    RunBenchmarks(params);
   }
 }

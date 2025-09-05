@@ -3,7 +3,6 @@
 
 #include <cuda_runtime.h>
 #include <math.h>
-
 #include <cfloat>
 #include <cstdio>
 #include <cstdlib>
@@ -11,64 +10,37 @@
 #include <iostream>
 #include <limits>
 #include <stdio.h>
-
 #include "cuda_sampling.h"
 #include "cuda_topk.h"
 #include "smartptrs.h"
 #include "span.h"
 
-// Add this to cuda_sampling.cu after the includes
-#define DEBUG_SAMPLING 1
-
-#if DEBUG_SAMPLING
-#include <vector>
-#include <iomanip>
-// Helper to print `n` elements of a device vector starting at `offset_elements`
-void PrintDeviceVector(const float* d_ptr, size_t n, size_t offset_elements, const char* name, cudaStream_t stream) {
-  std::vector<float> h_vec(n);
-  cudaMemcpyAsync(h_vec.data(), d_ptr + offset_elements, n * sizeof(float), cudaMemcpyDeviceToHost, stream);
-  cudaStreamSynchronize(stream);  // Sync to ensure data is ready on host
-
-  std::cout << "\n--- DEBUG: " << name << " ---" << std::endl;
-  std::cout << std::fixed << std::setprecision(6);
-  for (size_t i = 0; i < n; ++i) {
-    std::cout << h_vec[i] << " ";
-    if ((i > 0) && (i + 1) % 10 == 0) std::cout << std::endl;
-  }
-  std::cout << "\n------------------------------------------------" << std::endl;
-}
-bool EnableDebug(int batch_size, int k) { return (k == 10 && batch_size == 10); }
-#endif
-
 namespace Generators {
 namespace cuda {
 
+// Initializes the cuRAND states for each batch item.
 __global__ void InitCurandStates(unsigned long long seed, curandState* states, int batch_size) {
   int index = threadIdx.x + blockIdx.x * blockDim.x;
   if (index >= batch_size) return;
-
   curand_init(seed, index, 0, &states[index]);
 }
 
 SamplingData::SamplingData(unsigned long long random_seed, int batch_size, int vocab_size, cudaStream_t stream)
     : TopkData(batch_size, vocab_size, stream) {
-  const size_t vocab_batch_size = static_cast<size_t>(vocab_size) * batch_size;
+  const size_t topk_batch_size = static_cast<size_t>(kHybridSortMaxK) * batch_size;
 
-  prefix_sums = CudaMallocArray<float>(vocab_batch_size);
-  scores_adjusted = CudaMallocArray<float>(vocab_batch_size);
-  prefix_sums_adjusted = CudaMallocArray<float>(vocab_batch_size);
-
+  prefix_sums = CudaMallocArray<float>(topk_batch_size);
+  scores_adjusted = CudaMallocArray<float>(topk_batch_size);
+  prefix_sums_adjusted = CudaMallocArray<float>(topk_batch_size);
   thresholds = CudaMallocArray<float>(batch_size);
   curand_states = CudaMallocArray<curandState>(batch_size);
 
-  if (batch_size == 10 && vocab_size == 32000)
-    printf("random seed: %llu, batch_size: %d, vocab_size: %d\n", random_seed, batch_size, vocab_size);
   InitCurandStates<<<CeilDiv(batch_size, 128), 128, 0, stream>>>(random_seed, curand_states.get(), batch_size);
   CUDA_CHECK(cudaGetLastError());
 }
 
-// --- Sampling Kernels ---
-
+// Computes an inclusive prefix sum (scan) on the input scores.
+// This is used to generate the Cumulative Distribution Function (CDF).
 template <int kBlockSize>
 __global__ void CorrectPrefixSumKernel(const float* scores, float* prefix_sums, int sample_range) {
   int batch = blockIdx.x;
@@ -100,7 +72,8 @@ __global__ void CorrectPrefixSumKernel(const float* scores, float* prefix_sums, 
   }
 }
 
-// Filters raw logits based on a pre-computed prefix scan of probabilities.
+// Filters logits based on the Top-P cumulative probability.
+// Logits that fall outside the probability mass `p` are set to -infinity.
 __global__ void FilterOnTopPKernel(float* filtered_logits_out, const float* prefix_sums_in, const float* raw_logits_in,
                                    int sample_range, float p) {
   const int batch_idx = blockIdx.x;
@@ -117,9 +90,9 @@ __global__ void FilterOnTopPKernel(float* filtered_logits_out, const float* pref
   }
 }
 
-// A CUB-based softmax that correctly handles temperature for re-normalization.
+// Applies temperature to raw logits and computes their softmax probability.
 template <int kBlockSize>
-__global__ void RenormalizeSoftmaxKernel(float* final_scores, const float* input_scores, int k, float temperature) {
+__global__ void ApplyTemperatureAndSoftmax(float* final_scores, const float* input_scores, int k, float temperature) {
   const int batch_idx = blockIdx.x;
   const float* batch_input_scores = input_scores + batch_idx * k;
 
@@ -128,43 +101,30 @@ __global__ void RenormalizeSoftmaxKernel(float* final_scores, const float* input
   __shared__ float block_max_val;
   __shared__ float block_sum_exp;
 
-  float thread_max = -std::numeric_limits<float>::max();
-  if (threadIdx.x < k) {
-    thread_max = batch_input_scores[threadIdx.x] / temperature;
-  }
-
-  float max_val_reduced = BlockReduce(temp_storage).Reduce(thread_max, cub::Max());
+  // Find max value in the block for numerical stability
+  float thread_score =
+      (threadIdx.x < k) ? (batch_input_scores[threadIdx.x] / temperature) : -std::numeric_limits<float>::max();
+  float max_val_reduced = BlockReduce(temp_storage).Reduce(thread_score, cub::Max());
   if (threadIdx.x == 0) {
     block_max_val = max_val_reduced;
   }
   __syncthreads();
 
-  float thread_exp_sum = 0.0f;
-  if (threadIdx.x < k) {
-    thread_exp_sum = expf(batch_input_scores[threadIdx.x] / temperature - block_max_val);
-  }
-
-  float sum_exp_reduced = BlockReduce(temp_storage).Reduce(thread_exp_sum, cub::Sum());
+  // Compute sum of exponents
+  float thread_exp = (threadIdx.x < k) ? expf(thread_score - block_max_val) : 0.0f;
+  float sum_exp_reduced = BlockReduce(temp_storage).Reduce(thread_exp, cub::Sum());
   if (threadIdx.x == 0) {
     block_sum_exp = sum_exp_reduced;
   }
   __syncthreads();
 
+  // Compute final softmax probability
   if (threadIdx.x < k) {
-    final_scores[batch_idx * k + threadIdx.x] =
-        (block_sum_exp > 0.0f) ? (expf(batch_input_scores[threadIdx.x] / temperature - block_max_val) / block_sum_exp)
-                               : 0.0f;
+    final_scores[batch_idx * k + threadIdx.x] = (block_sum_exp > 0.0f) ? (thread_exp / block_sum_exp) : 0.0f;
   }
 }
 
-// __global__ void RandomThresholdKernel(curandState* curand_states, float* thresholds, int batch_size) {
-//   int index = threadIdx.x + blockIdx.x * blockDim.x;
-//   if (index < batch_size) {
-//     thresholds[index] = 0.9999999f * curand_uniform(&curand_states[index]);
-//   }
-// }
-
-// REPLACE the existing RandomThresholdKernel with this debug version
+// Generates a random float threshold [0.0, 1.0) for each batch item.
 __global__ void RandomThresholdKernel(curandState* curand_states, float* thresholds, int batch_size) {
   int index = threadIdx.x + blockIdx.x * blockDim.x;
   if (index < batch_size) {
@@ -172,123 +132,82 @@ __global__ void RandomThresholdKernel(curandState* curand_states, float* thresho
   }
 }
 
+// Samples a single token per batch item based on the CDF and a random threshold.
 template <int kBlockSize>
-__global__ void SampleKernel(float* prefix_sums, int* indices, int* index_out, int sample_range, int indices_stride,
-                             float* thresholds, bool enable_debug) {
+__global__ void SampleKernel(const float* prefix_sums, const int* indices, int* index_out, int sample_range,
+                             float* thresholds) {
   int batch = blockIdx.x;
 
-  // Only one thread per block will perform the search to ensure no race conditions.
   if (threadIdx.x == 0) {
     float threshold = thresholds[batch];
-    int selected_index = sample_range - 1;  // Default to the last valid token
+    int selected_index = sample_range - 1;  // Default to last element
 
-    // Simple linear search to find the first token whose CDF is >= the threshold
+    // Find the first element in the CDF that is >= the threshold.
     for (int i = 0; i < sample_range; i++) {
       if (prefix_sums[batch * sample_range + i] >= threshold) {
         selected_index = i;
         break;
       }
     }
-
-    // DEBUG: Print the inputs and output of the sampling decision
-    if (enable_debug) {
-      printf("Batch %d --- Threshold: %f, Selected Index: %d, CDF at Index: %f\n", batch, threshold, selected_index,
-             prefix_sums[batch * sample_range + selected_index]);
-    }
-
-    index_out[batch] = indices[batch * indices_stride + selected_index];
+    // Convert from the local index within the top-k set to the original vocabulary index.
+    index_out[batch] = indices[batch * sample_range + selected_index];
   }
 }
 
-void LaunchSampleKernel(SamplingData* data, cudaStream_t stream, float* scores, int* indices, int* index_out,
-                        int sample_range, int batch_size, int indices_stride, float p, int k, float temperature) {
+// Orchestrates the multi-stage Top-P sampling process.
+void LaunchSampleKernel(SamplingData* data, cudaStream_t stream, const float* scores, const int* indices,
+                        int* index_out, int sample_range, int batch_size, float p, int k, float temperature) {
   dim3 grid(batch_size);
   dim3 block(256);
 
-  // Stage 1: Compute a correct prefix sum of the initial Top-K probabilities.
-  CorrectPrefixSumKernel<256><<<grid, block, 0, stream>>>(scores, data->prefix_sums.get(), k);
+  // Stage 1: Apply temperature and softmax to the raw top-k logits to get initial probabilities.
+  ApplyTemperatureAndSoftmax<256><<<grid, block, 0, stream>>>(data->prefix_sums_adjusted.get(), scores, k, temperature);
   CUDA_CHECK(cudaGetLastError());
-#if DEBUG_SAMPLING
-  bool enable_debug = EnableDebug(batch_size, k);
-  if (enable_debug) {
-    cudaStreamSynchronize(stream);  // Sync before printing
-    PrintDeviceVector(data->prefix_sums.get(), k, 0 * k, "CDF of Initial Probs [Batch 0]", stream);
-    PrintDeviceVector(data->prefix_sums.get(), k, 1 * k, "CDF of Initial Probs [Batch 1]", stream);
-  }
-#endif
 
-  // Stage 2: Filter the raw logits based on the computed cumulative probability.
-  const float* raw_topk_logits = data->intermediate_scores_1.get();
-  FilterOnTopPKernel<<<grid, block, 0, stream>>>(data->scores_adjusted.get(), data->prefix_sums.get(), raw_topk_logits,
-                                                 k, p);
-  CUDA_CHECK(cudaGetLastError());
-#if DEBUG_SAMPLING
-  if (enable_debug) {
-    cudaStreamSynchronize(stream);
-    PrintDeviceVector(data->scores_adjusted.get(), k, 0 * k, "Filtered Raw Logits [Batch 0]", stream);
-    PrintDeviceVector(data->scores_adjusted.get(), k, 1 * k, "Filtered Raw Logits [Batch 1]", stream);
-  }
-#endif
-
-  // Stage 3: Re-normalize the filtered logits via softmax, now with temperature.
-  RenormalizeSoftmaxKernel<256>
-      <<<grid, block, 0, stream>>>(data->prefix_sums_adjusted.get(), data->scores_adjusted.get(), k, temperature);
-  CUDA_CHECK(cudaGetLastError());
-#if DEBUG_SAMPLING
-  if (enable_debug) {
-    cudaStreamSynchronize(stream);
-    PrintDeviceVector(data->prefix_sums_adjusted.get(), k, 0 * k, "Re-Normalized Probs [Batch 0]", stream);
-    PrintDeviceVector(data->prefix_sums_adjusted.get(), k, 1 * k, "Re-Normalized Probs [Batch 1]", stream);
-  }
-#endif
-
-  // Stage 4: Compute a prefix sum of the new, re-normalized probabilities for sampling.
+  // Stage 2: Compute prefix sum (CDF) of initial probabilities for Top-P filtering.
   CorrectPrefixSumKernel<256><<<grid, block, 0, stream>>>(data->prefix_sums_adjusted.get(), data->prefix_sums.get(), k);
   CUDA_CHECK(cudaGetLastError());
-#if DEBUG_SAMPLING
-  if (enable_debug) {
-    cudaStreamSynchronize(stream);
-    PrintDeviceVector(data->prefix_sums.get(), k, 0 * k, "Re-Normalized Probs [Batch 0]", stream);
-    PrintDeviceVector(data->prefix_sums.get(), k, 1 * k, "Re-Normalized Probs [Batch 1]", stream);
-  }
-#endif
 
-  // Stage 5: Generate random thresholds and sample one token per batch item.
+  // Stage 3: Filter the raw logits based on the computed cumulative probability `p`.
+  FilterOnTopPKernel<<<grid, block, 0, stream>>>(data->scores_adjusted.get(), data->prefix_sums.get(), scores, k, p);
+  CUDA_CHECK(cudaGetLastError());
+
+  // Stage 4: Re-normalize the filtered logits via softmax.
+  ApplyTemperatureAndSoftmax<256><<<grid, block, 0, stream>>>(
+      data->prefix_sums_adjusted.get(), data->scores_adjusted.get(), k, 1.0f);  // Temp is 1.0f for re-normalization
+  CUDA_CHECK(cudaGetLastError());
+
+  // Stage 5: Compute a prefix sum of the re-normalized probabilities to create the final CDF for sampling.
+  CorrectPrefixSumKernel<256><<<grid, block, 0, stream>>>(data->prefix_sums_adjusted.get(), data->prefix_sums.get(), k);
+  CUDA_CHECK(cudaGetLastError());
+
+  // Stage 6: Generate random thresholds and sample one token per batch item from the final CDF.
   RandomThresholdKernel<<<CeilDiv(batch_size, 128), 128, 0, stream>>>(data->curand_states.get(), data->thresholds.get(),
                                                                       batch_size);
   CUDA_CHECK(cudaGetLastError());
 
-  SampleKernel<256><<<grid, block, 0, stream>>>(data->prefix_sums.get(), indices, index_out, sample_range,
-                                                indices_stride, data->thresholds.get(), enable_debug);
+  SampleKernel<256>
+      <<<grid, block, 0, stream>>>(data->prefix_sums.get(), indices, index_out, sample_range, data->thresholds.get());
   CUDA_CHECK(cudaGetLastError());
 }
 
-void GetSample(SamplingData* data, cudaStream_t stream, int32_t* next_token_out, float* scores_in, int vocab_size,
+void GetSample(SamplingData* data, cudaStream_t stream, int32_t* next_token_out, const float* scores_in, int vocab_size,
                int batch_size, int k, float p, float temperature) {
   if (k <= 0 || k > vocab_size) {
     k = vocab_size;
   }
 
+  // Step 1: Get the raw scores (logits) and indices of the top `k` candidates.
+  // The results are placed in `data->output_scores` and `data->output_indices`.
   TopkData* topk_data = data;
-  GetTopKSubset(topk_data, stream, scores_in, data->topk_probs.get(), data->topk_indices.get(), vocab_size, batch_size,
-                k, temperature);
+  GetTopKSubset(topk_data, stream, scores_in, data->output_scores.get(), data->output_indices.get(), vocab_size,
+                batch_size, k);
 
-#if DEBUG_SAMPLING
-  if (EnableDebug(batch_size, k)) {
-    std::cout << "\n\n========= NEW SAMPLING CALL (k=" << k << ", p=" << p << ") =========" << std::endl;
-    // Print raw logits assuming a STRIDE of 64 (for hybrid sort debugging)
-    PrintDeviceVector(data->intermediate_scores_1.get(), k, 0 * 64, "Initial Raw Top-K Logits [Batch 0]", stream);
-    PrintDeviceVector(data->intermediate_scores_1.get(), k, 1 * 64, "Initial Raw Top-K Logits [Batch 1]", stream);
-    // Print probs/CDF assuming a COMPACT stride of k
-    PrintDeviceVector(data->topk_probs.get(), k, 0 * k, "Initial Top-K Probs [Batch 0]", stream);
-    PrintDeviceVector(data->topk_probs.get(), k, 1 * k, "Initial Top-K Probs [Batch 1]", stream);
-  }
-#endif
-
+  // Step 2: Launch the sampling kernel to perform Top-P sampling on the selected candidates.
   int sample_range = k;
-  int indices_stride = k;
-  LaunchSampleKernel(data, stream, data->topk_probs.get(), data->topk_indices.get(), next_token_out, sample_range,
-                     batch_size, indices_stride, p, k, temperature);
+  LaunchSampleKernel(data, stream, data->output_scores.get(), data->output_indices.get(), next_token_out, sample_range,
+                     batch_size, p, k, temperature);
 }
+
 }  // namespace cuda
 }  // namespace Generators

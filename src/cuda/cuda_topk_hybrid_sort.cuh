@@ -5,7 +5,6 @@
 
 #include <cub/block/block_radix_sort.cuh>
 #include <cuda_runtime.h>
-
 #include "cuda_topk.h"
 #include "cuda_topk_bitonic_sort_helper.cuh"
 
@@ -13,37 +12,36 @@ namespace Generators {
 namespace cuda {
 
 // Kernel to compact strided data into a dense layout.
+// Used to convert data from a [batch, stride] layout to a dense [batch, k] layout.
 template <typename T>
 __global__ void CompactStridedData(const T* input, T* output, int k, int batch_size, int input_stride) {
-    const int batch_idx = blockIdx.x;
-    for (int i = threadIdx.x; i < k; i += blockDim.x) {
-        int in_idx = batch_idx * input_stride + i;
-        int out_idx = batch_idx * k + i;
-        output[out_idx] = input[in_idx];
-    }
+  const int batch_idx = blockIdx.x;
+  for (int i = threadIdx.x; i < k; i += blockDim.x) {
+    int in_idx = batch_idx * input_stride + i;
+    int out_idx = batch_idx * k + i;
+    output[out_idx] = input[in_idx];
+  }
 }
 
-
+// Stage 1 of Hybrid Sort: Find the top-k elements within large, contiguous partitions of the vocabulary.
 template <int kBlockSize, int kPartitionSize, int K>
 __global__ void FindBlockTopK_CubRegisterSort(const float* __restrict__ scores_in,
                                               int* __restrict__ intermediate_indices,
-                                              float* __restrict__ intermediate_scores,
-                                              int vocab_size,
+                                              float* __restrict__ intermediate_scores, int vocab_size,
                                               int num_partitions) {
   constexpr int ItemsPerThread = kPartitionSize / kBlockSize;
-
   typedef cub::BlockRadixSort<float, kBlockSize, ItemsPerThread, int> BlockRadixSort;
   __shared__ typename BlockRadixSort::TempStorage temp_storage;
 
   const int batch_idx = blockIdx.y;
   const int partition_idx = blockIdx.x;
   const int partition_start = partition_idx * kPartitionSize;
-
   const float* batch_scores_in = scores_in + batch_idx * vocab_size;
 
   float thread_keys[ItemsPerThread];
   int thread_values[ItemsPerThread];
 
+  // Coalesced load from global memory into per-thread registers.
   for (int i = 0; i < ItemsPerThread; ++i) {
     int global_idx = partition_start + threadIdx.x + i * kBlockSize;
     if (global_idx < vocab_size && global_idx < partition_start + kPartitionSize) {
@@ -55,8 +53,10 @@ __global__ void FindBlockTopK_CubRegisterSort(const float* __restrict__ scores_i
     }
   }
 
+  // Sort the keys and values held in registers across the entire block.
   BlockRadixSort(temp_storage).SortDescendingBlockedToStriped(thread_keys, thread_values);
 
+  // The first K threads now hold the top K elements for this partition. Write them out.
   if (threadIdx.x < K) {
     int offset = (batch_idx * num_partitions + partition_idx) * K;
     intermediate_scores[offset + threadIdx.x] = thread_keys[0];
@@ -64,13 +64,15 @@ __global__ void FindBlockTopK_CubRegisterSort(const float* __restrict__ scores_i
   }
 }
 
+// Helper to calculate the size of intermediate buffers needed by hybrid sort.
 inline size_t GetHybridSortIntermediateSize(int batch_size, int vocab_size, int partition_size) {
   const int num_partitions = (vocab_size + partition_size - 1) / partition_size;
   return static_cast<size_t>(batch_size) * num_partitions * kHybridSortMaxK;
 }
 
-void RunTopKViaHybridSort(TopkData* data, cudaStream_t stream, float* scores_in, float* scores_out, int* indices_out,
-                          int vocab_size, int batch_size, int k, float temperature, int partition_size) {
+// Interface for running Top-K using the hybrid sort algorithm.
+void RunTopKViaHybridSort(TopkData* data, cudaStream_t stream, const float* scores_in, float* scores_out,
+                          int* indices_out, int vocab_size, int batch_size, int k, int partition_size) {
   constexpr int max_k = kHybridSortMaxK;
   constexpr int block_size = 256;
   static_assert(max_k <= block_size);
@@ -79,23 +81,24 @@ void RunTopKViaHybridSort(TopkData* data, cudaStream_t stream, float* scores_in,
   dim3 grid_stage1(num_partitions, batch_size);
   dim3 block_stage1(block_size);
 
-  // Stage 1: Find Top-K within partitions
+  // Stage 1: Find Top-K within partitions.
+  // The results are written to intermediate buffers.
   switch (partition_size) {
     case 1024:
       FindBlockTopK_CubRegisterSort<block_size, 1024, max_k><<<grid_stage1, block_stage1, 0, stream>>>(
-          scores_in, data->intermediate_indices.get(), data->intermediate_scores_1.get(), vocab_size, num_partitions);
+          scores_in, data->intermediate_indices_1.get(), data->intermediate_scores_1.get(), vocab_size, num_partitions);
       break;
     case 2048:
       FindBlockTopK_CubRegisterSort<block_size, 2048, max_k><<<grid_stage1, block_stage1, 0, stream>>>(
-          scores_in, data->intermediate_indices.get(), data->intermediate_scores_1.get(), vocab_size, num_partitions);
+          scores_in, data->intermediate_indices_1.get(), data->intermediate_scores_1.get(), vocab_size, num_partitions);
       break;
     case 4096:
       FindBlockTopK_CubRegisterSort<block_size, 4096, max_k><<<grid_stage1, block_stage1, 0, stream>>>(
-          scores_in, data->intermediate_indices.get(), data->intermediate_scores_1.get(), vocab_size, num_partitions);
+          scores_in, data->intermediate_indices_1.get(), data->intermediate_scores_1.get(), vocab_size, num_partitions);
       break;
     case 8192:
       FindBlockTopK_CubRegisterSort<block_size, 8192, max_k><<<grid_stage1, block_stage1, 0, stream>>>(
-          scores_in, data->intermediate_indices.get(), data->intermediate_scores_1.get(), vocab_size, num_partitions);
+          scores_in, data->intermediate_indices_1.get(), data->intermediate_scores_1.get(), vocab_size, num_partitions);
       break;
     default:
       assert(false && "Unsupported partition_size");
@@ -103,60 +106,38 @@ void RunTopKViaHybridSort(TopkData* data, cudaStream_t stream, float* scores_in,
   }
   CUDA_CHECK(cudaGetLastError());
 
-  // Stage 2: Reduce Phase
+  // Stage 2: Iteratively reduce the candidates from each partition until only one partition remains.
+  // This uses a ping-pong buffer scheme for scores and indices.
   int current_num_partitions = num_partitions;
   float* input_scores = data->intermediate_scores_1.get();
-  int* input_indices = data->intermediate_indices.get();
   float* output_scores = data->intermediate_scores_2.get();
-  // FIX: Use a dedicated intermediate buffer for indices to prevent race condition.
-  int* output_indices = data->topk_indices_intermediate.get();
+  int* input_indices = data->intermediate_indices_1.get();
+  int* output_indices = data->intermediate_indices_2.get();
 
   while (current_num_partitions > 1) {
     constexpr int partitions_per_block = 8;
     int num_blocks = (current_num_partitions + partitions_per_block - 1) / partitions_per_block;
     dim3 grid_reduce(num_blocks, batch_size);
     dim3 block_reduce(block_size);
-    bitonic::reduction::BlockReduceTopK<block_size, max_k, partitions_per_block><<<grid_reduce, block_reduce, 0, stream>>>(
-        input_scores, input_indices, output_scores, output_indices, current_num_partitions);
+    bitonic::reduction::BlockReduceTopK<block_size, max_k, partitions_per_block>
+        <<<grid_reduce, block_reduce, 0, stream>>>(input_scores, input_indices, output_scores, output_indices,
+                                                   current_num_partitions);
     CUDA_CHECK(cudaGetLastError());
     std::swap(input_scores, output_scores);
     std::swap(input_indices, output_indices);
     current_num_partitions = num_blocks;
   }
 
+  // After reduction, input_scores and input_indices point to the device buffers
+  // containing the final top-`max_k` raw scores and indices.
   float* final_reduced_scores = input_scores;
   int* final_reduced_indices = input_indices;
 
-  if (final_reduced_scores != data->intermediate_scores_1.get()) {
-    cudaMemcpyAsync(data->intermediate_scores_1.get(), final_reduced_scores,
-                    static_cast<size_t>(batch_size) * max_k * sizeof(float), cudaMemcpyDeviceToDevice, stream);
-  }
-
-  // The final reduced indices are now in `final_reduced_indices`. We must copy them to the canonical `topk_indices` buffer.
-  if (final_reduced_indices != data->topk_indices.get()){
-      cudaMemcpyAsync(data->topk_indices.get(), final_reduced_indices,
-                  static_cast<size_t>(batch_size) * max_k * sizeof(int), cudaMemcpyDeviceToDevice, stream);
-  }
-  
-  // At this point, intermediate_scores_1 (raw logits) and topk_indices (indices) are both strided by max_k.
-  final_reduced_scores = data->intermediate_scores_1.get();
-  final_reduced_indices = data->topk_indices.get();
-
-  // ApplySoftmaxToSortedTopK reads the strided inputs and produces COMPACT outputs.
-  ApplySoftmaxToSortedTopK<true>(stream, scores_out, indices_out, final_reduced_scores, final_reduced_indices,
-                                 k, batch_size, max_k, temperature);
-
-  // FIX: The raw logits in `intermediate_scores_1` are still strided by `max_k`, but the sampling
-  // pipeline expects them to be compact. We compact them here.
-  CompactStridedData<float><<<batch_size, 256, 0, stream>>>(
-      final_reduced_scores,
-      data->intermediate_scores_2.get(),
-      k, batch_size, max_k);
-
-  // Copy the compacted raw logits back into the canonical buffer.
-  cudaMemcpyAsync(data->intermediate_scores_1.get(), data->intermediate_scores_2.get(),
-                  static_cast<size_t>(batch_size) * k * sizeof(float),
-                  cudaMemcpyDeviceToDevice, stream);
+  // Stage 3: The reduced results are strided by `max_k`. We need to copy the first `k`
+  // elements for each batch item into the compact final output buffers.
+  CompactStridedData<float><<<batch_size, 256, 0, stream>>>(final_reduced_scores, scores_out, k, batch_size, max_k);
+  CompactStridedData<int><<<batch_size, 256, 0, stream>>>(final_reduced_indices, indices_out, k, batch_size, max_k);
+  CUDA_CHECK(cudaGetLastError());
 }
 
 }  // namespace cuda
