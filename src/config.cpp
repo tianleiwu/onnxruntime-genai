@@ -6,6 +6,8 @@
 #include "json.h"
 #include <fstream>
 #include <sstream>
+#include <limits>
+#include <stdexcept>
 
 namespace Generators {
 
@@ -746,6 +748,24 @@ struct Model_Element : JSON::Element {
   Speech_Element speech_{v_.speech};
 };
 
+int safe_double_to_int(double x, std::string_view name) {
+    if (std::isnan(x) || !std::isfinite(x)) {
+        throw std::overflow_error(
+            "Field '" + std::string(name) + "' cannot be converted to int32 (NaN or Inf)"
+        );
+    }
+
+    if (x < static_cast<double>(std::numeric_limits<int>::min()) ||
+        x > static_cast<double>(std::numeric_limits<int>::max())) {
+        throw std::overflow_error(
+            "Field '" + std::string(name) + "' value " + std::to_string(x) + 
+            " is out of int32 range"
+        );
+    }
+
+    return static_cast<int>(x);
+}
+
 struct Search_Element : JSON::Element {
   explicit Search_Element(Config::Search& v) : v_{v} {}
 
@@ -777,7 +797,7 @@ struct Search_Element : JSON::Element {
     } else if (name == "length_penalty") {
       v_.length_penalty = static_cast<float>(JSON::Get<double>(value));
     } else if (name == "random_seed") {
-      v_.random_seed = static_cast<int>(JSON::Get<double>(value));
+      v_.random_seed = safe_double_to_int(JSON::Get<double>(value), name);
     } else if (name == "do_sample") {
       v_.do_sample = JSON::Get<bool>(value);
     } else if (name == "past_present_share_buffer") {
