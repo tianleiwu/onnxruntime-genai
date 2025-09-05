@@ -532,13 +532,13 @@ TEST(SamplingTests, RandomizedSamplingTopKCuda) {
 }
 
 TEST(SamplingTests, RandomizedSamplingTopPAndKCuda) {
-  const int batch_size = 5;
+  const int batch_size = 10;
   const int k = 10;
   const float p = 0.75f;
-  const int vocab_size = 32000;
+  const int vocab_size = 1000;
 
   auto config = OgaConfig::Create(MODEL_PATH "hf-internal-testing/tiny-random-gpt2-fp32");
-  config->Overlay(R"({ "model": { "vocab_size" : 32000 } })");
+  config->Overlay(R"({ "model": { "vocab_size" : 1000 } })");
   config->ClearProviders();
   config->AppendProvider("cuda");
 
@@ -555,26 +555,30 @@ TEST(SamplingTests, RandomizedSamplingTopPAndKCuda) {
   std::random_device rd;
   std::mt19937 engine(rd());
   std::vector<int> indices(vocab_size);
-  const int num_iter = 1;
+  const int num_iter = 1000;
   std::map<float, int> logit_to_count;
 
   // Run test
-  for (int i = 0; i < num_iter; i++) {
-    std::vector<float> logits_cpu(vocab_size * batch_size);
-    // Shuffle integers 1 to k randomly into cpu_span
-    for (int b = 0; b < batch_size; b++) {
-      std::iota(indices.begin(), indices.end(), 0);
-      std::shuffle(indices.begin(), indices.end(), engine);
-      for (int j = 0; j < k; j++)
-        logits_cpu[indices[j] + vocab_size * b] = float(k - j);
-    }
+  std::vector<float> logits_cpu(vocab_size * batch_size);
+  // Shuffle integers 1 to k randomly into cpu_span
+  for (int b = 0; b < batch_size; b++) {
+    std::iota(indices.begin(), indices.end(), 0);
+    std::shuffle(indices.begin(), indices.end(), engine);
+    for (int j = 0; j < k; j++) logits_cpu[indices[j] + vocab_size * b] = float(k - j);
+  }
 
-    auto generator = OgaGenerator::Create(*model, *params);
-    // Explicitly create a std::array for the shape so it can be
-    // correctly converted to the std::span expected by OgaTensor::Create.
-    std::array<int64_t, 2> shape = {batch_size, vocab_size};
-    auto logits_tensor = OgaTensor::Create(logits_cpu.data(), shape);
-    generator->SetLogits(*logits_tensor);
+  auto random_seed = static_cast<double>(engine());
+  printf("Random Seed: %f\n", random_seed);
+  params->SetSearchOption("random_seed", random_seed);
+  auto generator = OgaGenerator::Create(*model, *params);
+
+  // Explicitly create a std::array for the shape so it can be
+  // correctly converted to the std::span expected by OgaTensor::Create.
+  std::array<int64_t, 2> shape = {batch_size, vocab_size};
+  auto logits_tensor = OgaTensor::Create(logits_cpu.data(), shape);
+  generator->SetLogits(*logits_tensor);
+
+  for (int i = 0; i < num_iter; i++) {    
     generator->GenerateNextToken();
     auto next_tokens = generator->GetNextTokens();
 
@@ -583,6 +587,7 @@ TEST(SamplingTests, RandomizedSamplingTopPAndKCuda) {
       auto next_token = next_tokens[b];
       auto next_token_score = logits_cpu[next_token + vocab_size * b];
       logit_to_count[next_token_score]++;
+      printf("batch: %d, next token: %d, score: %f\n", b, next_token, next_token_score);
       EXPECT_GT(next_token_score, 0.0f);
     }
   }

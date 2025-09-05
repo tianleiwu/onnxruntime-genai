@@ -35,6 +35,11 @@ SamplingData::SamplingData(unsigned long long random_seed, int batch_size, int v
   thresholds = CudaMallocArray<float>(batch_size);
   curand_states = CudaMallocArray<curandState>(batch_size);
 
+  ReInitCurandStates(random_seed, batch_size, stream);
+}
+
+void SamplingData::ReInitCurandStates(unsigned long long random_seed, int batch_size, cudaStream_t stream) {
+  random_seed_ = random_seed;
   InitCurandStates<<<CeilDiv(batch_size, 128), 128, 0, stream>>>(random_seed, curand_states.get(), batch_size);
   CUDA_CHECK(cudaGetLastError());
 }
@@ -47,23 +52,19 @@ __global__ void CorrectPrefixSumKernel(const float* scores, float* prefix_sums, 
   typedef cub::BlockScan<float, kBlockSize> BlockScan;
   __shared__ typename BlockScan::TempStorage temp_storage;
   __shared__ float chunk_total;
-
   float running_total = 0.0f;
 
   for (int i = 0; i < sample_range; i += kBlockSize) {
     int global_index = threadIdx.x + i + batch * sample_range;
     int local_index = threadIdx.x + i;
     float score = (local_index < sample_range) ? scores[global_index] : 0.0f;
-
     float scanned_score;
     BlockScan(temp_storage).InclusiveSum(score, scanned_score);
     __syncthreads();
-
     if (local_index < sample_range) {
       prefix_sums[global_index] = scanned_score + running_total;
     }
     __syncthreads();
-
     if (threadIdx.x == kBlockSize - 1) {
       chunk_total = scanned_score;
     }
@@ -77,11 +78,9 @@ __global__ void CorrectPrefixSumKernel(const float* scores, float* prefix_sums, 
 __global__ void FilterOnTopPKernel(float* filtered_logits_out, const float* prefix_sums_in, const float* raw_logits_in,
                                    int sample_range, float p) {
   const int batch_idx = blockIdx.x;
-
   for (int i = threadIdx.x; i < sample_range; i += blockDim.x) {
     const int global_idx = batch_idx * sample_range + i;
     const float prev_sum = (i == 0) ? 0.0f : prefix_sums_in[global_idx - 1];
-
     if (prev_sum < p) {
       filtered_logits_out[global_idx] = raw_logits_in[global_idx];
     } else {
@@ -140,7 +139,7 @@ __global__ void SampleKernel(const float* prefix_sums, const int* indices, int* 
 
   if (threadIdx.x == 0) {
     float threshold = thresholds[batch];
-    int selected_index = sample_range - 1;  // Default to last element
+    int selected_index = sample_range - 1; // Default to last element
 
     // Find the first element in the CDF that is >= the threshold.
     for (int i = 0; i < sample_range; i++) {
@@ -173,8 +172,8 @@ void LaunchSampleKernel(SamplingData* data, cudaStream_t stream, const float* sc
   CUDA_CHECK(cudaGetLastError());
 
   // Stage 4: Re-normalize the filtered logits via softmax.
-  ApplyTemperatureAndSoftmax<256><<<grid, block, 0, stream>>>(
-      data->prefix_sums_adjusted.get(), data->scores_adjusted.get(), k, 1.0f);  // Temp is 1.0f for re-normalization
+  ApplyTemperatureAndSoftmax<256><<<grid, block, 0, stream>>>(data->prefix_sums_adjusted.get(),
+                                                              data->scores_adjusted.get(), k, 1.0f); // Temp is 1.0f for re-normalization
   CUDA_CHECK(cudaGetLastError());
 
   // Stage 5: Compute a prefix sum of the re-normalized probabilities to create the final CDF for sampling.
@@ -186,15 +185,20 @@ void LaunchSampleKernel(SamplingData* data, cudaStream_t stream, const float* sc
                                                                       batch_size);
   CUDA_CHECK(cudaGetLastError());
 
-  SampleKernel<256>
-      <<<grid, block, 0, stream>>>(data->prefix_sums.get(), indices, index_out, sample_range, data->thresholds.get());
+  SampleKernel<256><<<grid, block, 0, stream>>>(data->prefix_sums.get(), indices, index_out, sample_range,
+                                                data->thresholds.get());
   CUDA_CHECK(cudaGetLastError());
 }
 
-void GetSample(SamplingData* data, cudaStream_t stream, int32_t* next_token_out, const float* scores_in, int vocab_size,
-               int batch_size, int k, float p, float temperature) {
+void GetSample(SamplingData* data, cudaStream_t stream, int32_t* next_token_out, const float* scores_in,
+               int vocab_size, int batch_size, int k, float p, float temperature, unsigned long long seed) {
   if (k <= 0 || k > vocab_size) {
     k = vocab_size;
+  }
+
+  // If the seed has changed, re-initialize the cuRAND states.
+  if (data->random_seed_ != seed) {
+    data->ReInitCurandStates(seed, batch_size, stream);
   }
 
   // Step 1: Get the raw scores (logits) and indices of the top `k` candidates.
@@ -205,9 +209,79 @@ void GetSample(SamplingData* data, cudaStream_t stream, int32_t* next_token_out,
 
   // Step 2: Launch the sampling kernel to perform Top-P sampling on the selected candidates.
   int sample_range = k;
-  LaunchSampleKernel(data, stream, data->output_scores.get(), data->output_indices.get(), next_token_out, sample_range,
-                     batch_size, p, k, temperature);
+  LaunchSampleKernel(data, stream, data->output_scores.get(), data->output_indices.get(), next_token_out,
+                     sample_range, batch_size, p, k, temperature);
 }
+
+
+// Implementation for the general-purpose block-wise softmax, used by beam search.
+template <int kBlockSize, bool is_log_softmax>
+__global__ void BlockwiseSoftmaxKernel(float* output, const float* input, int softmax_elements, int input_stride,
+                                       int output_stride) {
+  const int batch_idx = blockIdx.x;
+  const float* batch_input = input + batch_idx * input_stride;
+  float* batch_output = output + batch_idx * output_stride;
+
+  typedef cub::BlockReduce<float, kBlockSize> BlockReduce;
+  __shared__ typename BlockReduce::TempStorage temp_storage;
+  __shared__ float max_val;
+  __shared__ float sum_exp;
+
+  // Step 1: Find max value in parallel for numerical stability.
+  float thread_max = -std::numeric_limits<float>::max();
+  for (int i = threadIdx.x; i < softmax_elements; i += kBlockSize) {
+    thread_max = max(thread_max, batch_input[i]);
+  }
+  float block_max = BlockReduce(temp_storage).Reduce(thread_max, cub::Max());
+  if (threadIdx.x == 0) {
+    max_val = block_max;
+  }
+  __syncthreads();
+
+  // Step 2: Compute sum of exponents in parallel.
+  float thread_sum_exp = 0.0f;
+  for (int i = threadIdx.x; i < softmax_elements; i += kBlockSize) {
+    thread_sum_exp += expf(batch_input[i] - max_val);
+  }
+  float block_sum = BlockReduce(temp_storage).Reduce(thread_sum_exp, cub::Sum());
+  if (threadIdx.x == 0) {
+    sum_exp = block_sum;
+  }
+  __syncthreads();
+
+  // Step 3: Compute final softmax or log_softmax and write to output.
+  if constexpr (is_log_softmax) {
+    // Add a small epsilon to prevent log(0) which results in -inf.
+    float log_sum_exp = logf(sum_exp + 1e-20f);
+    for (int i = threadIdx.x; i < softmax_elements; i += kBlockSize) {
+      batch_output[i] = batch_input[i] - max_val - log_sum_exp;
+    }
+  } else {
+    for (int i = threadIdx.x; i < softmax_elements; i += kBlockSize) {
+      // Handle case where sum_exp is zero to prevent division by zero (NaN).
+      batch_output[i] = (sum_exp > 0.0f) ? (expf(batch_input[i] - max_val) / sum_exp) : 0.0f;
+    }
+  }
+}
+
+template <bool is_log_softmax>
+void DispatchBlockwiseSoftmaxForward(cudaStream_t stream, float* output, const float* input, int softmax_elements,
+                                     int input_stride, int output_stride, int batch_count) {
+  // This kernel is efficient for large softmax_elements (like vocab_size) where
+  // a single block can cooperatively process one batch item.
+  constexpr int kBlockSize = 256;
+  dim3 grid(batch_count);
+  dim3 block(kBlockSize);
+
+  BlockwiseSoftmaxKernel<kBlockSize, is_log_softmax><<<grid, block, 0, stream>>>(output, input, softmax_elements,
+                                                                                input_stride, output_stride);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+// Explicitly instantiate the templates to be linked from other translation units.
+template void DispatchBlockwiseSoftmaxForward<true>(cudaStream_t, float*, const float*, int, int, int, int);
+template void DispatchBlockwiseSoftmaxForward<false>(cudaStream_t, float*, const float*, int, int, int, int);
 
 }  // namespace cuda
 }  // namespace Generators
+

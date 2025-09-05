@@ -46,6 +46,8 @@ GreedySearch_Cuda::GreedySearch_Cuda(const GeneratorParams& params)
     random_seed = params_->search.random_seed;
   else
     random_seed = std::random_device{}();
+  if (params_->search.batch_size == 10 && params_->config.model.vocab_size == 32000)
+    printf("GreedySearch_Cuda random_seed: %llu\n", random_seed);
   samplingdata_ = std::make_unique<cuda::SamplingData>(random_seed, params_->search.batch_size, params_->config.model.vocab_size, GetStream());
 }
 
@@ -153,8 +155,9 @@ void BeamSearch_Cuda::SelectTop() {
 void GreedySearch_Cuda::SampleTopKTopP(int k, float p, float temperature) {
   std::span<float> scores = next_token_scores_.Span();
   assert(scores.size() == params_->search.batch_size * params_->config.model.vocab_size);
+  unsigned long long seed = samplingdata_->GetRandomSeed();
   cuda::GetSample(samplingdata_.get(), GetStream(), next_tokens_.data(), scores.data(), int(scores.size() / params_->search.batch_size),
-                  params_->search.batch_size, k, p, temperature);
+                  params_->search.batch_size, k, p, temperature, seed);
 
   // Check for EOS
   assert(next_tokens_.size() == eos_seen_.size());
