@@ -19,7 +19,10 @@ struct TopkData {
 
   // Used to hold initial vocabulary indices for full sort, and intermediate
   // indices during the reduction phase of hybrid sort.
-  cuda_unique_ptr<int> intermediate_indices;
+  cuda_unique_ptr<int> intermediate_indices_1;
+
+  // A dedicated buffer for the hybrid sort index reduction.
+  cuda_unique_ptr<int> intermediate_indices_2; 
 
   // Primary buffer for holding raw scores.
   // - Full sort: Holds the fully sorted raw scores.
@@ -48,7 +51,7 @@ struct TopkData {
 };
 
 void GetTopKSubset(TopkData* topk_data, cudaStream_t stream, float* scores_in, float* scores_out, int* indices_out,
-                   int vocab_size, int batch_size, int k, float temperature);
+                   int vocab_size, int batch_size, int k, float temperature, bool debug=false);
 
 enum class TopKAlgorithm { SELECTION_SORT, HYBRID_SORT, FULL_SORT };
 

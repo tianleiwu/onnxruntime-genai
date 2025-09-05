@@ -56,7 +56,8 @@ TopkData::TopkData(int batch_size, int vocab_size, cudaStream_t stream) {
   // Selection sort uses buffer of batch_size * 64 elements, which is smaller than intermediate_buffer_elements.
   size_t max_buffer_elements = std::max(vocab_batch_size, intermediate_buffer_elements);
 
-  this->intermediate_indices = CudaMallocArray<int>(max_buffer_elements);
+  this->intermediate_indices_1 = CudaMallocArray<int>(max_buffer_elements);
+  this->intermediate_indices_2 = CudaMallocArray<int>(max_buffer_elements);
   this->intermediate_scores_1 = CudaMallocArray<float>(max_buffer_elements);
   this->intermediate_scores_2 = CudaMallocArray<float>(max_buffer_elements);
   this->topk_indices = CudaMallocArray<int>(max_buffer_elements);
@@ -68,21 +69,24 @@ TopkData::TopkData(int batch_size, int vocab_size, cudaStream_t stream) {
 }
 
 void GetTopKSubset(TopkData* topk_data, cudaStream_t stream, float* scores_in, float* scores_out, int* indices_out,
-                   int vocab_size, int batch_size, int k, float temperature) {
+                   int vocab_size, int batch_size, int k, float temperature, bool debug) {
   assert(topk_data != nullptr);
-  assert(topk_data->intermediate_indices != nullptr);  // The caller shall allocate the buffer.
+  assert(topk_data->intermediate_indices_1 != nullptr);  // The caller shall allocate the buffer.
 
-  if (k > 64) {
+  if (k > 64) {  // Force to use full sort. TODO: change 0 to 64 after debugging.
+    if (debug) printf("Using Full Sort for TopK\n");
     RunTopKViaFullSort(topk_data, stream, scores_in, scores_out, indices_out, vocab_size, batch_size, k, temperature);
     return;
   }
 
   if (UseSelectSort(vocab_size, batch_size, k)) {
+    if (debug) printf("Using Selection Sort for TopK\n");
     RunTopKViaSelectionSort(topk_data, stream, scores_in, scores_out, indices_out, vocab_size, batch_size, k,
                             temperature);
     return;
   }
 
+  if (debug) printf("Using Hybrid Sort for TopK\n");
   int partition_size = GetHybridSortPartitionSize(vocab_size, batch_size);
   RunTopKViaHybridSort(topk_data, stream, scores_in, scores_out, indices_out, vocab_size, batch_size, k, temperature,
                        partition_size);
