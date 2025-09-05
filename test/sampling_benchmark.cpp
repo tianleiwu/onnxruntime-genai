@@ -62,32 +62,49 @@ struct BenchmarkResult {
 };
 
 void PrintSummary(const std::vector<BenchmarkResult>& results) {
-  // clang-format off
-  std::cout << "\n--- Benchmark Summary ---\n";
-  std::cout << std::left
-            << std::setw(8) << "Device"
-            << std::setw(8) << "Batch"
-            << std::setw(12) << "Vocab"
-            << std::setw(5) << "K"
-            << std::setw(12) << "Function"
-            << std::setw(15) << "Latency(us)"
-            << std::setw(15) << "Stdev(us)"
-            << std::setw(15) << "P95(us)" << "\n";
-  std::cout << std::string(90, '-') << "\n";
+  std::vector<BenchmarkResult> cpu_results;
+  std::vector<BenchmarkResult> cuda_results;
 
   for (const auto& result : results) {
-    std::cout << std::left << std::fixed << std::setprecision(2)
-              << std::setw(8) << result.params.device_type
-              << std::setw(8) << result.params.batch_size
-              << std::setw(12) << result.params.vocab_size
-              << std::setw(5) << result.params.k
-              << std::setw(12) << BenchmarkFunctionToString(result.params.benchmark_function)
-              << std::setw(15) << result.latency_us
-              << std::setw(15) << result.latency_us_stdev
-              << std::setw(15) << result.latency_us_95_percentile
-              << "\n";
+    if (strcmp(result.params.device_type, "cpu") == 0) {
+      cpu_results.push_back(result);
+    } else {
+      cuda_results.push_back(result);
+    }
   }
-  // clang-format on
+
+  auto print_device_summary = [](const std::string& device_name, const std::vector<BenchmarkResult>& device_results) {
+    if (device_results.empty()) {
+      return;
+    }
+    // clang-format off
+    std::cout << "\n--- " << device_name << " Sampling Benchmark Summary ---\n";
+    std::cout << std::left
+              << std::setw(8) << "Batch"
+              << std::setw(12) << "Vocab"
+              << std::setw(5) << "K"
+              << std::setw(12) << "Function"
+              << std::setw(15) << "Latency(us)"
+              << std::setw(15) << "Stdev(us)"
+              << std::setw(15) << "P95(us)" << "\n";
+    std::cout << std::string(82, '-') << "\n";
+
+    for (const auto& result : device_results) {
+      std::cout << std::left << std::fixed << std::setprecision(2)
+                << std::setw(8) << result.params.batch_size
+                << std::setw(12) << result.params.vocab_size
+                << std::setw(5) << result.params.k
+                << std::setw(12) << BenchmarkFunctionToString(result.params.benchmark_function)
+                << std::setw(15) << result.latency_us
+                << std::setw(15) << result.latency_us_stdev
+                << std::setw(15) << result.latency_us_95_percentile
+                << "\n";
+    }
+    // clang-format on 
+  };
+
+  print_device_summary("CPU", cpu_results);
+  print_device_summary("CUDA", cuda_results);
 }
 
 BenchmarkResult RunBenchmark(const BenchmarkParams& params) {
@@ -95,7 +112,8 @@ BenchmarkResult RunBenchmark(const BenchmarkParams& params) {
   std::string overlay = R"({ "model": { "vocab_size" : )" + std::to_string(params.vocab_size) + R"( } })";
   config->Overlay(overlay.c_str());
   config->ClearProviders();
-  if (strcmp(params.device_type, "cpu")) config->AppendProvider(params.device_type);
+  if (strcmp(params.device_type, "cpu"))
+    config->AppendProvider(params.device_type);
 
   auto model = OgaModel::Create(*config);
   auto generator_params = OgaGeneratorParams::Create(*model);
@@ -160,7 +178,7 @@ TEST(SamplingBenchmarks, PerformanceTests) {
 
   std::vector<int> batch_sizes = {1, 4};
   std::vector<int> vocab_sizes = {32000, 201088};
-  std::vector<int> ks = {1, 8, 20, 50, 64};
+  std::vector<int> ks = {1, 8, 20, 50, 64, 100};
 
   for (const auto& device_type : device_types) {
     for (int batch_size : batch_sizes) {
