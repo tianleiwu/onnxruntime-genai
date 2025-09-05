@@ -81,7 +81,6 @@ void RunParityTests(const TopKTestParams& params) {
                         cudaMemcpyDeviceToDevice));
 
   // --- Get Reference Result using Full Sort ---
-  // The refactored Top-K functions now output raw scores directly.
   auto ref_scores_d = Generators::CudaMallocArray<float>(topk_size);
   auto ref_indices_d = Generators::CudaMallocArray<int>(topk_size);
 

@@ -50,14 +50,16 @@ struct TopkData {
   cuda_unique_ptr<int> topk_indices;
 };
 
-// Finds the top-k raw logits and their indices from the input scores.
-// The results are stored in the `scores_out` and `indices_out` buffers in a compact [batch_size, k] layout.
-void GetTopKSubset(TopkData* topk_data, cudaStream_t stream, const float* scores_in, float* scores_out,
-                   int* indices_out, int vocab_size, int batch_size, int k);
+// Main dispatcher for Top-K. Used by the sampling logic.
+// This function is optimized for performance. For k > kHybridSortMaxK, it avoids an
+// expensive memory copy by returning pointers to strided data.
+// Returns the stride of the output data.
+int GetTopK(TopkData* topk_data, cudaStream_t stream, const float* scores_in, const float** scores_out,
+            const int** indices_out, int vocab_size, int batch_size, int k);
 
-// The specific Top-K algorithm implementations. These functions are designed to be called by GetTopKSubset.
-// They all adhere to the same contract: find the top `k` raw logits and indices and write them to `scores_out`
-// and `indices_out` in a compact layout.
+// The specific Top-K algorithm implementations. These are exposed for testing and benchmarking.
+// They all adhere to the same contract: find the top `k` raw logits and indices and write them
+// to `scores_out` and `indices_out` in a compact [batch_size, k] layout.
 void RunTopKViaSelectionSort(TopkData* data, cudaStream_t stream, float* scores_in, float* scores_out, int* indices_out,
                              int vocab_size, int batch_size, int k);
 void RunTopKViaFullSort(TopkData* data, cudaStream_t stream, const float* scores_in, float* scores_out,
@@ -67,3 +69,4 @@ void RunTopKViaHybridSort(TopkData* data, cudaStream_t stream, const float* scor
 
 }  // namespace cuda
 }  // namespace Generators
+

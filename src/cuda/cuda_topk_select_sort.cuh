@@ -79,14 +79,13 @@ void LaunchGetTopK(cudaStream_t stream, float* scores_in, float* scores_out, int
   CUDA_CHECK(cudaGetLastError());
 }
 
-// Interface for running Top-K using the selection sort algorithm.
-void RunTopKViaSelectionSort(TopkData* data, cudaStream_t stream, float* scores_in, float* scores_out, int* indices_out,
-                             int vocab_size, int batch_size, int k) {
+void RunTopKViaSelectionSort(TopkData* data, cudaStream_t stream, float* scores_in, float* scores_out,
+                             int* indices_out, int vocab_size, int batch_size, int k) {
   // The selection sort kernel finds the top-k raw scores and their indices.
   // IMPORTANT: This kernel modifies the `scores_in` tensor in-place. The caller is responsible
   // for making a copy if the original data is needed after this call.
   LaunchGetTopK(stream, scores_in, scores_out, indices_out, vocab_size, batch_size, k);
 }
-
 }  // namespace cuda
 }  // namespace Generators
+

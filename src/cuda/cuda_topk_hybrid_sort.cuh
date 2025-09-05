@@ -70,7 +70,6 @@ inline size_t GetHybridSortIntermediateSize(int batch_size, int vocab_size, int 
   return static_cast<size_t>(batch_size) * num_partitions * kHybridSortMaxK;
 }
 
-// Interface for running Top-K using the hybrid sort algorithm.
 void RunTopKViaHybridSort(TopkData* data, cudaStream_t stream, const float* scores_in, float* scores_out,
                           int* indices_out, int vocab_size, int batch_size, int k, int partition_size) {
   constexpr int max_k = kHybridSortMaxK;
@@ -142,3 +141,4 @@ void RunTopKViaHybridSort(TopkData* data, cudaStream_t stream, const float* scor
 
 }  // namespace cuda
 }  // namespace Generators
+

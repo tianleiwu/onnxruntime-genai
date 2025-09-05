@@ -60,29 +60,36 @@ TopkData::TopkData(int batch_size, int vocab_size, cudaStream_t stream) {
   cub_temp_storage = CudaMallocArray<unsigned char>(this->cub_temp_storage_bytes);
 }
 
-void GetTopKSubset(TopkData* topk_data, cudaStream_t stream, const float* scores_in, float* scores_out,
-                   int* indices_out, int vocab_size, int batch_size, int k) {
+int GetTopK(TopkData* topk_data, cudaStream_t stream, const float* scores_in, const float** scores_out,
+            const int** indices_out, int vocab_size, int batch_size, int k) {
   assert(topk_data != nullptr);
 
-  // Dispatch to the most appropriate Top-K algorithm based on k and other heuristics.
   if (k > kHybridSortMaxK) {
-    RunTopKViaFullSort(topk_data, stream, scores_in, scores_out, indices_out, vocab_size, batch_size, k);
-    return;
+    // For large K, run a full sort but do NOT compact the results.
+    // The consumer (sampler) will handle the strided data.
+    LaunchSort(topk_data, stream, scores_in, topk_data->intermediate_scores_1.get(),
+               topk_data->intermediate_indices_1.get(), vocab_size, batch_size);
+    *scores_out = topk_data->intermediate_scores_1.get();
+    *indices_out = topk_data->intermediate_indices_1.get();
+    return vocab_size;
   }
 
+  // For smaller K, run an optimized sort that produces compact output into the dedicated compact buffers.
   if (UseSelectSort(vocab_size, batch_size, k)) {
-    // Note: Selection sort modifies the input buffer `scores_in` in-place.
-    // The caller is responsible for creating a copy if the original scores are needed.
-    // This is handled in the benchmark and test files.
-    RunTopKViaSelectionSort(topk_data, stream, const_cast<float*>(scores_in), scores_out, indices_out, vocab_size,
-                            batch_size, k);
-    return;
+    // NOTE: This modifies scores_in in-place
+    RunTopKViaSelectionSort(topk_data, stream, const_cast<float*>(scores_in), topk_data->topk_scores.get(),
+                            topk_data->topk_indices.get(), vocab_size, batch_size, k);
+  } else {
+    int partition_size = GetHybridSortPartitionSize(vocab_size, batch_size);
+    RunTopKViaHybridSort(topk_data, stream, scores_in, topk_data->topk_scores.get(),
+                         topk_data->topk_indices.get(), vocab_size, batch_size, k, partition_size);
   }
 
-  int partition_size = GetHybridSortPartitionSize(vocab_size, batch_size);
-  RunTopKViaHybridSort(topk_data, stream, scores_in, scores_out, indices_out, vocab_size, batch_size, k,
-                       partition_size);
+  *scores_out = topk_data->topk_scores.get();
+  *indices_out = topk_data->topk_indices.get();
+  return k;
 }
 
 }  // namespace cuda
 }  // namespace Generators
+

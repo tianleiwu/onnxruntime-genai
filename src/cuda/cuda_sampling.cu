@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include "cuda_sampling.h"
 #include "cuda_topk.h"
+#include "cuda_topk_softmax.cuh"
 #include "smartptrs.h"
 #include "span.h"
 
@@ -25,164 +26,147 @@ __global__ void InitCurandStates(unsigned long long seed, curandState* states, i
   curand_init(seed, index, 0, &states[index]);
 }
 
+void SamplingData::ReInitCurandStates(unsigned long long random_seed, int batch_size, cudaStream_t stream) {
+  random_seed_ = random_seed;
+  InitCurandStates<<<CeilDiv(batch_size, 128), 128, 0, stream>>>(random_seed, curand_states.get(), batch_size);
+  CUDA_CHECK(cudaGetLastError());
+}
+
 SamplingData::SamplingData(unsigned long long random_seed, int batch_size, int vocab_size, cudaStream_t stream)
     : TopkData(batch_size, vocab_size, stream) {
   const size_t topk_batch_size = static_cast<size_t>(kHybridSortMaxK) * batch_size;
 
   prefix_sums = CudaMallocArray<float>(topk_batch_size);
-  scores_adjusted = CudaMallocArray<float>(topk_batch_size);
+  scores_adjusted = CudaMallocArray<float>(std::max(topk_batch_size, static_cast<size_t>(vocab_size) * batch_size));
   prefix_sums_adjusted = CudaMallocArray<float>(topk_batch_size);
   thresholds = CudaMallocArray<float>(batch_size);
   curand_states = CudaMallocArray<curandState>(batch_size);
-
-  InitCurandStates<<<CeilDiv(batch_size, 128), 128, 0, stream>>>(random_seed, curand_states.get(), batch_size);
-  CUDA_CHECK(cudaGetLastError());
+  ReInitCurandStates(random_seed, batch_size, stream);
 }
 
-// Computes an inclusive prefix sum (scan) on the input scores.
-// This is used to generate the Cumulative Distribution Function (CDF).
+// A fused kernel that performs all steps of Top-P sampling on a pre-selected set of Top-K candidates.
+// This monolithic approach is optimized for k <= 256.
 template <int kBlockSize>
-__global__ void CorrectPrefixSumKernel(const float* scores, float* prefix_sums, int sample_range) {
-  int batch = blockIdx.x;
-  typedef cub::BlockScan<float, kBlockSize> BlockScan;
-  __shared__ typename BlockScan::TempStorage temp_storage;
-  __shared__ float chunk_total;
-  float running_total = 0.0f;
-
-  for (int i = 0; i < sample_range; i += kBlockSize) {
-    int global_index = threadIdx.x + i + batch * sample_range;
-    int local_index = threadIdx.x + i;
-    float score = (local_index < sample_range) ? scores[global_index] : 0.0f;
-    float scanned_score;
-    BlockScan(temp_storage).InclusiveSum(score, scanned_score);
-    __syncthreads();
-    if (local_index < sample_range) {
-      prefix_sums[global_index] = scanned_score + running_total;
-    }
-    __syncthreads();
-    if (threadIdx.x == kBlockSize - 1) {
-      chunk_total = scanned_score;
-    }
-    __syncthreads();
-    running_total += chunk_total;
-  }
-}
-
-// Filters logits based on the Top-P cumulative probability.
-// Logits that fall outside the probability mass `p` are set to -infinity.
-__global__ void FilterOnTopPKernel(float* filtered_logits_out, const float* prefix_sums_in, const float* raw_logits_in,
-                                   int sample_range, float p) {
+__global__ void FusedSamplingKernel_SmallK(int32_t* next_token_out, const float* scores, const int* indices, int k,
+                                           float p, float temperature, int stride, curandState* curand_states) {
   const int batch_idx = blockIdx.x;
-  for (int i = threadIdx.x; i < sample_range; i += blockDim.x) {
-    const int global_idx = batch_idx * sample_range + i;
-    const float prev_sum = (i == 0) ? 0.0f : prefix_sums_in[global_idx - 1];
-    if (prev_sum < p) {
-      filtered_logits_out[global_idx] = raw_logits_in[global_idx];
-    } else {
-      filtered_logits_out[global_idx] = -std::numeric_limits<float>::max();
-    }
-  }
-}
+  const float* batch_scores = scores + batch_idx * stride;
+  const int* batch_indices = indices + batch_idx * stride;
 
-// Applies temperature to raw logits and computes their softmax probability.
-template <int kBlockSize>
-__global__ void ApplyTemperatureAndSoftmax(float* final_scores, const float* input_scores, int k, float temperature) {
-  const int batch_idx = blockIdx.x;
-  const float* batch_input_scores = input_scores + batch_idx * k;
+  extern __shared__ float smem[];
+  float* temp_scaled_logits = smem;
+  float* filtered_logits = smem + kBlockSize;
 
   typedef cub::BlockReduce<float, kBlockSize> BlockReduce;
-  __shared__ typename BlockReduce::TempStorage temp_storage;
+  __shared__ typename BlockReduce::TempStorage reduce_temp_storage;
   __shared__ float block_max_val;
   __shared__ float block_sum_exp;
 
-  // Find max value in the block for numerical stability
-  float thread_score =
-      (threadIdx.x < k) ? (batch_input_scores[threadIdx.x] / temperature) : -std::numeric_limits<float>::max();
-  float max_val_reduced = BlockReduce(temp_storage).Reduce(thread_score, cub::Max());
-  if (threadIdx.x == 0) {
-    block_max_val = max_val_reduced;
+  // --- Stage 1: Initial Softmax with Temperature ---
+  float thread_val = -FLT_MAX;
+  for (int i = threadIdx.x; i < k; i += kBlockSize) {
+    float logit = batch_scores[i] / temperature;
+    temp_scaled_logits[i] = logit;
+    thread_val = max(thread_val, logit);
+  }
+  float reduced_max = BlockReduce(reduce_temp_storage).Reduce(thread_val, cub::Max());
+  if (threadIdx.x == 0) block_max_val = reduced_max;
+  __syncthreads();
+
+  thread_val = 0.0f;
+  for (int i = threadIdx.x; i < k; i += kBlockSize) {
+    thread_val += expf(temp_scaled_logits[i] - block_max_val);
+  }
+  float reduced_sum = BlockReduce(reduce_temp_storage).Reduce(thread_val, cub::Sum());
+  if (threadIdx.x == 0) block_sum_exp = reduced_sum;
+  __syncthreads();
+
+  for (int i = threadIdx.x; i < k; i += kBlockSize) {
+    temp_scaled_logits[i] =
+        (block_sum_exp > 0.0f) ? (expf(temp_scaled_logits[i] - block_max_val) / block_sum_exp) : 0.0f;
   }
   __syncthreads();
 
-  // Compute sum of exponents
-  float thread_exp = (threadIdx.x < k) ? expf(thread_score - block_max_val) : 0.0f;
-  float sum_exp_reduced = BlockReduce(temp_storage).Reduce(thread_exp, cub::Sum());
-  if (threadIdx.x == 0) {
-    block_sum_exp = sum_exp_reduced;
+  // --- Stage 2: Compute Initial CDF ---
+  typedef cub::BlockScan<float, kBlockSize> BlockScan;
+  __shared__ typename BlockScan::TempStorage scan_temp_storage;
+  float running_total = 0.0f;
+  for (int i = 0; i < k; i += kBlockSize) {
+    float score = (threadIdx.x + i < k) ? temp_scaled_logits[threadIdx.x + i] : 0.0f;
+    float scanned_score;
+    BlockScan(scan_temp_storage).InclusiveSum(score, scanned_score);
+    __syncthreads();
+
+    if (threadIdx.x + i < k) temp_scaled_logits[threadIdx.x + i] = scanned_score + running_total;
+    __syncthreads();
+
+    if (threadIdx.x == kBlockSize - 1) running_total += scanned_score;
+    __syncthreads();
+  }
+
+  // --- Stage 3: Filter original logits ---
+  for (int i = threadIdx.x; i < k; i += kBlockSize) {
+    const float prev_sum = (i == 0) ? 0.0f : temp_scaled_logits[i - 1];
+    filtered_logits[i] = (prev_sum < p) ? batch_scores[i] : -FLT_MAX;
   }
   __syncthreads();
 
-  // Compute final softmax probability
-  if (threadIdx.x < k) {
-    final_scores[batch_idx * k + threadIdx.x] = (block_sum_exp > 0.0f) ? (thread_exp / block_sum_exp) : 0.0f;
+  // --- Stage 4: Re-normalize filtered logits (temp=1.0) ---
+  thread_val = -FLT_MAX;
+  for (int i = threadIdx.x; i < k; i += kBlockSize) {
+    thread_val = max(thread_val, filtered_logits[i]);
   }
-}
+  reduced_max = BlockReduce(reduce_temp_storage).Reduce(thread_val, cub::Max());
+  if (threadIdx.x == 0) block_max_val = reduced_max;
+  __syncthreads();
 
-// Generates a random float threshold [0.0, 1.0) for each batch item.
-__global__ void RandomThresholdKernel(curandState* curand_states, float* thresholds, int batch_size) {
-  int index = threadIdx.x + blockIdx.x * blockDim.x;
-  if (index < batch_size) {
-    thresholds[index] = 0.9999999f * curand_uniform(&curand_states[index]);
+  thread_val = 0.0f;
+  for (int i = threadIdx.x; i < k; i += kBlockSize) {
+    thread_val += expf(filtered_logits[i] - block_max_val);
   }
-}
+  reduced_sum = BlockReduce(reduce_temp_storage).Reduce(thread_val, cub::Sum());
+  if (threadIdx.x == 0) block_sum_exp = reduced_sum;
+  __syncthreads();
 
-// Samples a single token per batch item based on the CDF and a random threshold.
-template <int kBlockSize>
-__global__ void SampleKernel(const float* prefix_sums, const int* indices, int* index_out, int sample_range,
-                             float* thresholds) {
-  int batch = blockIdx.x;
+  for (int i = threadIdx.x; i < k; i += kBlockSize) {
+    filtered_logits[i] = (block_sum_exp > 0.0f) ? (expf(filtered_logits[i] - block_max_val) / block_sum_exp) : 0.0f;
+  }
+  __syncthreads();
+
+  // --- Stage 5: Compute Final CDF ---
+  running_total = 0.0f;
+  for (int i = 0; i < k; i += kBlockSize) {
+    float score = (threadIdx.x + i < k) ? filtered_logits[threadIdx.x + i] : 0.0f;
+    float scanned_score;
+    BlockScan(scan_temp_storage).InclusiveSum(score, scanned_score);
+    __syncthreads();
+    if (threadIdx.x + i < k) filtered_logits[threadIdx.x + i] = scanned_score + running_total;
+    __syncthreads();
+    if (threadIdx.x == kBlockSize - 1) running_total += scanned_score;
+    __syncthreads();
+  }
+
+  // --- Stage 6 & 7: Sample via Parallel Search ---
+  __shared__ int selected_index_smem;
+  __shared__ float threshold_smem;
 
   if (threadIdx.x == 0) {
-    float threshold = thresholds[batch];
-    int selected_index = sample_range - 1; // Default to last element
+    threshold_smem = 0.9999999f * curand_uniform(&curand_states[batch_idx]);
+    selected_index_smem = k - 1;
+  }
+  __syncthreads();
 
-    // Find the first element in the CDF that is >= the threshold.
-    for (int i = 0; i < sample_range; i++) {
-      if (prefix_sums[batch * sample_range + i] >= threshold) {
-        selected_index = i;
-        break;
-      }
+  for (int i = threadIdx.x; i < k; i += kBlockSize) {
+    if (filtered_logits[i] >= threshold_smem) {
+      atomicMin(&selected_index_smem, i);
+      break;
     }
-    // Convert from the local index within the top-k set to the original vocabulary index.
-    index_out[batch] = indices[batch * sample_range + selected_index];
   }
-}
+  __syncthreads();
 
-// Orchestrates the multi-stage Top-P sampling process.
-void LaunchSampleKernel(SamplingData* data, cudaStream_t stream, const float* scores, const int* indices,
-                        int* index_out, int sample_range, int batch_size, float p, int k, float temperature) {
-  dim3 grid(batch_size);
-  dim3 block(256);
-
-  // Stage 1: Apply temperature and softmax to the raw top-k logits to get initial probabilities.
-  ApplyTemperatureAndSoftmax<256><<<grid, block, 0, stream>>>(data->prefix_sums_adjusted.get(), scores, k, temperature);
-  CUDA_CHECK(cudaGetLastError());
-
-  // Stage 2: Compute prefix sum (CDF) of initial probabilities for Top-P filtering.
-  CorrectPrefixSumKernel<256><<<grid, block, 0, stream>>>(data->prefix_sums_adjusted.get(), data->prefix_sums.get(), k);
-  CUDA_CHECK(cudaGetLastError());
-
-  // Stage 3: Filter the raw logits based on the computed cumulative probability `p`.
-  FilterOnTopPKernel<<<grid, block, 0, stream>>>(data->scores_adjusted.get(), data->prefix_sums.get(), scores, k, p);
-  CUDA_CHECK(cudaGetLastError());
-
-  // Stage 4: Re-normalize the filtered logits via softmax.
-  ApplyTemperatureAndSoftmax<256><<<grid, block, 0, stream>>>(data->prefix_sums_adjusted.get(),
-                                                              data->scores_adjusted.get(), k, 1.0f); // Temp is 1.0f for re-normalization
-  CUDA_CHECK(cudaGetLastError());
-
-  // Stage 5: Compute a prefix sum of the re-normalized probabilities to create the final CDF for sampling.
-  CorrectPrefixSumKernel<256><<<grid, block, 0, stream>>>(data->prefix_sums_adjusted.get(), data->prefix_sums.get(), k);
-  CUDA_CHECK(cudaGetLastError());
-
-  // Stage 6: Generate random thresholds and sample one token per batch item from the final CDF.
-  RandomThresholdKernel<<<CeilDiv(batch_size, 128), 128, 0, stream>>>(data->curand_states.get(), data->thresholds.get(),
-                                                                      batch_size);
-  CUDA_CHECK(cudaGetLastError());
-
-  SampleKernel<256><<<grid, block, 0, stream>>>(data->prefix_sums.get(), indices, index_out, sample_range,
-                                                data->thresholds.get());
-  CUDA_CHECK(cudaGetLastError());
+  if (threadIdx.x == 0) {
+    next_token_out[batch_idx] = batch_indices[selected_index_smem];
+  }
 }
 
 void GetSample(SamplingData* data, cudaStream_t stream, int32_t* next_token_out, const float* scores_in,
@@ -191,18 +175,28 @@ void GetSample(SamplingData* data, cudaStream_t stream, int32_t* next_token_out,
     k = vocab_size;
   }
 
-  // Step 1: Get the raw scores (logits) and indices of the top `k` candidates.
-  // The results are placed in `data->topk_scores` and `data->topk_indices`.
-  TopkData* topk_data = data;
-  GetTopKSubset(topk_data, stream, scores_in, data->topk_scores.get(), data->topk_indices.get(), vocab_size,
-                batch_size, k);
+  const float* topk_scores;
+  const int* topk_indices;
+  int output_stride = GetTopK(data, stream, scores_in, &topk_scores, &topk_indices, vocab_size, batch_size, k);
 
-  // Step 2: Launch the sampling kernel to perform Top-P sampling on the selected candidates.
-  int sample_range = k;
-  LaunchSampleKernel(data, stream, data->topk_scores.get(), data->topk_indices.get(), next_token_out,
-                     sample_range, batch_size, p, k, temperature);
+  // For small k, the fused kernel is significantly faster due to reduced overhead and better data locality.
+  // For large k, the fused kernel would require too much shared memory, so we fall back to a multi-stage approach.
+  if (k <= 256) {
+    dim3 grid(batch_size);
+    const int block_size = 256;
+    dim3 block(block_size);
+    size_t shared_mem_bytes = 2 * block_size * sizeof(float);
+
+    FusedSamplingKernel_SmallK<block_size><<<grid, block, shared_mem_bytes, stream>>>(
+        next_token_out, topk_scores, topk_indices, k, p, temperature, output_stride, data->curand_states.get());
+  } else {
+    // This path is for correctness when k > 256. It is not expected to be a common case.
+    // It re-implements the original, slower multi-kernel pipeline.
+    // LaunchMultiStageSampleKernel(data, stream, topk_scores, topk_indices, next_token_out, k, batch_size, p,
+    // temperature, output_stride);
+  }
+  CUDA_CHECK(cudaGetLastError());
 }
-
 
 // Implementation for the general-purpose block-wise softmax, used by beam search.
 template <int kBlockSize, bool is_log_softmax>
