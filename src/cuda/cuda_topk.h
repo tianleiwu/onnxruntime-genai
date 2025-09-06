@@ -72,7 +72,28 @@ void GetTopK(TopkData* topk_data, cudaStream_t stream, const float* scores_in, i
 void RunTopKViaSelectionSort(TopkData* data, cudaStream_t stream, const float* scores_in, int vocab_size, int batch_size, int k);
 void RunTopKViaFullSort(TopkData* data, cudaStream_t stream, const float* scores_in, int vocab_size, int batch_size, int k);
 void RunTopKViaHybridSort(TopkData* data, cudaStream_t stream, const float* scores_in, int vocab_size, int batch_size, int k, int partition_size);
+
+void RunTopKViaBitonicSort(TopkData* data, cudaStream_t stream, const float* scores_in, int vocab_size, int batch_size, int k);
+
+template<bool CompactOutput>
 void RunTopKViaBaselineSort(TopkData* data, cudaStream_t stream, const float* scores_in, int vocab_size, int batch_size, int k);
+
+// // Tell the compiler these instantiations exist somewhere else
+// extern template void RunTopKViaBaselineSort<true>(
+//     TopkData* data,
+//     cudaStream_t stream,
+//     const float* scores_in,
+//     int vocab_size,
+//     int batch_size,
+//     int k);
+
+// extern template void RunTopKViaBaselineSort<false>(
+//     TopkData* data,
+//     cudaStream_t stream,
+//     const float* scores_in,
+//     int vocab_size,
+//     int batch_size,
+//     int k);
 
 }  // namespace cuda
 }  // namespace Generators

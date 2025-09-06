@@ -126,8 +126,20 @@ void RunParityTests(const TopKTestParams& params) {
     }
   }
 
-  test_algo("BASELINE_SORT", [&]() {
-    Generators::cuda::RunTopKViaBaselineSort(topk_data.get(), stream, scores_in_d.get(),
+  if (params.vocab_size <= 256) {
+    test_algo("BITONIC_SORT", [&]() {
+      Generators::cuda::RunTopKViaBitonicSort(topk_data.get(), stream, scores_in_d.get(),
+                                              params.vocab_size, params.batch_size, params.k);
+    });
+  }
+
+  test_algo("BASELINE_COMPACT", [&]() {
+    Generators::cuda::RunTopKViaBaselineSort<true>(topk_data.get(), stream, scores_in_d.get(),
+                                             params.vocab_size, params.batch_size, params.k);
+  });
+
+  test_algo("BASELINE_STRIDE", [&]() {
+    Generators::cuda::RunTopKViaBaselineSort<false>(topk_data.get(), stream, scores_in_d.get(),
                                              params.vocab_size, params.batch_size, params.k);
   });
 
@@ -135,7 +147,7 @@ void RunParityTests(const TopKTestParams& params) {
 }
 
 TEST(TopKTests, ParityTests) {
-  std::vector<TopKTestParams> test_cases = {{1, 10000, 50}, {2, 10000, Generators::cuda::kHybridSortMaxK}, {1, 32000, 1}, {1, 32000, 16}, {1, 512000, 50}, {1, 1024, 18}};
+  std::vector<TopKTestParams> test_cases = {{1, 10000, 50}, {2, 10000, Generators::cuda::kHybridSortMaxK}, {1, 32000, 1}, {1, 32000, 16}, {1, 512000, 50}, {1, 1024, 18}, {1, 256, 16}, {2, 256, 18}};
 
   for (const auto& params : test_cases) {
     RunParityTests(params);

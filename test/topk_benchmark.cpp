@@ -113,10 +113,18 @@ void RunBenchmarks(const BenchmarkParams& params) {
   // Benchmark Baseline Sort (ONNXRuntime logic)
   {
     auto [mean_ms, stdev_ms, p95_ms] = bench_algo([&]() {
-      Generators::cuda::RunTopKViaBaselineSort(data.get(), stream, scores_in_d.get(), params.vocab_size,
+      Generators::cuda::RunTopKViaBaselineSort<true>(data.get(), stream, scores_in_d.get(), params.vocab_size,
                                                params.batch_size, params.k);
     });
-    all_results.push_back({params, "BASELINE_ORT", 0, mean_ms, stdev_ms, p95_ms});
+    all_results.push_back({params, "BASELINE_COMPACT", 0, mean_ms, stdev_ms, p95_ms});
+  }
+
+  {
+    auto [mean_ms, stdev_ms, p95_ms] = bench_algo([&]() {
+      Generators::cuda::RunTopKViaBaselineSort<false>(data.get(), stream, scores_in_d.get(), params.vocab_size,
+                                               params.batch_size, params.k);
+    });
+    all_results.push_back({params, "BASELINE_STRIDE", 0, mean_ms, stdev_ms, p95_ms});
   }
 
   if (params.k <= Generators::cuda::kHybridSortMaxK) {
@@ -140,27 +148,81 @@ void RunBenchmarks(const BenchmarkParams& params) {
     }
   }
 
+  if (params.vocab_size <= 256) {
+    // Benchmark Bitonic Sort
+  auto [mean_ms, stdev_ms, p95_ms] = bench_algo([&]() {
+        Generators::cuda::RunTopKViaBitonicSort(data.get(), stream, scores_in_d.get(), params.vocab_size,
+                                                  params.batch_size, params.k);
+      });
+      all_results.push_back({params, "BITONIC_SORT", 0, mean_ms, stdev_ms, p95_ms});
+  }
+
   PrintSummary(all_results);
   CUDA_CHECK(cudaStreamDestroy(stream));
 }
 }  // namespace
 
 TEST(TopKBenchmarks, PerformanceTests) {
-  std::vector<int> batch_sizes = {1};
-  std::vector<int> vocab_sizes = {201088};
-  std::vector<int> ks = {50, 1, 2, 4, 8, 16, 32, Generators::cuda::kHybridSortMaxK};
 
-  std::vector<BenchmarkParams> test_cases;
-  for (int batch_size : batch_sizes) {
-    for (int vocab_size : vocab_sizes) {
-      for (int k : ks) {
-        test_cases.push_back({batch_size, vocab_size, k});
+  // Test different K
+  {
+    std::vector<int> batch_sizes = {1};
+    std::vector<int> vocab_sizes = {201088};
+    std::vector<int> ks = {1, 2, 4, 8, 10, 16, 32, 50, Generators::cuda::kHybridSortMaxK};
+
+    std::vector<BenchmarkParams> test_cases;
+    for (int batch_size : batch_sizes) {
+      for (int vocab_size : vocab_sizes) {
+        for (int k : ks) {
+          test_cases.push_back({batch_size, vocab_size, k});
+        }
       }
+    }
+    for (const auto& params : test_cases) {
+      RunBenchmarks(params);
+    }
+  }
+  
+  constexpr bool is_build_pipeline = true; // Change it false to trigger more runs in local machine.
+
+  // Test small vocab_sizes.
+  if constexpr (!is_build_pipeline) {
+    std::vector<int> batch_sizes = {1, 2, 4, 8, 16, 32};
+    std::vector<int> vocab_sizes = {256};
+    std::vector<int> ks = {50};
+
+    std::vector<BenchmarkParams> test_cases;
+    for (int batch_size : batch_sizes) {
+      for (int vocab_size : vocab_sizes) {
+        for (int k : ks) {
+          test_cases.push_back({batch_size, vocab_size, k});
+        }
+      }
+    }
+    for (const auto& params : test_cases) {
+      RunBenchmarks(params);
     }
   }
 
-  for (const auto& params : test_cases) {
-    RunBenchmarks(params);
+  // Test batch sizes.
+  if constexpr (!is_build_pipeline) {
+    std::vector<int> batch_sizes = {1, 2, 4, 8, 16, 32};
+    std::vector<int> vocab_sizes = {201088};
+    std::vector<int> ks = {50};
+
+    std::vector<BenchmarkParams> test_cases;
+    for (int batch_size : batch_sizes) {
+      for (int vocab_size : vocab_sizes) {
+        for (int k : ks) {
+          test_cases.push_back({batch_size, vocab_size, k});
+        }
+      }
+    }
+
+    for (const auto& params : test_cases) {
+      RunBenchmarks(params);
+    }
   }
 }
+
 #endif
