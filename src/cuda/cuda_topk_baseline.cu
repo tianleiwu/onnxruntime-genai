@@ -101,8 +101,10 @@ void RunTopKViaBaselineSort(TopkData* data, cudaStream_t stream, const float* sc
       
       cub::DeviceRadixSort::SortPairsDescending(temp_storage, temp_bytes, temp_in_scores, temp_out_scores, temp_in_indices, temp_out_indices, vocab_size, 0, sizeof(float) * 8, stream);
 
-      auto blocks_per_grid_K = (int)ceil(static_cast<float>(k) / BT);
+      if (batch_size != 1) {
+        auto blocks_per_grid_K = (int)ceil(static_cast<float>(k) / BT);
       FillOutput<<<blocks_per_grid_K, BT, 0, stream>>>(temp_out_scores, temp_out_indices, final_scores_out, final_indices_out, k);
+      }
     } else { // Strided output path
       // Sort from workspace directly into the final strided destination buffer.
       float* final_scores_out = final_scores_buffer + static_cast<size_t>(i) * vocab_size;

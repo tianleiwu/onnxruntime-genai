@@ -182,8 +182,8 @@ TEST(TopKBenchmarks, PerformanceTests) {
       RunBenchmarks(params);
     }
   }
-  
-  constexpr bool is_build_pipeline = true; // Change it false to trigger more runs in local machine.
+
+  constexpr bool is_build_pipeline = false; // Change it false to trigger more runs in local machine.
 
   // Test small vocab_sizes.
   if constexpr (!is_build_pipeline) {
@@ -204,11 +204,50 @@ TEST(TopKBenchmarks, PerformanceTests) {
     }
   }
 
+    // Test medium vocab_sizes.
+  if constexpr (!is_build_pipeline) {
+    std::vector<int> batch_sizes = {1, 2, 4, 8, 16, 32};
+    std::vector<int> vocab_sizes = {32000};
+    std::vector<int> ks = {50};
+
+    std::vector<BenchmarkParams> test_cases;
+    for (int batch_size : batch_sizes) {
+      for (int vocab_size : vocab_sizes) {
+        for (int k : ks) {
+          test_cases.push_back({batch_size, vocab_size, k});
+        }
+      }
+    }
+    for (const auto& params : test_cases) {
+      RunBenchmarks(params);
+    }
+  }
+
   // Test batch sizes.
   if constexpr (!is_build_pipeline) {
     std::vector<int> batch_sizes = {1, 2, 4, 8, 16, 32};
     std::vector<int> vocab_sizes = {201088};
     std::vector<int> ks = {50};
+
+    std::vector<BenchmarkParams> test_cases;
+    for (int batch_size : batch_sizes) {
+      for (int vocab_size : vocab_sizes) {
+        for (int k : ks) {
+          test_cases.push_back({batch_size, vocab_size, k});
+        }
+      }
+    }
+
+    for (const auto& params : test_cases) {
+      RunBenchmarks(params);
+    }
+  }
+
+  // Test vocab_sizes.
+  if constexpr (!is_build_pipeline) {
+    std::vector<int> batch_sizes = {1};
+    std::vector<int> vocab_sizes = {512, 1*1024, 2*1024, 4 * 1024, 8* 1024, 16 * 1024, 32 * 1024, 64* 1024, 128 * 1024, 256 * 1024};
+    std::vector<int> ks = {8, 16, 50};
 
     std::vector<BenchmarkParams> test_cases;
     for (int batch_size : batch_sizes) {
