@@ -1,6 +1,6 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
-
+#if USE_CUDA
 #include <gtest/gtest.h>
 
 #include <chrono>
@@ -43,7 +43,7 @@ struct BenchmarkResult {
 };
 
 void PrintSummary(const std::vector<BenchmarkResult>& results) {
-  std::cout << "\n--- TopK Benchmark Summary ---\n";
+  std::cout << "\n--- TopK Cuda Kernel Benchmark Summary ---\n";
   std::cout << std::left << std::setw(12) << "Batch Size" << std::setw(12) << "Vocab Size" << std::setw(5) << "K"
             << std::setw(28) << "Algorithm" << std::setw(12) << "Latency(us)" << std::setw(12) << "Stdev(us)"
             << std::setw(12) << "P95(us)" << "\n";
@@ -113,26 +113,11 @@ void RunBenchmarks(const BenchmarkParams& params) {
   if (params.k <= 64) {
     // Benchmark Selection Sort
     {
-      auto scores_in_copy_d =
-          Generators::CudaMallocArray<float>(static_cast<size_t>(params.batch_size) * params.vocab_size);
-      // Make a copy of input scores since Selection Sort modifies the input.
-      cudaMemcpyAsync(scores_in_copy_d.get(), scores_in_d.get(), sizeof(float) * params.batch_size * params.vocab_size,
-                      cudaMemcpyDeviceToDevice, stream);
       auto [mean_ms, stdev_ms, p95_ms] = bench_algo([&]() {
-        Generators::cuda::RunTopKViaSelectionSort(data.get(), stream, scores_in_copy_d.get(), params.vocab_size,
+        Generators::cuda::RunTopKViaSelectionSort(data.get(), stream, scores_in_d.get(), params.vocab_size,
                                                   params.batch_size, params.k);
       });
       all_results.push_back({params, "SELECTION_SORT", 0, mean_ms, stdev_ms, p95_ms});
-    }
-
-    // Benchmark Hybrid Sort
-    for (int p_size : {1024, 2048, 4096, 8192}) {
-      if (p_size > params.vocab_size) continue;
-      auto [mean_ms, stdev_ms, p95_ms] = bench_algo([&]() {
-        Generators::cuda::RunTopKViaHybridSort(data.get(), stream, scores_in_d.get(), params.vocab_size,
-                                               params.batch_size, params.k, p_size);
-      });
-      all_results.push_back({params, "HYBRID_SORT", p_size, mean_ms, stdev_ms, p95_ms});
     }
   }
 
@@ -159,3 +144,4 @@ TEST(TopKBenchmarks, PerformanceTests) {
     RunBenchmarks(params);
   }
 }
+#endif
