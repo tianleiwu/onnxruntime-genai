@@ -18,7 +18,6 @@ struct SamplingData : public TopkData {
 
   // Re-initializes the cuRAND states with a new seed.
   void ReInitCurandStates(unsigned long long random_seed, int batch_size, cudaStream_t stream);
-  unsigned long long GetRandomSeed() const { return random_seed_; }
 
   // Buffers for the sampling logic (Top-P, temperature, etc.)
   cuda_unique_ptr<float> prefix_sums;
@@ -40,6 +39,12 @@ void GetSample(SamplingData* sampling_data, cudaStream_t stream, int32_t* d_next
 template <bool is_log_softmax>
 void DispatchBlockwiseSoftmaxForward(cudaStream_t stream, float* output, const float* input, int softmax_elements,
                                      int input_stride, int output_stride, int batch_count);
+
+void LaunchFusedSampleKernel(SamplingData* data, cudaStream_t stream, const float* scores, const int* indices,
+                             int32_t* next_token_out, int k, int batch_size, float p, float temperature, int stride);
+
+void LaunchMultiStageSampleKernel(SamplingData* data, cudaStream_t stream, const float* scores, const int* indices,
+                                  int32_t* next_token_out, int k, int batch_size, float p, float temperature, int stride);
 
 }  // namespace cuda
 }  // namespace Generators
