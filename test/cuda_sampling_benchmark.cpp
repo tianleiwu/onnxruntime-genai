@@ -112,8 +112,8 @@ void RunBenchmarks(const BenchmarkParams& params) {
   {
     auto [mean_ms, stdev_ms, p95_ms] = bench_algo([&]() {
       Generators::cuda::LaunchFusedSampleKernel(data.get(), stream, d_topk_scores.get(), d_topk_indices.get(),
-                                                     d_next_token.get(), params.k, params.batch_size, p_value,
-                                                     temperature, params.topk_stride);
+                                                d_next_token.get(), params.k, params.batch_size, p_value,
+                                                temperature, params.topk_stride);
     });
     all_results.push_back({params, "FUSED", mean_ms, stdev_ms, p95_ms});
   }
@@ -133,33 +133,25 @@ void RunBenchmarks(const BenchmarkParams& params) {
 }
 }  // namespace
 
-TEST(SamplingKernelBenchmarks, PerformanceTests) {
+TEST(CudaSamplingBenchmarks, PerformanceTests) {
   std::vector<int> batch_sizes = {1};
   std::vector<int> vocab_sizes = {204800};
-  std::vector<int> ks = {1, 8, 50, 100};
+  std::vector<int> ks = {1, 8, 50};
 
   for (int batch_size : batch_sizes) {
     for (int vocab_size : vocab_sizes) {
       for (int k : ks) {
         // Test different stride scenarios from the Top-K stage
-        std::vector<int> strides;
+        int stride;
         if (k <= 8) {
-          strides.push_back(k);  // Compact output, e.g., from Selection Sort
-        } else if (k <= 64) {
-          strides.push_back(64);  // Max K for hybrid sort
+          stride = k;  // selection sort
+        } else if (k <= Generators::cuda::kHybridSortMaxK) {
+          stride = Generators::cuda::kHybridSortMaxK;  // hybrid sort
         } else {
-          strides.push_back(vocab_size);  // Full sort output
+          stride = vocab_size;  // Full sort
         }
 
-        // Remove duplicate strides
-        std::sort(strides.begin(), strides.end());
-        strides.erase(std::unique(strides.begin(), strides.end()), strides.end());
-        
-        for (int stride : strides) {
-          // Stride must be at least as large as k
-          if (stride < k) continue;
-          RunBenchmarks({batch_size, vocab_size, k, stride});
-        }
+        RunBenchmarks({batch_size, vocab_size, k, stride});
       }
     }
   }

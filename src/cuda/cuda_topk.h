@@ -9,7 +9,7 @@
 namespace Generators {
 namespace cuda {
 
-constexpr int kHybridSortMaxK = 256; // The maximum k allowed for hybrid sort.
+constexpr int kHybridSortMaxK = 256;  // The maximum k allowed for hybrid sort.
 
 // This struct holds all the device memory buffers required for Top-K operations.
 struct TopkData {
@@ -21,7 +21,7 @@ struct TopkData {
   // --- Intermediate Buffers for Top-K Algorithms ---
 
   // - Full sort - Holds top-k indices for output
-  // - Selection sort: Holds top-k indices for output 
+  // - Selection sort: Holds top-k indices for output
   // - Hybrid sort: A "ping-pong" buffer for indices during the reduction phase.
   cuda_unique_ptr<int> intermediate_indices_1;
 

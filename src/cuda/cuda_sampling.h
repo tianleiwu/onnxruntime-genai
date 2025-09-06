@@ -11,7 +11,7 @@
 namespace Generators {
 namespace cuda {
 
-constexpr int kFusedSamplingMaxK = 256; // Threshold to switch from Fused to Multi-Stage sampling
+constexpr int kFusedSamplingMaxK = 256;  // Threshold to switch from Fused to Multi-Stage sampling
 
 // This struct holds buffers for the SAMPLING stage.
 // It inherits the Top-K buffers from the TopkData struct.

@@ -138,7 +138,8 @@ BenchmarkResult RunBenchmark(const BenchmarkParams& params) {
   std::mt19937 engine(rd());
   std::uniform_int_distribution<> dist(5, 25);
   const int warm_up_runs = 5;
-  const int total_runs = 1000;
+  constexpr bool is_build_pipeline = true; // Change it false to trigger more runs in local machine.
+  const int total_runs = is_build_pipeline ? 100 : 1000; // Reduce total run time in build pipeline
 
   std::vector<double> latencies;
 
@@ -181,7 +182,7 @@ TEST(SamplingBenchmarks, PerformanceTests) {
 
   std::vector<int> batch_sizes = {1};
   std::vector<int> vocab_sizes = {201088};
-  std::vector<int> ks = {1, 8, 50};
+  std::vector<int> ks = {1, 50};
 
   for (const auto& device_type : device_types) {
     for (int batch_size : batch_sizes) {
@@ -189,7 +190,8 @@ TEST(SamplingBenchmarks, PerformanceTests) {
         test_cases.push_back({device_type, batch_size, vocab_size, 0, BenchmarkFunction::TopP});        
         for (int k : ks) {
           test_cases.push_back({device_type, batch_size, vocab_size, k, BenchmarkFunction::TopK});
-          test_cases.push_back({device_type, batch_size, vocab_size, k, BenchmarkFunction::TopKTopP});
+          if (k >= 20)
+            test_cases.push_back({device_type, batch_size, vocab_size, k, BenchmarkFunction::TopKTopP});
         }
       }
     }

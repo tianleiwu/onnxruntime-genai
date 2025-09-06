@@ -88,7 +88,7 @@ void RunTopKViaSelectionSort(TopkData* data, cudaStream_t stream, const float* s
   float* mutable_scores = data->intermediate_scores_2.get();
   size_t buffer_size = static_cast<size_t>(batch_size) * vocab_size * sizeof(float);
   CUDA_CHECK(cudaMemcpyAsync(mutable_scores, scores_in, buffer_size, cudaMemcpyDeviceToDevice, stream));
-  
+
   float* topk_scores = data->intermediate_scores_1.get();
   int* topk_indices = data->intermediate_indices_1.get();
   LaunchGetTopK(stream, mutable_scores, topk_scores, topk_indices, vocab_size, batch_size, k);
