@@ -19,7 +19,7 @@ struct KV {
   int val;
 };
 
-// Macros adapted from topk_impl.cuh (assuming largest=1, sorted=1)
+// Macros adapted from topk_impl.cuh (assuming largest=1, sorted=1, i.e. the output is a sorted list of the largest k elements)
 #define TRIVIAL (std::numeric_limits<float>::lowest())
 #define BIGGER(n, m) (n.key > m.key ? n : (n.key < m.key ? m : (n.val > m.val ? m : n)))
 #define IS_SMALLER(n, m) (n.key < m.key || (!(n.key > m.key) && n.val > m.val))
