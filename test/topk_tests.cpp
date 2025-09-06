@@ -35,7 +35,7 @@ bool CompareResults(const std::vector<float>& reference_scores, const std::vecto
   bool match = true;
   const float epsilon = 1e-4f;
 
-  for (int b = 0; b < batch_size; ++b) {
+  for (int b = 0; b < batch_size && match; ++b) {
     for (int i = 0; i < k; ++i) {
       size_t idx = static_cast<size_t>(b) * k + i;
       if (reference_indices[idx] != actual_indices[idx] ||
@@ -45,12 +45,11 @@ bool CompareResults(const std::vector<float>& reference_scores, const std::vecto
                   << reference_scores[idx] << "), Got: (" << actual_indices[idx] << ", " << actual_scores[idx] << ")"
                   << std::endl;
         match = false;
-        goto end_loops;  // Exit both loops
+        break;
       }
     }
   }
 
-end_loops:
   return match;
 }
 
@@ -66,7 +65,6 @@ void RunParityTests(const TopKTestParams& params) {
   size_t topk_size = static_cast<size_t>(params.batch_size) * params.k;
 
   auto scores_in_d = Generators::CudaMallocArray<float>(total_vocab_size);
-  auto scores_in_d_copy = Generators::CudaMallocArray<float>(total_vocab_size);
 
   // Use a fixed seed for reproducibility
   std::mt19937 gen(3407);
@@ -75,10 +73,7 @@ void RunParityTests(const TopKTestParams& params) {
   for (auto& val : scores_in_h) {
     val = dis(gen);
   }
-  CUDA_CHECK(
-      cudaMemcpy(scores_in_d.get(), scores_in_h.data(), scores_in_h.size() * sizeof(float), cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(scores_in_d_copy.get(), scores_in_d.get(), scores_in_h.size() * sizeof(float),
-                        cudaMemcpyDeviceToDevice));
+  CUDA_CHECK(cudaMemcpy(scores_in_d.get(), scores_in_h.data(), scores_in_h.size() * sizeof(float), cudaMemcpyHostToDevice));
 
   // --- Get Reference Result using Full Sort ---
   auto topk_data = std::make_unique<Generators::cuda::TopkDataCompact>(params.batch_size, params.vocab_size, stream);
@@ -115,10 +110,7 @@ void RunParityTests(const TopKTestParams& params) {
 
   if (params.k <= 64) {
     test_algo("SELECTION_SORT", [&]() {
-      // Selection sort modifies the input in place, so we use a copy.
-      CUDA_CHECK(cudaMemcpy(scores_in_d_copy.get(), scores_in_d.get(), scores_in_h.size() * sizeof(float),
-                            cudaMemcpyDeviceToDevice));
-      Generators::cuda::RunTopKViaSelectionSort(topk_data.get(), stream, scores_in_d_copy.get(),
+      Generators::cuda::RunTopKViaSelectionSort(topk_data.get(), stream, scores_in_d.get(),
                                                 params.vocab_size, params.batch_size, params.k);
     });
   }

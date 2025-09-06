@@ -80,12 +80,18 @@ void LaunchGetTopK(cudaStream_t stream, float* scores_in, float* scores_out, int
   CUDA_CHECK(cudaGetLastError());
 }
 
-void RunTopKViaSelectionSort(TopkData* data, cudaStream_t stream, float* scores_in, int vocab_size, int batch_size, int k) {
-  // IMPORTANT: This kernel modifies the `scores_in` tensor in-place. The caller is responsible
-  // for making a copy if the original data is needed after this call.
+void RunTopKViaSelectionSort(TopkData* data, cudaStream_t stream, const float* scores_in, int vocab_size, int batch_size, int k) {
+  // This function implements a "copy-on-write" strategy for safety and performance.
+  // 1. It copies the const `scores_in` to a mutable intermediate buffer.
+  // 2. It runs the high-performance in-place selection sort kernel on that buffer.
+  // This preserves the const-correctness of the API while using the fastest kernel.
+  float* mutable_scores = data->intermediate_scores_2.get();
+  size_t buffer_size = static_cast<size_t>(batch_size) * vocab_size * sizeof(float);
+  CUDA_CHECK(cudaMemcpyAsync(mutable_scores, scores_in, buffer_size, cudaMemcpyDeviceToDevice, stream));
+  
   float* topk_scores = data->intermediate_scores_1.get();
   int* topk_indices = data->intermediate_indices_1.get();
-  LaunchGetTopK(stream, scores_in, topk_scores, topk_indices, vocab_size, batch_size, k);
+  LaunchGetTopK(stream, mutable_scores, topk_scores, topk_indices, vocab_size, batch_size, k);
 
   data->topk_scores = topk_scores;
   data->topk_indices = topk_indices;

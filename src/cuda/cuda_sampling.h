@@ -11,6 +11,8 @@
 namespace Generators {
 namespace cuda {
 
+constexpr int kFusedSamplingMaxK = 256; // Threshold to switch from Fused to Multi-Stage sampling
+
 // This struct holds buffers for the SAMPLING stage.
 // It inherits the Top-K buffers from the TopkData struct.
 struct SamplingData : public TopkData {
@@ -40,6 +42,7 @@ template <bool is_log_softmax>
 void DispatchBlockwiseSoftmaxForward(cudaStream_t stream, float* output, const float* input, int softmax_elements,
                                      int input_stride, int output_stride, int batch_count);
 
+// The following are for macro benchmark.
 void LaunchFusedSampleKernel(SamplingData* data, cudaStream_t stream, const float* scores, const int* indices,
                              int32_t* next_token_out, int k, int batch_size, float p, float temperature, int stride);
 

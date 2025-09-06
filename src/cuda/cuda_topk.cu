@@ -49,13 +49,11 @@ void TopkDataCompact::CompactOutput(int batch_size, int vocab_size, cudaStream_t
 
 void GetTopK(TopkData* topk_data, cudaStream_t stream, const float* scores_in, int vocab_size, int batch_size, int k) {
   assert(topk_data != nullptr);
-
-  if (k > 64) {
-    LaunchSort(topk_data, stream, scores_in, topk_data->intermediate_scores_1.get(),
-               topk_data->intermediate_indices_1.get(), vocab_size, batch_size);
+  
+  if (k > kSelectionSortMaxK) {
+    RunTopKViaFullSort(topk_data, stream, scores_in, vocab_size, batch_size, k);
   } else {
-    // NOTE: This modifies scores_in in-place
-    RunTopKViaSelectionSort(topk_data, stream, const_cast<float*>(scores_in), vocab_size, batch_size, k);
+    RunTopKViaSelectionSort(topk_data, stream, scores_in, vocab_size, batch_size, k);
   }
 }
 

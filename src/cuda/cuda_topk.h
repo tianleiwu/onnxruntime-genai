@@ -9,7 +9,7 @@
 namespace Generators {
 namespace cuda {
 
-constexpr int kHybridSortMaxK = 64;  // up to 256.
+constexpr int kSelectionSortMaxK = 64; // Threshold to switch from Selection Sort to Full Sort
 
 // This struct holds all the device memory buffers required for Top-K operations.
 // The user of this struct is responsible for allocating and managing the memory.
@@ -19,6 +19,7 @@ struct TopkData {
   // --- Intermediate Buffers for Top-K Algorithms ---
 
   // Used to hold initial vocabulary indices for full sort.
+  // Used to hold top-k indices for selection sort.
   cuda_unique_ptr<int> intermediate_indices_1;
 
   // A dedicated "ping-pong" buffer for full sort.
@@ -26,10 +27,11 @@ struct TopkData {
 
   // Primary buffer for holding raw scores.
   // - Full sort: Holds the fully sorted raw scores.
-  // - Selection sort: Not used directly for output, but reserved.
+  // - Selection sort: Holds the top-k scores for selection sort.
   cuda_unique_ptr<float> intermediate_scores_1;
 
   // A secondary "ping-pong" buffer.
+  // - Selection sort: Holds a copy of input scores. Will be updated in place by selection sort kernel.
   cuda_unique_ptr<float> intermediate_scores_2;
 
   // General-purpose temporary storage for CUB's DeviceSegmentedRadixSort (for full sort only).
@@ -57,10 +59,8 @@ struct TopkDataCompact : public TopkData {
 // Main dispatcher for Top-K. Used by the sampling logic. The topk_data will be updated for output pointers and stride.
 void GetTopK(TopkData* topk_data, cudaStream_t stream, const float* scores_in, int vocab_size, int batch_size, int k);
 
-// The specific Top-K algorithm implementations. These are exposed for testing and benchmarking.
-// They all adhere to the same contract: find the top `k` raw logits and indices and write them
-// to `scores_out` and `indices_out` in a compact [batch_size, k] layout.
-void RunTopKViaSelectionSort(TopkData* data, cudaStream_t stream, float* scores_in, int vocab_size, int batch_size, int k);
+// Top-K algorithm implementations. These are exposed for testing and benchmarking.
+void RunTopKViaSelectionSort(TopkData* data, cudaStream_t stream, const float* scores_in, int vocab_size, int batch_size, int k);
 void RunTopKViaFullSort(TopkData* data, cudaStream_t stream, const float* scores_in, int vocab_size, int batch_size, int k);
 
 }  // namespace cuda

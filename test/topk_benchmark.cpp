@@ -113,13 +113,8 @@ void RunBenchmarks(const BenchmarkParams& params) {
   if (params.k <= 64) {
     // Benchmark Selection Sort
     {
-      auto scores_in_copy_d =
-          Generators::CudaMallocArray<float>(static_cast<size_t>(params.batch_size) * params.vocab_size);
-      // Make a copy of input scores since Selection Sort modifies the input.
-      cudaMemcpyAsync(scores_in_copy_d.get(), scores_in_d.get(), sizeof(float) * params.batch_size * params.vocab_size,
-                      cudaMemcpyDeviceToDevice, stream);
       auto [mean_ms, stdev_ms, p95_ms] = bench_algo([&]() {
-        Generators::cuda::RunTopKViaSelectionSort(data.get(), stream, scores_in_copy_d.get(), params.vocab_size,
+        Generators::cuda::RunTopKViaSelectionSort(data.get(), stream, scores_in_d.get(), params.vocab_size,
                                                   params.batch_size, params.k);
       });
       all_results.push_back({params, "SELECTION_SORT", 0, mean_ms, stdev_ms, p95_ms});
