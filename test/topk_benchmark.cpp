@@ -110,6 +110,15 @@ void RunBenchmarks(const BenchmarkParams& params) {
     all_results.push_back({params, "FULL_SORT", 0, mean_ms, stdev_ms, p95_ms});
   }
 
+  // Benchmark Baseline Sort (ONNXRuntime logic)
+  {
+    auto [mean_ms, stdev_ms, p95_ms] = bench_algo([&]() {
+      Generators::cuda::RunTopKViaBaselineSort(data.get(), stream, scores_in_d.get(), params.vocab_size,
+                                               params.batch_size, params.k);
+    });
+    all_results.push_back({params, "BASELINE_ORT", 0, mean_ms, stdev_ms, p95_ms});
+  }
+
   if (params.k <= Generators::cuda::kHybridSortMaxK) {
     // Benchmark Selection Sort
     {

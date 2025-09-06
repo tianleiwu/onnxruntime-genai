@@ -126,6 +126,11 @@ void RunParityTests(const TopKTestParams& params) {
     }
   }
 
+  test_algo("BASELINE_SORT", [&]() {
+    Generators::cuda::RunTopKViaBaselineSort(topk_data.get(), stream, scores_in_d.get(),
+                                             params.vocab_size, params.batch_size, params.k);
+  });
+
   CUDA_CHECK(cudaStreamDestroy(stream));
 }
 
