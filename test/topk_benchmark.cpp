@@ -110,7 +110,7 @@ void RunBenchmarks(const BenchmarkParams& params) {
     all_results.push_back({params, "FULL_SORT", 0, mean_ms, stdev_ms, p95_ms});
   }
 
-  if (params.k <= 64) {
+  if (params.k <= Generators::cuda::kHybridSortMaxK) {
     // Benchmark Selection Sort
     {
       auto [mean_ms, stdev_ms, p95_ms] = bench_algo([&]() {
@@ -139,7 +139,7 @@ void RunBenchmarks(const BenchmarkParams& params) {
 TEST(TopKBenchmarks, PerformanceTests) {
   std::vector<int> batch_sizes = {1};
   std::vector<int> vocab_sizes = {201088};
-  std::vector<int> ks = {50, 1, 2, 4, 8, 16, 32, 64};
+  std::vector<int> ks = {50, 1, 2, 4, 8, 16, 32, Generators::cuda::kHybridSortMaxK};
 
   std::vector<BenchmarkParams> test_cases;
   for (int batch_size : batch_sizes) {

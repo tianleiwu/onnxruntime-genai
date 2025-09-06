@@ -130,7 +130,7 @@ void RunParityTests(const TopKTestParams& params) {
 }
 
 TEST(TopKTests, ParityTests) {
-  std::vector<TopKTestParams> test_cases = {{1, 10000, 50}, {2, 10000, 64}, {1, 32000, 1}, {1, 32000, 16}, {1, 512000, 50}, {1, 1024, 18}};
+  std::vector<TopKTestParams> test_cases = {{1, 10000, 50}, {2, 10000, Generators::cuda::kHybridSortMaxK}, {1, 32000, 1}, {1, 32000, 16}, {1, 512000, 50}, {1, 1024, 18}};
 
   for (const auto& params : test_cases) {
     RunParityTests(params);
