@@ -1,6 +1,6 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
-
+#if USE_CUDA
 #include <gtest/gtest.h>
 
 #include <chrono>
@@ -43,7 +43,7 @@ struct BenchmarkResult {
 };
 
 void PrintSummary(const std::vector<BenchmarkResult>& results) {
-  std::cout << "\n--- TopK Benchmark Summary ---\n";
+  std::cout << "\n--- TopK Cuda Kernel Benchmark Summary ---\n";
   std::cout << std::left << std::setw(12) << "Batch Size" << std::setw(12) << "Vocab Size" << std::setw(5) << "K"
             << std::setw(28) << "Algorithm" << std::setw(12) << "Latency(us)" << std::setw(12) << "Stdev(us)"
             << std::setw(12) << "P95(us)" << "\n";
@@ -149,3 +149,4 @@ TEST(TopKBenchmarks, PerformanceTests) {
     RunBenchmarks(params);
   }
 }
+#endif

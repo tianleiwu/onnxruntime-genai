@@ -1,6 +1,6 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
-
+#if USE_CUDA
 #include <gtest/gtest.h>
 
 #include <chrono>
@@ -133,3 +133,4 @@ TEST(TopKTests, ParityTests) {
     RunParityTests(params);
   }
 }
+#endif
