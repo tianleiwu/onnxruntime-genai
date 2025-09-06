@@ -9,49 +9,58 @@
 namespace Generators {
 namespace cuda {
 
-constexpr int kSelectionSortMaxK = 64; // Threshold to switch from Selection Sort to Full Sort
+constexpr int kHybridSortMaxK = 256; // The maximum k allowed for hybrid sort.
 
 // This struct holds all the device memory buffers required for Top-K operations.
-// The user of this struct is responsible for allocating and managing the memory.
 struct TopkData {
   TopkData(int batch_size, int vocab_size, cudaStream_t stream);
+  TopkData() = delete;
+  TopkData(const TopkData&) = delete;
+  TopkData& operator=(const TopkData&) = delete;
 
   // --- Intermediate Buffers for Top-K Algorithms ---
 
-  // Used to hold initial vocabulary indices for full sort.
-  // Used to hold top-k indices for selection sort.
+  // - Full sort - Holds top-k indices for output
+  // - Selection sort: Holds top-k indices for output 
+  // - Hybrid sort: A "ping-pong" buffer for indices during the reduction phase.
   cuda_unique_ptr<int> intermediate_indices_1;
 
-  // A dedicated "ping-pong" buffer for full sort.
+  // - Full sort - Holds the initial vocabulary indices before sorting.
+  // - Hybrid sort - A "ping-pong" buffer for indices during the reduction phase.
   cuda_unique_ptr<int> intermediate_indices_2;
 
-  // Primary buffer for holding raw scores.
   // - Full sort: Holds the fully sorted raw scores.
   // - Selection sort: Holds the top-k scores for selection sort.
+  // - Hybrid sort: A "ping-pong" buffer for raw scores during the reduction phase.
   cuda_unique_ptr<float> intermediate_scores_1;
 
-  // A secondary "ping-pong" buffer.
   // - Selection sort: Holds a copy of input scores. Will be updated in place by selection sort kernel.
+  // - Hybrid sort: A "ping-pong" buffer for raw scores during the reduction phase.
   cuda_unique_ptr<float> intermediate_scores_2;
 
-  // General-purpose temporary storage for CUB's DeviceSegmentedRadixSort (for full sort only).
+  // - Full sort: General-purpose temporary storage for CUB's DeviceSegmentedRadixSort
   cuda_unique_ptr<unsigned char> cub_temp_storage;
   size_t cub_temp_storage_bytes = 0;
 
-  // Stores the start offset of each batch segment for CUB's segmented sort (for full sort only).
+  // - Full sort: Stores the start offset of each batch segment for CUB's segmented sort
   cuda_unique_ptr<int> batch_offsets;
 
   // --- Information of Final Output (Input to Sampling Stage) ---
-  const float* topk_scores = nullptr;  // pointer to the top-k scores data (in intermediate_scores_1 or intermediate_scores_2)
-  const int* topk_indices = nullptr;   // pointer to the top-k indices data (in intermediate_indices_1 or intermediate_indices_2)
-  int topk_stride = 0;                 // stride of the top-k output data: k for selection sort, vocab_size for full sort
+  const float* topk_scores = nullptr;  // pointer to the top-k scores data (in either intermediate_scores_1 or intermediate_scores_2)
+  const int* topk_indices = nullptr;   // pointer to the top-k indices data (in either intermediate_indices_1 or intermediate_indices_2)
+  int topk_stride = 0;                 // stride of the top-k output data: k for selection sort, vocab_size for full sort, kHybridSortMaxK for hybrid sort
 };
 
 // For parity test, a derived struct to help compact output buffers.
 struct TopkDataCompact : public TopkData {
   TopkDataCompact(int batch_size, int vocab_size, cudaStream_t stream)
       : TopkData(batch_size, vocab_size, stream) {}
+  TopkDataCompact() = delete;
+  TopkDataCompact(const TopkDataCompact&) = delete;
+  TopkDataCompact& operator=(const TopkDataCompact&) = delete;
+
   void CompactOutput(int batch_size, int vocab_size, cudaStream_t stream, int k);
+
   cuda_unique_ptr<float> topk_scores_compact;  // compact [batch_size, k] output scores
   cuda_unique_ptr<int> topk_indices_compact;   // compact [batch_size, k] output indices
 };
@@ -62,6 +71,7 @@ void GetTopK(TopkData* topk_data, cudaStream_t stream, const float* scores_in, i
 // Top-K algorithm implementations. These are exposed for testing and benchmarking.
 void RunTopKViaSelectionSort(TopkData* data, cudaStream_t stream, const float* scores_in, int vocab_size, int batch_size, int k);
 void RunTopKViaFullSort(TopkData* data, cudaStream_t stream, const float* scores_in, int vocab_size, int batch_size, int k);
+void RunTopKViaHybridSort(TopkData* data, cudaStream_t stream, const float* scores_in, int vocab_size, int batch_size, int k, int partition_size);
 
 }  // namespace cuda
 }  // namespace Generators

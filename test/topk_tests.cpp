@@ -108,11 +108,22 @@ void RunParityTests(const TopKTestParams& params) {
     std::cout << "  [PASS] " << name << " (Raw Scores & Indices)" << std::endl;
   };
 
-  if (params.k <= 64) {
-    test_algo("SELECTION_SORT", [&]() {
-      Generators::cuda::RunTopKViaSelectionSort(topk_data.get(), stream, scores_in_d.get(),
-                                                params.vocab_size, params.batch_size, params.k);
-    });
+  test_algo("SELECTION_SORT", [&]() {
+    Generators::cuda::RunTopKViaSelectionSort(topk_data.get(), stream, scores_in_d.get(),
+                                              params.vocab_size, params.batch_size, params.k);
+  });
+
+  if (params.k <= Generators::cuda::kHybridSortMaxK) {
+    for (int partition_size : {1024, 2048, 4096, 8192}) {
+      if (partition_size > params.vocab_size) {
+        continue;
+      }
+      std::string algo_name = "HYBRID (" + std::to_string(partition_size) + ")";
+      test_algo(algo_name, [&]() {
+        Generators::cuda::RunTopKViaHybridSort(topk_data.get(), stream, scores_in_d.get(), params.vocab_size,
+                                               params.batch_size, params.k, partition_size);
+      });
+    }
   }
 
   CUDA_CHECK(cudaStreamDestroy(stream));
