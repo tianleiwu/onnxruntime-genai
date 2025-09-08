@@ -13,11 +13,7 @@ namespace Generators {
 namespace cuda {
 
 TopkData::TopkData(int batch_size, int vocab_size, cudaStream_t stream) {
-  int device_id = -1;
-  CUDA_CHECK(cudaGetDevice(&device_id));
-  CUDA_CHECK(cudaGetDeviceProperties(&device_properties, device_id));
-
-  hybrid_sort_partition_size = EstimateHybridSortBestPartitionSize(batch_size, vocab_size, device_properties);
+  hybrid_sort_partition_size = EstimateHybridSortBestPartitionSize(vocab_size);
 
   size_t hybrid_sort_buffer_elements = GetHybridSortIntermediateSize(batch_size, vocab_size, hybrid_sort_partition_size);
 

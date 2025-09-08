@@ -177,68 +177,30 @@ void RunTopKViaHybridSort(TopkData* data, cudaStream_t stream, const float* scor
  * creates an optimal amount of parallel work to saturate the GPU, while minimizing
  * the overhead of the reduction stage.
  *
- * The heuristic considers:
- * 1.  The trivial case where the entire vocabulary fits in a single partition.
- * 2.  The need to generate sufficient parallelism for small batch sizes.
- * 3.  The goal of matching the total number of workstreams to the GPU's number of
- * Streaming Multiprocessors (SMs) for larger batch sizes.
+ * The heuristic is based on the following rules derived from empirical data:
+ * 1.  If the vocabulary fits within a single partition, the smallest partition that
+ * can contain it is chosen to eliminate the reduction stage overhead.
+ * 2.  If the vocabulary is larger than the biggest available partition, 8192 is
+ * consistently the best choice across all batch sizes, as it minimizes the
+ * number of partitions that need to be processed in the reduction stage.
  *
- * @param batch_size The number of batches being processed.
  * @param vocab_size The size of the vocabulary to sort over.
- * @param device_prop The CUDA device properties, used to get the SM count.
  * @return The estimated optimal partition size (e.g., 1024, 2048, 4096, 8192).
  */
-inline int EstimateHybridSortBestPartitionSize(int batch_size, int vocab_size, const cudaDeviceProp& /*device_prop*/) {
-  const std::vector<int> available_partition_sizes = {1024, 2048, 4096, 8192};
-
+inline int EstimateHybridSortBestPartitionSize(int vocab_size) {
   // --- Rule 1: Single Partition Dominance ---
-  // If the entire vocabulary fits within one of the available partition sizes,
-  // the smallest one that fits is always the most efficient choice. This avoids
-  // the reduction stage (Stage 2) entirely.
-  for (int p_size : available_partition_sizes) {
-    if (vocab_size <= p_size) {
-      return p_size;
-    }
-  }
+  // If the vocabulary fits entirely within a partition, use the smallest one that fits.
+  // This is the most efficient case as it completely avoids the reduction stage.
+  if (vocab_size <= 1024) return 1024;
+  if (vocab_size <= 2048) return 2048;
+  if (vocab_size <= 4096) return 4096;
+  if (vocab_size <= 8192) return 8192;
 
-  // Helper lambda to find the partition size that gets closest to a target number of partitions.
-  auto find_closest = [&](int target_partitions) {
-    long min_diff = -1;
-    int best_p_size = available_partition_sizes.back();
-    // Iterate in descending order to prefer smaller partition sizes in a tie-break,
-    // as the heuristic targets are tuned for this behavior.
-    for (size_t i = 0; i < available_partition_sizes.size(); ++i) {
-      int p_size = available_partition_sizes[available_partition_sizes.size() - 1 - i];
-      int num_partitions = (vocab_size + p_size - 1) / p_size;
-      long diff = std::abs(num_partitions - target_partitions);
-
-      if (min_diff == -1 || diff <= min_diff) {
-        min_diff = diff;
-        best_p_size = p_size;
-      }
-    }
-    return best_p_size;
-  };
-
-  if (batch_size <= 2) {
-    // --- Rule 2: Small Batch Size Heuristic (batch <= 2) ---
-    // This logic is tuned based on empirical data for small batches where performance
-    // can be non-monotonic and requires specific ranges.
-    if (vocab_size > 40000 && vocab_size < 50000) return 8192; // Specific exception for this range
-    if (vocab_size < 80000) return find_closest(8);
-    // In this range, the optimal number of partitions dips.
-    if (vocab_size >= 140000 && vocab_size < 180000) return find_closest(36);
-    // For other ranges (80k-140k and >180k), a higher number of partitions is more efficient.
-    return find_closest(56);
-  } else { // batch_size > 2
-    // --- Rule 3: Large Batch Size Heuristic (batch > 2) ---
-    // With more batches, the optimal number of partitions is more stable and primarily
-    // depends on creating enough work without excessive reduction overhead.
-    if (vocab_size < 81920) return find_closest(8);
-    if (vocab_size >= 524288) return find_closest(64);
-    // The broad mid-range performs best when targeting ~32 partitions.
-    return find_closest(32);
-  }
+  // --- Rule 2: Default to Largest Partition Size ---
+  // For any vocabulary size larger than 8192, the benchmark data consistently
+  // shows that using the largest partition size (8192) is optimal. This minimizes
+  // the number of partitions, making the reduction stage as efficient as possible.
+  return 8192;
 }
 
 }  // namespace cuda

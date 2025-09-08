@@ -17,12 +17,6 @@ struct TopkData {
   TopkData() = delete;
   TopkData(const TopkData&) = delete;
   TopkData& operator=(const TopkData&) = delete;
-
-  // --- Data used in hybrid sort partition size estimation --
-
-  // The device property can be moved to cuda interface if it is used in other place as well.
-  // It is the only place that is using it so we keep it here.
-  cudaDeviceProp device_properties; // properties of current cuda device
   
   // The estimated best partition size for hybrid sort.
   int hybrid_sort_partition_size;
