@@ -4,6 +4,7 @@
 #include <cub/device/device_segmented_radix_sort.cuh>
 
 #include "cuda_topk.h"
+#include "cuda_topk_threshold.cuh"
 #include "cuda_topk_full_sort.cuh"
 #include "cuda_topk_radix_sort.cuh"
 #include "cuda_topk_hybrid_sort.cuh"
@@ -14,6 +15,7 @@ namespace cuda {
 
 TopkData::TopkData(int batch_size, int vocab_size, cudaStream_t stream) {
   hybrid_sort_partition_size = EstimateHybridSortBestPartitionSize(vocab_size);
+  selection_sort_k_threshold = EstimateThresholdK(batch_size, vocab_size);
 
   size_t hybrid_sort_buffer_elements = GetHybridSortIntermediateSize(batch_size, vocab_size, hybrid_sort_partition_size);
 
@@ -57,23 +59,20 @@ void TopkDataCompact::CompactOutput(int batch_size, int vocab_size, cudaStream_t
 void GetTopK(TopkData* topk_data, cudaStream_t stream, const float* scores_in, int vocab_size, int batch_size, int k) {
   assert(topk_data != nullptr);
 
-  if (k <= 8 ) {
+  if (k <= topk_data->selection_sort_k_threshold) {
     RunTopKViaSelectionSort(topk_data, stream, scores_in, vocab_size, batch_size, k);
     return;
   }
 
-  if (batch_size == 1) {
-    if (vocab_size >= 131072) {
-      RunTopKViaRadixSort(topk_data, stream, scores_in, vocab_size, batch_size, k);
-    } else {
-      RunTopKViaHybridSort(topk_data, stream, scores_in, vocab_size, batch_size, k);
-    }
+  if (k <= kHybridSortMaxK) {
+    RunTopKViaHybridSort(topk_data, stream, scores_in, vocab_size, batch_size, k);
+    return;
+  }
+
+  if (batch_size <= 2) {
+    RunTopKViaRadixSort(topk_data, stream, scores_in, vocab_size, batch_size, k);
   } else {
-    if (k > kHybridSortMaxK) {
-      RunTopKViaFullSort(topk_data, stream, scores_in, vocab_size, batch_size, k);
-    } else {
-      RunTopKViaHybridSort(topk_data, stream, scores_in, vocab_size, batch_size, k);
-    }
+    RunTopKViaFullSort(topk_data, stream, scores_in, vocab_size, batch_size, k);
   }
 }
 

@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
+#include <fstream>  // Added for file output
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -35,7 +36,6 @@ struct BenchmarkParams {
 struct BenchmarkResult {
   BenchmarkParams params;
   std::string algo_name;
-  int partition_size;
 
   float latency_ms;
   float latency_ms_stdev;
@@ -65,9 +65,6 @@ void PrintSummary(const std::vector<BenchmarkResult>& results) {
 
   for (const auto& result : results) {
     std::string full_algo_name = result.algo_name;
-    if (result.partition_size > 0) {
-      full_algo_name += " (p=" + std::to_string(result.partition_size) + ")";
-    }
 
     std::cout << std::left << std::setw(12) << result.params.batch_size << std::setw(12) << result.params.vocab_size
               << std::setw(5) << result.params.k << std::setw(28) << full_algo_name << std::fixed
@@ -77,45 +74,60 @@ void PrintSummary(const std::vector<BenchmarkResult>& results) {
   }
 }
 
+// **MODIFIED FUNCTION**
+// This function now writes the benchmark summary to a CSV file instead of standard output.
 void PrintCsvSummary(const std::vector<CsvSummaryResult>& results) {
   if (results.empty()) {
     return;
   }
-  std::cout << "\n--- TopK Benchmark CSV Summary: Latency in Microseconds (us) ---\n";
-  std::cout << "batch_size,vocab_size,k,full_sort,radix_sort,selection_sort,hybrid_sort,best_algorithm,best_latency\n";
+
+  const char* filename = "topk_benchmark_summary.csv";
+  std::ofstream summary_file(filename);
+  if (!summary_file.is_open()) {
+    std::cerr << "Error: Could not open summary file '" << filename << "' for writing." << std::endl;
+    return;
+  }
+  std::cout << "\n--- Writing TopK Benchmark CSV Summary to " << filename << " ---\n";
+
+  // Write header
+  summary_file << "batch_size,vocab_size,k,full_sort,radix_sort,selection_sort,hybrid_sort,best_algorithm,best_latency\n";
 
   for (const auto& result : results) {
-    std::cout << result.params.batch_size << ","
-              << result.params.vocab_size << ","
-              << result.params.k << ",";
+    summary_file << result.params.batch_size << ","
+                 << result.params.vocab_size << ","
+                 << result.params.k << ",";
 
-    auto print_latency = [](float latency) {
+    // Helper lambda to print latency values, or "NA" if not applicable.
+    auto print_latency = [](std::ostream& out, float latency) {
       if (latency < 0.0f) {
-        std::cout << "NA";
+        out << "NA";
       } else {
-        std::cout << std::fixed << std::setprecision(4) << latency * 1000.0f;
+        out << std::fixed << std::setprecision(4) << latency * 1000.0f;
       }
     };
 
-    print_latency(result.full_sort_latency);
-    std::cout << ",";
-    print_latency(result.radix_sort_latency);
-    std::cout << ",";
-    print_latency(result.selection_sort_latency);
-    std::cout << ",";
-    print_latency(result.hybrid_sort_latency);
-    std::cout << ",";
+    print_latency(summary_file, result.full_sort_latency);
+    summary_file << ",";
+    print_latency(summary_file, result.radix_sort_latency);
+    summary_file << ",";
+    print_latency(summary_file, result.selection_sort_latency);
+    summary_file << ",";
+    print_latency(summary_file, result.hybrid_sort_latency);
+    summary_file << ",";
 
-    std::cout << result.best_algorithm << ",";
+    summary_file << result.best_algorithm << ",";
 
     if (result.best_latency == std::numeric_limits<float>::max()) {
-      std::cout << "NA";
+      summary_file << "NA";
     } else {
-      std::cout << std::fixed << std::setprecision(4) << result.best_latency;
+      print_latency(summary_file, result.best_latency);
     }
 
-    std::cout << "\n";
+    summary_file << "\n";
   }
+
+  summary_file.close();
+  std::cout << "--- CSV summary successfully written. ---\n";
 }
 
 void RunBenchmarks(const BenchmarkParams& params, std::vector<CsvSummaryResult>& csv_results, bool use_default_partition_size = true) {
@@ -166,7 +178,7 @@ void RunBenchmarks(const BenchmarkParams& params, std::vector<CsvSummaryResult>&
       Generators::cuda::RunTopKViaFullSort(data.get(), stream, scores_in_d.get(), params.vocab_size,
                                            params.batch_size, params.k);
     });
-    all_results.push_back({params, "FULL_SORT", 0, mean_ms, stdev_ms, p95_ms});
+    all_results.push_back({params, "FULL_SORT", mean_ms, stdev_ms, p95_ms});
     current_csv_result.full_sort_latency = mean_ms;
     algo_latencies["FULL_SORT"] = mean_ms;
   }
@@ -177,7 +189,7 @@ void RunBenchmarks(const BenchmarkParams& params, std::vector<CsvSummaryResult>&
       Generators::cuda::RunTopKViaSelectionSort(data.get(), stream, scores_in_d.get(), params.vocab_size,
                                                 params.batch_size, params.k);
     });
-    all_results.push_back({params, "SELECTION_SORT", 0, mean_ms, stdev_ms, p95_ms});
+    all_results.push_back({params, "SELECTION_SORT", mean_ms, stdev_ms, p95_ms});
     current_csv_result.selection_sort_latency = mean_ms;
     algo_latencies["SELECTION_SORT"] = mean_ms;
   }
@@ -188,7 +200,7 @@ void RunBenchmarks(const BenchmarkParams& params, std::vector<CsvSummaryResult>&
       Generators::cuda::RunTopKViaRadixSort(data.get(), stream, scores_in_d.get(), params.vocab_size,
                                             params.batch_size, params.k);
     });
-    all_results.push_back({params, "RADIX_SORT", 0, mean_ms, stdev_ms, p95_ms});
+    all_results.push_back({params, "RADIX_SORT", mean_ms, stdev_ms, p95_ms});
     current_csv_result.radix_sort_latency = mean_ms;
     algo_latencies["RADIX_SORT"] = mean_ms;
   }
@@ -199,8 +211,8 @@ void RunBenchmarks(const BenchmarkParams& params, std::vector<CsvSummaryResult>&
       Generators::cuda::RunTopKViaHybridSort(data.get(), stream, scores_in_d.get(), params.vocab_size,
                                              params.batch_size, params.k);
     });
-    all_results.push_back({params, "HYBRID_SORT", 0, mean_ms, stdev_ms, p95_ms});
-    current_csv_result.radix_sort_latency = mean_ms;
+    all_results.push_back({params, "HYBRID_SORT", mean_ms, stdev_ms, p95_ms});
+    current_csv_result.hybrid_sort_latency = mean_ms;
     algo_latencies["HYBRID_SORT"] = mean_ms;
   }
 
@@ -223,11 +235,11 @@ void RunBenchmarks(const BenchmarkParams& params, std::vector<CsvSummaryResult>&
 TEST(TopKBenchmarks, PerformanceTests) {
   std::vector<CsvSummaryResult> csv_summary_results;
 
-  constexpr bool is_build_pipeline = true;
+  constexpr bool is_build_pipeline = false;
   if constexpr (is_build_pipeline) {  // limited test in CI pipeline
     std::vector<int> batch_sizes = {1};
     std::vector<int> vocab_sizes = {201088};
-    std::vector<int> ks = {50, 1, 2, 4, 8, 16, 32, Generators::cuda::kHybridSortMaxK};
+    std::vector<int> ks = {50, 1, 2, 4, 8, 16, 32, 64, 128, 256};
 
     std::vector<BenchmarkParams> test_cases;
     for (int batch_size : batch_sizes) {
@@ -240,7 +252,8 @@ TEST(TopKBenchmarks, PerformanceTests) {
     for (const auto& params : test_cases) {
       RunBenchmarks(params, csv_summary_results);
     }
-  } else {  // not build pipeline, enable comprehensive tests.
+  } else {  // not build pipeline
+    // Comprehensive tests to find proper threshold for selection sort vs hybrid sort for small k.
     std::vector<int> batch_sizes = {1, 2, 4, 8};
     std::vector<int> vocab_sizes = {512, 1024, 2048, 4096};
     for (int v = 8 * 1024; v < 64 * 1024; v += 8 * 1024) {
@@ -249,7 +262,8 @@ TEST(TopKBenchmarks, PerformanceTests) {
     for (int v = 64 * 1024; v <= 256 * 1024; v += 16 * 1024) {
       vocab_sizes.push_back(v);
     }
-    std::vector<int> ks = {1, 2, 4, 8, 10, 16, 32, 50, 64, 128};
+    std::vector<int> ks = {2, 4, 6, 8, 10, 12, 16, 20};
+    // std::vector<int> ks = {1, 2, 4, 8, 10, 16, 32, 50, 64, 128};
 
     std::vector<BenchmarkParams> test_cases;
     for (int batch_size : batch_sizes) {

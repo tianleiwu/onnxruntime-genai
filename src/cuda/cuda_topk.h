@@ -21,6 +21,9 @@ struct TopkData {
   // The estimated best partition size for hybrid sort.
   int hybrid_sort_partition_size;
 
+  // The estimated threshold to use selection sort instead of other algorithm when k <= threshold
+  int selection_sort_k_threshold;
+
   // --- Intermediate Buffers for Top-K Algorithms ---
 
   // - Full sort - Holds top-k indices for output
