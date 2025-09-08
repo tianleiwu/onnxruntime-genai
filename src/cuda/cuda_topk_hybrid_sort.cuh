@@ -57,6 +57,37 @@ inline size_t GetHybridSortIntermediateSize(int batch_size, int vocab_size, int 
   return static_cast<size_t>(batch_size) * num_partitions * kHybridSortMaxK;
 }
 
+// Selects the most efficient reduction size (partitions per block) for a given number of partitions.
+// The goal is to minimize the number of "wasted" slots in the final, partially-filled thread block.
+// In case of a tie in waste, the larger reduction size is preferred to minimize kernel launch overhead.
+inline int select_partitions_per_block(int num_partitions) {
+  if (num_partitions <= 2) return 2;
+  if (num_partitions <= 4) return 4;
+
+  // Start with the largest reduction size as the default.
+  int best_p_size = 8;
+  // Waste is the number of empty slots we must process.
+  int min_waste = ((num_partitions + 7) / 8) * 8 - num_partitions;
+  if (min_waste == 0) {
+    return 8;  // Perfect alignment, no need to check further.
+  }
+
+  // Check if a reduction size of 4 is strictly better.
+  const int p4_waste = ((num_partitions + 3) / 4) * 4 - num_partitions;
+  if (p4_waste < min_waste) {
+    min_waste = p4_waste;
+    best_p_size = 4;
+  }
+
+  // Check if a reduction size of 2 is strictly better than the current best.
+  const int p2_waste = ((num_partitions + 1) / 2) * 2 - num_partitions;
+  if (p2_waste < min_waste) {
+    best_p_size = 2;
+  }
+
+  return best_p_size;
+}
+
 void RunTopKViaHybridSort(TopkData* data, cudaStream_t stream, const float* scores_in, int vocab_size, int batch_size, int k) {
   constexpr int max_k = kHybridSortMaxK;
   constexpr int block_size = 256;
@@ -102,18 +133,33 @@ void RunTopKViaHybridSort(TopkData* data, cudaStream_t stream, const float* scor
   int* output_indices = data->intermediate_indices_2.get();
 
   while (current_num_partitions > 1) {
-    constexpr int partitions_per_block = 8;
-    int num_blocks = (current_num_partitions + partitions_per_block - 1) / partitions_per_block;
+    const int partitions_per_block = select_partitions_per_block(current_num_partitions);
+    const int num_blocks = (current_num_partitions + partitions_per_block - 1) / partitions_per_block;
     dim3 grid_reduce(num_blocks, batch_size);
     dim3 block_reduce(block_size);
-    bitonic::reduction::BlockReduceTopK<block_size, max_k, partitions_per_block>
-        <<<grid_reduce, block_reduce, 0, stream>>>(input_scores, input_indices, output_scores, output_indices,
-                                                   current_num_partitions);
+
+    // Dispatch to the kernel with the optimal reduction size.
+    switch (partitions_per_block) {
+      case 8:
+        bitonic::reduction::BlockReduceTopK<block_size, max_k, 8><<<grid_reduce, block_reduce, 0, stream>>>(
+            input_scores, input_indices, output_scores, output_indices, current_num_partitions);
+        break;
+      case 4:
+        bitonic::reduction::BlockReduceTopK<block_size, max_k, 4><<<grid_reduce, block_reduce, 0, stream>>>(
+            input_scores, input_indices, output_scores, output_indices, current_num_partitions);
+        break;
+      case 2:
+        bitonic::reduction::BlockReduceTopK<block_size, max_k, 2><<<grid_reduce, block_reduce, 0, stream>>>(
+            input_scores, input_indices, output_scores, output_indices, current_num_partitions);
+        break;
+    }
+
     CUDA_CHECK(cudaGetLastError());
     std::swap(input_scores, output_scores);
     std::swap(input_indices, output_indices);
     current_num_partitions = num_blocks;
   }
+
 
   // After reduction, input_scores and input_indices point to the device buffers containing the final top-`max_k` raw scores and indices.
   data->topk_scores = input_scores;
