@@ -33,10 +33,6 @@ struct TopkData {
   // The estimated threshold to use selection sort instead of other algorithm when k <= threshold
   int selection_sort_k_threshold;
 
-  // The number of shards to use for distributed sort.
-  // TODO: re-visit this hard-coded value in the future. For example, compute shard number from vocab_size.
-  int top_k_shards = 32;
-
   // --- Intermediate Buffers for Top-K Algorithms ---
 
   // - Full sort - Holds top-k indices for output
@@ -110,3 +106,4 @@ void RunTopKViaDistributedSelectionSort(TopkData* data, cudaStream_t stream, con
 
 }  // namespace cuda
 }  // namespace Generators
+
