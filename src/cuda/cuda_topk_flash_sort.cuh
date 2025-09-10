@@ -13,25 +13,26 @@ namespace cuda {
 namespace cg = cooperative_groups;
 
 __host__ __device__ inline void swap_ptr(float*& a, float*& b) {
-    float* tmp = a;
-    a = b;
-    b = tmp;
+  float* tmp = a;
+  a = b;
+  b = tmp;
 }
 
 __host__ __device__ inline void swap_ptr(int*& a, int*& b) {
-    int* tmp = a;
-    a = b;
-    b = tmp;
+  int* tmp = a;
+  a = b;
+  b = tmp;
 }
 
 // A single, cooperative kernel that performs a multi-stage Top-K sort.
 // It uses cooperative groups to synchronize the entire grid between stages,
-// eliminating the high overhead of multiple kernel launches.
+// eliminating the high overhead of multiple kernel launches. This version is
+// specialized for batch_size=1.
 // K_PADDED: The compile-time constant for K, padded for efficiency.
 // kBlockSize: The number of threads per block.
 // kPartitionSize: The size of the vocabulary partition each block handles in Stage 1.
 template <int K_PADDED, int kBlockSize, int kPartitionSize>
-__global__ void FlashSortKernel(const float* __restrict__ input_scores_in,
+__global__ void FlashSortKernel(const float* __restrict__ input_scores,
                                 int* __restrict__ final_indices_out,
                                 float* __restrict__ final_scores_out,
                                 int* __restrict__ intermediate_indices_1,
@@ -51,7 +52,6 @@ __global__ void FlashSortKernel(const float* __restrict__ input_scores_in,
     __shared__ typename BlockRadixSort::TempStorage temp_storage;
 
     const int partition_start = partition_idx * kPartitionSize;
-    const float* batch_scores_in = input_scores_in;  // Assuming batch_size = 1
 
     float thread_keys[ItemsPerThread];
     int thread_values[ItemsPerThread];
@@ -60,7 +60,7 @@ __global__ void FlashSortKernel(const float* __restrict__ input_scores_in,
     for (int i = 0; i < ItemsPerThread; ++i) {
       int global_idx = partition_start + threadIdx.x + i * kBlockSize;
       if (global_idx < vocab_size) {
-        thread_keys[i] = batch_scores_in[global_idx];
+        thread_keys[i] = input_scores[global_idx];
         thread_values[i] = global_idx;
       } else {
         thread_keys[i] = -FLT_MAX;
@@ -134,61 +134,70 @@ __global__ void FlashSortKernel(const float* __restrict__ input_scores_in,
   }
 
   // --- Final Output ---
-  // Block 0 writes the final top-k results to the output buffers.
+  // Block 0 writes the final top-k results from the 'in' buffer to the final output buffers.
   if (partition_idx == 0 && threadIdx.x < k_final) {
     final_scores_out[threadIdx.x] = scores_in[threadIdx.x];
     final_indices_out[threadIdx.x] = indices_in[threadIdx.x];
   }
 }
 
+inline int SelectFlashSortPartitionSize(int vocab_size) {
+    if (vocab_size <= 65536) return 4096; // Smaller vocabularies benefit from smaller partitions
+    return 8192; // Larger vocabularies may see a benefit from larger partitions
+}
+
 // Host-side launcher for the FlashSort kernel.
 void RunTopKViaFlashSort(TopkData* data, cudaStream_t stream, const float* scores_in, int vocab_size, int batch_size, int k) {
-  // This kernel is designed for batch_size=1 and requires cooperative launch.
+  // This kernel is optimized for batch_size=1 and requires cooperative launch.
   assert(batch_size == 1);
 
   constexpr int kBlockSize = 256;
-  constexpr int kPartitionSize = 8192;
+  const int kPartitionSize = SelectFlashSortPartitionSize(vocab_size);
   const int num_partitions = CeilDiv(vocab_size, kPartitionSize);
 
   dim3 grid(num_partitions);
   dim3 block(kBlockSize);
 
-  void* kernel_args[10];
+  void* kernel_args[9];
 
   auto launch_flash_sort = [&](auto k_padded) {
     constexpr int K_PADDED = decltype(k_padded)::value;
+
+    // Correct mapping of pointers to kernel arguments.
     kernel_args[0] = (void*)&scores_in;
-    kernel_args[1] = (void*)&data->intermediate_indices_1;
-    kernel_args[2] = (void*)&data->intermediate_scores_1;
-    kernel_args[3] = (void*)&data->intermediate_indices_1;
-    kernel_args[4] = (void*)&data->intermediate_scores_1;
-    kernel_args[5] = (void*)&data->intermediate_indices_2;
-    kernel_args[6] = (void*)&data->intermediate_scores_2;
+    kernel_args[1] = (void*)&data->intermediate_indices_2;   // final_indices_out
+    kernel_args[2] = (void*)&data->intermediate_scores_2;    // final_scores_out
+    kernel_args[3] = (void*)&data->intermediate_indices_1;   // intermediate_indices_1
+    kernel_args[4] = (void*)&data->intermediate_scores_1;    // intermediate_scores_1
+    kernel_args[5] = (void*)&data->intermediate_indices_2;   // intermediate_indices_2
+    kernel_args[6] = (void*)&data->intermediate_scores_2;    // intermediate_scores_2
     kernel_args[7] = (void*)&vocab_size;
     kernel_args[8] = (void*)&k;
 
-    CUDA_CHECK(cudaLaunchCooperativeKernel((void*)FlashSortKernel<K_PADDED, kBlockSize, kPartitionSize>, grid, block, kernel_args, 0, stream));
+    switch(kPartitionSize) {
+      case 4096:
+        CUDA_CHECK(cudaLaunchCooperativeKernel((void*)FlashSortKernel<K_PADDED, kBlockSize, 4096>, grid, block, kernel_args, 0, stream));
+        break;
+      case 8192:
+        CUDA_CHECK(cudaLaunchCooperativeKernel((void*)FlashSortKernel<K_PADDED, kBlockSize, 8192>, grid, block, kernel_args, 0, stream));
+        break;
+    }
     
-    data->topk_scores = data->intermediate_scores_1.get();
-    data->topk_indices = data->intermediate_indices_1.get();
+    // The final result is now consistently in buffer 2.
+    data->topk_scores = data->intermediate_scores_2.get();
+    data->topk_indices = data->intermediate_indices_2.get();
   };
 
   // Select the best padded K value to reduce wasted work.
-  if (k == 1) {
-    launch_flash_sort(std::integral_constant<int, 1>());
-  } else if (k <= 2) {
-    launch_flash_sort(std::integral_constant<int, 2>());
-  } else if (k <= 4) {
-    launch_flash_sort(std::integral_constant<int, 4>());
-  } else if (k <= 8) {
-    launch_flash_sort(std::integral_constant<int, 16>());
-  } else if (k <= 16) {
+  if (k <= 16) {
     launch_flash_sort(std::integral_constant<int, 16>());
   } else if (k <= 32) {
     launch_flash_sort(std::integral_constant<int, 32>());
-  } else /*if (k <= 64)*/ {
+  } else if (k <= 50) {
     launch_flash_sort(std::integral_constant<int, 64>());
-  } 
+  } else {
+    launch_flash_sort(std::integral_constant<int, 64>());
+  }
 
   CUDA_CHECK_LAUNCH();
   data->topk_stride = k;
@@ -196,3 +205,4 @@ void RunTopKViaFlashSort(TopkData* data, cudaStream_t stream, const float* score
 
 }  // namespace cuda
 }  // namespace Generators
+

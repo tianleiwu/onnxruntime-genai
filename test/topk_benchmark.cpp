@@ -235,7 +235,7 @@ void RunBenchmarks(const BenchmarkParams& params, std::vector<CsvSummaryResult>&
   }
   
   // Benchmark Flash Sort
-  if (params.batch_size == 1 && params.k <= 64) {
+  if (params.k <= 64) {
     int cooperative_launch_support = 0;
     cudaDeviceGetAttribute(&cooperative_launch_support, cudaDevAttrCooperativeLaunch, 0);
     if (cooperative_launch_support) {
@@ -279,7 +279,7 @@ TEST(TopKBenchmarks, PerformanceTests) {
 
   constexpr bool is_build_pipeline = true;
   if constexpr (is_build_pipeline) {  // limited test in CI pipeline
-    std::vector<int> batch_sizes = {1};
+    std::vector<int> batch_sizes = {1, 4};
     std::vector<int> vocab_sizes = {201088};
     std::vector<int> ks = {50, 1, 2, 4, 8, 16, 32, 64};
 
