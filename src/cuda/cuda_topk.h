@@ -10,6 +10,7 @@ namespace Generators {
 namespace cuda {
 
 constexpr int kHybridSortMaxK = 256;      // The maximum k allowed for hybrid sort.
+constexpr int kFlashSortMaxK = 256;       // The maximum k allowed for flash sort.
 constexpr int kDistributedSortMaxK = 64;  // The maximum k allowed for distributed sort.
 constexpr int kMaxBenchmarkK = 64;        // The maximum k for online benchmarking.
 

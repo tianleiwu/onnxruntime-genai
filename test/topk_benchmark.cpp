@@ -235,7 +235,7 @@ void RunBenchmarks(const BenchmarkParams& params, std::vector<CsvSummaryResult>&
   }
   
   // Benchmark Flash Sort
-  if (params.k <= 64) {
+  if (params.k <= kFlashSortMaxK) {
     int cooperative_launch_support = 0;
     cudaDeviceGetAttribute(&cooperative_launch_support, cudaDevAttrCooperativeLaunch, 0);
     if (cooperative_launch_support) {

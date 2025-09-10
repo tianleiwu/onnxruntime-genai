@@ -136,7 +136,7 @@ void RunParityTests(const TopKTestParams& params) {
     });
   }
 
-  if (params.k <= 64) {
+  if (params.k <= kFlashSortMaxK) {
     int cooperative_launch_support = 0;
     cudaDeviceGetAttribute(&cooperative_launch_support, cudaDevAttrCooperativeLaunch, 0);
     if (cooperative_launch_support) {
