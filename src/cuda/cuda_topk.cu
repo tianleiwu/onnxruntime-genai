@@ -8,6 +8,7 @@
 #include "cuda_topk_full_sort.cuh"
 #include "cuda_topk_radix_sort.cuh"
 #include "cuda_topk_hybrid_sort.cuh"
+#include "cuda_topk_flash_sort.cuh"
 #include "cuda_topk_select_sort.cuh"
 #include "cuda_topk_select_sort_distributed.cuh"
 
@@ -35,7 +36,6 @@ TopkData::TopkData(int batch_size, int vocab_size, cudaStream_t stream) {
   size_t max_buffer_elements = std::max({vocab_batch_size, hybrid_sort_buffer_elements});
 
   // Allocate all necessary device memory
-  // TODO: we shall consider allocating from a pre-allocated memory pool instead of separate cudaMalloc calls.
   intermediate_indices_1 = CudaMallocArray<int>(max_buffer_elements);
   intermediate_indices_2 = CudaMallocArray<int>(max_buffer_elements);
   intermediate_scores_1 = CudaMallocArray<float>(max_buffer_elements);
@@ -51,14 +51,14 @@ TopkData::TopkData(int batch_size, int vocab_size, cudaStream_t stream) {
   top_k_distributed_lock = CudaMallocArray<int>(batch_size);
   cudaMemset(top_k_distributed_lock.get(), 0, batch_size * sizeof(int));
 
-  int device = -1;
-  CUDA_CHECK(cudaGetDevice(&device));
-  cudaDeviceProp device_prop;
-  CUDA_CHECK(cudaGetDeviceProperties(&device_prop, device));
-  top_k_shards = std::min(top_k_shards, device_prop.multiProcessorCount);
+  // The intermediate candidate buffer for distributed sort must be large enough for the
+  // worst-case number of shards that any of its kernels might launch.
+  constexpr int kDefaultMaxShards = 32;
+  constexpr int kSmallKPartitionSize = 4096;
+  const int max_shards_for_small_k = (vocab_size + kSmallKPartitionSize - 1) / kSmallKPartitionSize;
+  const int max_possible_shards = std::max(kDefaultMaxShards, max_shards_for_small_k);
 
-  // Allocate a sparse buffer for intermediate candidates: batch_size * num_shards * max_k
-  size_t dist_buffer_size = static_cast<size_t>(batch_size) * top_k_shards * kDistributedSortMaxK;
+  size_t dist_buffer_size = static_cast<size_t>(batch_size) * max_possible_shards * kDistributedSortMaxK;
   top_k_distributed_keys = CudaMallocArray<int>(dist_buffer_size);
   top_k_distributed_values = CudaMallocArray<float>(dist_buffer_size);
 }
@@ -107,6 +107,9 @@ void RunTopK(TopkData* topk_data, cudaStream_t stream, const float* scores_in, i
         return;
       case TopkAlgo::HYBRID:
         RunTopKViaHybridSort(topk_data, stream, scores_in, vocab_size, batch_size, k);
+        return;
+      case TopkAlgo::FLASH:
+        RunTopKViaFlashSort(topk_data, stream, scores_in, vocab_size, batch_size, k);
         return;
       default:
         // Fallback to heuristics if something went wrong during benchmarking.

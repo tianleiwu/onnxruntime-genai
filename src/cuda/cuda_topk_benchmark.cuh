@@ -76,6 +76,22 @@ static TopkAlgo BenchmarkAndSelectBestAlgo(TopkData* topk_data, cudaStream_t str
     }
   }
 
+  // Candidate 4: Flash Sort (Cooperative Kernel)
+  if (batch_size == 1 && k <= 64) {
+    // Check for cooperative launch support
+    int cooperative_launch_support = 0;
+    cudaDeviceGetAttribute(&cooperative_launch_support, cudaDevAttrCooperativeLaunch, 0);
+    if (cooperative_launch_support) {
+      float flash_latency = TimeKernel(stream, [&]() {
+        RunTopKViaFlashSort(topk_data, stream, scores_in, vocab_size, batch_size, k);
+      });
+      if (flash_latency < min_latency) {
+        min_latency = flash_latency;
+        best_algo = TopkAlgo::FLASH;
+      }
+    }
+  }
+
   // Cache the result for future calls to avoid re-benchmarking.
   topk_data->best_algo_cache[k] = best_algo;
   return best_algo;

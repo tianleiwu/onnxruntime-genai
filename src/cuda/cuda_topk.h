@@ -11,10 +11,10 @@ namespace cuda {
 
 constexpr int kHybridSortMaxK = 256;      // The maximum k allowed for hybrid sort.
 constexpr int kDistributedSortMaxK = 64;  // The maximum k allowed for distributed sort.
-constexpr int kMaxBenchmarkK = 32;        // The maximum k for online benchmarking.
+constexpr int kMaxBenchmarkK = 64;        // The maximum k for online benchmarking.
 
 // Enum for the different Top-K algorithms used in online benchmarking.
-enum class TopkAlgo { SELECTION, DISTRIBUTED, HYBRID, RADIX, FULL, UNKNOWN = -1 };
+enum class TopkAlgo { SELECTION, DISTRIBUTED, HYBRID, FLASH, RADIX, FULL, UNKNOWN = -1 };
 
 // This struct holds all the device memory buffers and other data required for Top-K operations.
 struct TopkData {
@@ -32,10 +32,6 @@ struct TopkData {
 
   // The estimated threshold to use selection sort instead of other algorithm when k <= threshold
   int selection_sort_k_threshold;
-
-  // The number of shards to use for distributed sort.
-  // TODO: re-visit this hard-coded value in the future. For example, compute shard number from vocab_size.
-  int top_k_shards = 32;
 
   // --- Intermediate Buffers for Top-K Algorithms ---
 
@@ -102,6 +98,9 @@ void RunTopKViaFullSort(TopkData* data, cudaStream_t stream, const float* scores
 
 // Use a hybrid multi-stage reduction: First stage uses BlockRadixSort on partitions, then followed by Bitonic sort in reductions.
 void RunTopKViaHybridSort(TopkData* data, cudaStream_t stream, const float* scores_in, int vocab_size, int batch_size, int k);
+
+// A single-kernel cooperative sort.
+void RunTopKViaFlashSort(TopkData* data, cudaStream_t stream, const float* scores_in, int vocab_size, int batch_size, int k);
 
 // Use CUB's device radix sort to perform full sort on each batch sequentially.
 void RunTopKViaRadixSort(TopkData* data, cudaStream_t stream, const float* scores_in, int vocab_size, int batch_size, int k);

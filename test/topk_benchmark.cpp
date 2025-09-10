@@ -52,6 +52,7 @@ struct CsvSummaryResult {
   float selection_sort_latency = -1.0f;
   float hybrid_sort_latency = -1.0f;
   float distributed_sort_latency = -1.0f;
+  float flash_sort_latency = -1.0f;
   float default_latency = -1.0f;
 
   std::string best_algorithm = "NA";
@@ -91,7 +92,7 @@ void PrintCsvSummary(const std::vector<CsvSummaryResult>& results) {
   std::cout << "\n--- Writing TopK Benchmark CSV Summary to " << filename << " ---\n";
 
   // Write header
-  summary_file << "batch_size,vocab_size,k,full_sort,radix_sort,selection_sort,hybrid_sort,distributed_sort,best_algorithm,best_latency,default\n";
+  summary_file << "batch_size,vocab_size,k,full_sort,radix_sort,selection_sort,hybrid_sort,distributed_sort,flash_sort,best_algorithm,best_latency,default\n";
 
   for (const auto& result : results) {
     summary_file << result.params.batch_size << ","
@@ -116,6 +117,8 @@ void PrintCsvSummary(const std::vector<CsvSummaryResult>& results) {
     print_latency(summary_file, result.hybrid_sort_latency);
     summary_file << ",";
     print_latency(summary_file, result.distributed_sort_latency);
+    summary_file << ",";
+    print_latency(summary_file, result.flash_sort_latency);
     summary_file << ",";
     summary_file << result.best_algorithm << ",";
     if (result.best_latency == std::numeric_limits<float>::max()) {
@@ -229,6 +232,21 @@ void RunBenchmarks(const BenchmarkParams& params, std::vector<CsvSummaryResult>&
     all_results.push_back({params, "DISTRIBUTED_SORT", mean_ms, stdev_ms, p95_ms});
     current_csv_result.distributed_sort_latency = mean_ms;
     algo_latencies["DISTRIBUTED_SORT"] = mean_ms;
+  }
+  
+  // Benchmark Flash Sort
+  if (params.batch_size == 1 && params.k <= 64) {
+    int cooperative_launch_support = 0;
+    cudaDeviceGetAttribute(&cooperative_launch_support, cudaDevAttrCooperativeLaunch, 0);
+    if (cooperative_launch_support) {
+        auto [mean_ms, stdev_ms, p95_ms] = bench_algo([&]() {
+        Generators::cuda::RunTopKViaFlashSort(data.get(), stream, scores_in_d.get(), params.vocab_size,
+                                                    params.batch_size, params.k);
+        });
+        all_results.push_back({params, "FLASH_SORT", mean_ms, stdev_ms, p95_ms});
+        current_csv_result.flash_sort_latency = mean_ms;
+        algo_latencies["FLASH_SORT"] = mean_ms;
+    }
   }
 
   // Find the best algorithm overall for this configuration
