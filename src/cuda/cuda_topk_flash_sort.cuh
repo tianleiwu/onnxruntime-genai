@@ -105,7 +105,7 @@ __global__ void FlashSortBs1Kernel_Fast(const float* __restrict__ input_scores,
     for (int i = threadIdx.x; i < sort_size; i += kBlockSize) {
       if (i < num_total_candidates) {
         smem_alias.reduction_storage.scores[i] = intermediate_scores_1[i];
-        smem_alias.reduction_storage.indices[i] = intermediate_scores_1[i];
+        smem_alias.reduction_storage.indices[i] = intermediate_indices_1[i];
       } else {
         smem_alias.reduction_storage.scores[i] = -FLT_MAX;
         smem_alias.reduction_storage.indices[i] = -1;
