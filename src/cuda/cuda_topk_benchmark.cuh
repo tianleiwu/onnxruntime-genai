@@ -77,7 +77,7 @@ static TopkAlgo BenchmarkAndSelectBestAlgo(TopkData* topk_data, cudaStream_t str
   }
 
   // Candidate 4: Flash Sort (Cooperative Kernel)
-  if (batch_size == 1 && k <= 64) {
+  if (k <= kFlashSortMaxK) {
     // Check for cooperative launch support
     int cooperative_launch_support = 0;
     cudaDeviceGetAttribute(&cooperative_launch_support, cudaDevAttrCooperativeLaunch, 0);
