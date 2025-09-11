@@ -13,11 +13,6 @@ namespace Generators {
 namespace cuda {
 namespace cg = cooperative_groups;
 
-// 4096 candidates use 32KB, which is safe alongside CUB's storage requirements.
-// The fast path could support vocab_size <= kMaxFlashSortCandidates * kPartitionSize / K_PADDED
-// For example, when K_PADDED is 64, kPartitionSize=8192, the fast path could support vocab_size up to 262,144
-constexpr int kMaxFlashSortCandidates = 4096;
-
 __host__ __device__ inline void swap_ptr(float*& a, float*& b) {
   float* tmp = a;
   a = b;
@@ -30,151 +25,26 @@ __host__ __device__ inline void swap_ptr(int*& a, int*& b) {
   b = tmp;
 }
 
-// Kernel for the "Fast Path": All intermediate candidates fit into one block's shared memory.
-// It uses a union to alias shared memory between the CUB radix sort and the final reduction sort.
-// A single, cooperative kernel that performs a multi-stage Top-K sort.
+// A single, cooperative kernel that performs a multi-stage Top-K sort for batch_size=1.
 // It uses cooperative groups to synchronize the entire grid between stages,
-// eliminating the high overhead of multiple kernel launches. This version is
-// specialized for batch_size=1.
+// eliminating the high overhead of multiple kernel launches.
 // K_PADDED: The compile-time constant for K, padded for efficiency.
 // kBlockSize: The number of threads per block.
 // kPartitionSize: The size of the vocabulary partition each block handles in Stage 1.
-// UseFastPath: control which reduction path is compiled.
 template <int K_PADDED, int kBlockSize, int kPartitionSize>
-__global__ void FlashSortBs1Kernel_Fast(const float* __restrict__ input_scores,
-                                        int* __restrict__ final_indices_out,
-                                        float* __restrict__ final_scores_out,
-                                        int* __restrict__ intermediate_indices_1,
-                                        float* __restrict__ intermediate_scores_1,
-                                        int vocab_size, int k_final) {
+__global__ void FlashSortBs1Kernel(const float* __restrict__ input_scores,
+                                   int* __restrict__ final_indices_out,
+                                   float* __restrict__ final_scores_out,
+                                   int* __restrict__ intermediate_indices_1,
+                                   float* __restrict__ intermediate_scores_1,
+                                   int* __restrict__ intermediate_indices_2,
+                                   float* __restrict__ intermediate_scores_2,
+                                   int vocab_size, int k_final) {
   auto grid = cg::this_grid();
   const int partition_idx = blockIdx.x;
   const int num_partitions = gridDim.x;
 
-  constexpr int ItemsPerThread = kPartitionSize / kBlockSize;
-  using BlockRadixSort = cub::BlockRadixSort<float, kBlockSize, ItemsPerThread, int>;
-
-  // This union allows CUB's TempStorage and our reduction buffer to share the same memory space,
-  // By using a union to alias shared memory between Stage 1 (CUB) and Stage 2 (reduction),
-  // we can maximize the number of candidates for the fast path without exceeding memory limits.
-  __shared__ union SharedMemoryAlias {
-    typename BlockRadixSort::TempStorage radix_storage;
-    struct {
-      float scores[kMaxFlashSortCandidates];
-      int indices[kMaxFlashSortCandidates];
-    } reduction_storage;
-  } smem_alias;
-
-  // Compile-time check to ensure the total shared memory usage is within the hardware limit.
-  static_assert(sizeof(SharedMemoryAlias) <= 49152, "FlashSortBs1Kernel_Fast: Shared memory union exceeds 48KB limit.");
-
-  // --- Stage 1: Find Top-K within each partition using CUB ---
-  {
-    const int partition_start = partition_idx * kPartitionSize;
-    float thread_keys[ItemsPerThread];
-    int thread_values[ItemsPerThread];
-
-    for (int i = 0; i < ItemsPerThread; ++i) {
-      int global_idx = partition_start + threadIdx.x + i * kBlockSize;
-      if (global_idx < vocab_size) {
-        thread_keys[i] = input_scores[global_idx];
-        thread_values[i] = global_idx;
-      } else {
-        thread_keys[i] = -FLT_MAX;
-        thread_values[i] = -1;
-      }
-    }
-
-    BlockRadixSort(smem_alias.radix_storage).SortDescendingBlockedToStriped(thread_keys, thread_values);
-
-    if (threadIdx.x < K_PADDED) {
-      size_t offset = static_cast<size_t>(partition_idx) * K_PADDED + threadIdx.x;
-      intermediate_scores_1[offset] = thread_keys[0];
-      intermediate_indices_1[offset] = thread_values[0];
-    }
-  }
-
-  grid.sync();  // Synchronize all blocks after Stage 1 is complete.
-
-  // --- Stage 2: Final Reduction in a Single Block ---
-  if (partition_idx == 0) {
-    const int num_total_candidates = num_partitions * K_PADDED;
-    int sort_size = 1;
-    while (sort_size < num_total_candidates) sort_size <<= 1;
-
-    for (int i = threadIdx.x; i < sort_size; i += kBlockSize) {
-      if (i < num_total_candidates) {
-        smem_alias.reduction_storage.scores[i] = intermediate_scores_1[i];
-        smem_alias.reduction_storage.indices[i] = intermediate_indices_1[i];
-      } else {
-        smem_alias.reduction_storage.scores[i] = -FLT_MAX;
-        smem_alias.reduction_storage.indices[i] = -1;
-      }
-    }
-    __syncthreads();
-
-    switch (sort_size) {
-      case 2:
-        bitonic::SharedMemBitonicSort_SoA<kBlockSize, 2>(smem_alias.reduction_storage.scores, smem_alias.reduction_storage.indices);
-        break;
-      case 4:
-        bitonic::SharedMemBitonicSort_SoA<kBlockSize, 4>(smem_alias.reduction_storage.scores, smem_alias.reduction_storage.indices);
-        break;
-      case 8:
-        bitonic::SharedMemBitonicSort_SoA<kBlockSize, 8>(smem_alias.reduction_storage.scores, smem_alias.reduction_storage.indices);
-        break;
-      case 16:
-        bitonic::SharedMemBitonicSort_SoA<kBlockSize, 16>(smem_alias.reduction_storage.scores, smem_alias.reduction_storage.indices);
-        break;
-      case 32:
-        bitonic::SharedMemBitonicSort_SoA<kBlockSize, 32>(smem_alias.reduction_storage.scores, smem_alias.reduction_storage.indices);
-        break;
-      case 64:
-        bitonic::SharedMemBitonicSort_SoA<kBlockSize, 64>(smem_alias.reduction_storage.scores, smem_alias.reduction_storage.indices);
-        break;
-      case 128:
-        bitonic::SharedMemBitonicSort_SoA<kBlockSize, 128>(smem_alias.reduction_storage.scores, smem_alias.reduction_storage.indices);
-        break;
-      case 256:
-        bitonic::SharedMemBitonicSort_SoA<kBlockSize, 256>(smem_alias.reduction_storage.scores, smem_alias.reduction_storage.indices);
-        break;
-      case 512:
-        bitonic::SharedMemBitonicSort_SoA<kBlockSize, 512>(smem_alias.reduction_storage.scores, smem_alias.reduction_storage.indices);
-        break;
-      case 1024:
-        bitonic::SharedMemBitonicSort_SoA<kBlockSize, 1024>(smem_alias.reduction_storage.scores, smem_alias.reduction_storage.indices);
-        break;
-      case 2048:
-        bitonic::SharedMemBitonicSort_SoA<kBlockSize, 2048>(smem_alias.reduction_storage.scores, smem_alias.reduction_storage.indices);
-        break;
-      case 4096:
-        bitonic::SharedMemBitonicSort_SoA<kBlockSize, 4096>(smem_alias.reduction_storage.scores, smem_alias.reduction_storage.indices);
-        break;
-    }
-    __syncthreads();
-
-    if (threadIdx.x < k_final) {
-      final_scores_out[threadIdx.x] = smem_alias.reduction_storage.scores[threadIdx.x];
-      final_indices_out[threadIdx.x] = smem_alias.reduction_storage.indices[threadIdx.x];
-    }
-  }
-}
-
-// Kernel for the "Slow Path": Iterative reduction for when candidates do not fit in one block.
-template <int K_PADDED, int kBlockSize, int kPartitionSize>
-__global__ void FlashSortBs1Kernel_Slow(const float* __restrict__ input_scores,
-                                        int* __restrict__ final_indices_out,
-                                        float* __restrict__ final_scores_out,
-                                        int* __restrict__ intermediate_indices_1,
-                                        float* __restrict__ intermediate_scores_1,
-                                        int* __restrict__ intermediate_indices_2,
-                                        float* __restrict__ intermediate_scores_2,
-                                        int vocab_size, int k_final) {
-  auto grid = cg::this_grid();
-  const int partition_idx = blockIdx.x;
-  const int num_partitions = gridDim.x;
-
-  // --- Stage 1: Find Top-K within each partition (same as fast path) ---
+  // --- Stage 1: Find Top-K within each partition ---
   {
     constexpr int ItemsPerThread = kPartitionSize / kBlockSize;
     using BlockRadixSort = cub::BlockRadixSort<float, kBlockSize, ItemsPerThread, int>;
@@ -248,6 +118,8 @@ __global__ void FlashSortBs1Kernel_Slow(const float* __restrict__ input_scores,
     grid.sync();
   }
 
+  // After all reductions, the final results are in the 'in' buffers, pointed to by block 0.
+  // We must copy the first k_final elements to the designated output buffers.
   if (partition_idx == 0 && threadIdx.x < k_final) {
     final_scores_out[threadIdx.x] = scores_in[threadIdx.x];
     final_indices_out[threadIdx.x] = indices_in[threadIdx.x];
@@ -303,62 +175,34 @@ void RunTopKViaFlashSort(TopkData* data, cudaStream_t stream, const float* score
     dim3 grid(num_partitions);
     dim3 block(kBlockSize);
 
-    const int num_total_candidates = num_partitions * K_PADDED;
+    void* kernel_args[9];
+    kernel_args[0] = (void*)&scores_in;
+    kernel_args[1] = (void*)&data->intermediate_indices_1;  // Final out is determined by reduction
+    kernel_args[2] = (void*)&data->intermediate_scores_1;   // Final out is determined by reduction
+    kernel_args[3] = (void*)&data->intermediate_indices_1;
+    kernel_args[4] = (void*)&data->intermediate_scores_1;
+    kernel_args[5] = (void*)&data->intermediate_indices_2;
+    kernel_args[6] = (void*)&data->intermediate_scores_2;
+    kernel_args[7] = (void*)&vocab_size;
+    kernel_args[8] = (void*)&k;
 
-    if (num_total_candidates <= kMaxFlashSortCandidates) {
-      // FAST PATH LAUNCHER
-      void* kernel_args[7];
-      kernel_args[0] = (void*)&scores_in;
-      kernel_args[1] = (void*)&data->intermediate_indices_1;  // Final indices out
-      kernel_args[2] = (void*)&data->intermediate_scores_1;   // Final scores out
-      kernel_args[3] = (void*)&data->intermediate_indices_1;  // Intermediate indices
-      kernel_args[4] = (void*)&data->intermediate_scores_1;   // Intermediate scores
-      kernel_args[5] = (void*)&vocab_size;
-      kernel_args[6] = (void*)&k;
-
-      switch (kPartitionSize) {
-        case 1024:
-          CUDA_CHECK(cudaLaunchCooperativeKernel((void*)FlashSortBs1Kernel_Fast<K_PADDED, kBlockSize, 1024>, grid, block, kernel_args, 0, stream));
-          break;
-        case 2048:
-          CUDA_CHECK(cudaLaunchCooperativeKernel((void*)FlashSortBs1Kernel_Fast<K_PADDED, kBlockSize, 2048>, grid, block, kernel_args, 0, stream));
-          break;
-        case 4096:
-          CUDA_CHECK(cudaLaunchCooperativeKernel((void*)FlashSortBs1Kernel_Fast<K_PADDED, kBlockSize, 4096>, grid, block, kernel_args, 0, stream));
-          break;
-        case 8192:
-          CUDA_CHECK(cudaLaunchCooperativeKernel((void*)FlashSortBs1Kernel_Fast<K_PADDED, kBlockSize, 8192>, grid, block, kernel_args, 0, stream));
-          break;
-      }
-    } else {
-      // SLOW PATH LAUNCHER
-      void* kernel_args[9];
-      kernel_args[0] = (void*)&scores_in;
-      kernel_args[1] = (void*)&data->intermediate_indices_1;  // Final out is determined by reduction
-      kernel_args[2] = (void*)&data->intermediate_scores_1;   // Final out is determined by reduction
-      kernel_args[3] = (void*)&data->intermediate_indices_1;
-      kernel_args[4] = (void*)&data->intermediate_scores_1;
-      kernel_args[5] = (void*)&data->intermediate_indices_2;
-      kernel_args[6] = (void*)&data->intermediate_scores_2;
-      kernel_args[7] = (void*)&vocab_size;
-      kernel_args[8] = (void*)&k;
-
-      switch (kPartitionSize) {
-        case 1024:
-          CUDA_CHECK(cudaLaunchCooperativeKernel((void*)FlashSortBs1Kernel_Slow<K_PADDED, kBlockSize, 1024>, grid, block, kernel_args, 0, stream));
-          break;
-        case 2048:
-          CUDA_CHECK(cudaLaunchCooperativeKernel((void*)FlashSortBs1Kernel_Slow<K_PADDED, kBlockSize, 2048>, grid, block, kernel_args, 0, stream));
-          break;
-        case 4096:
-          CUDA_CHECK(cudaLaunchCooperativeKernel((void*)FlashSortBs1Kernel_Slow<K_PADDED, kBlockSize, 4096>, grid, block, kernel_args, 0, stream));
-          break;
-        case 8192:
-          CUDA_CHECK(cudaLaunchCooperativeKernel((void*)FlashSortBs1Kernel_Slow<K_PADDED, kBlockSize, 8192>, grid, block, kernel_args, 0, stream));
-          break;
-      }
+    switch (kPartitionSize) {
+      case 1024:
+        CUDA_CHECK(cudaLaunchCooperativeKernel((void*)FlashSortBs1Kernel<K_PADDED, kBlockSize, 1024>, grid, block, kernel_args, 0, stream));
+        break;
+      case 2048:
+        CUDA_CHECK(cudaLaunchCooperativeKernel((void*)FlashSortBs1Kernel<K_PADDED, kBlockSize, 2048>, grid, block, kernel_args, 0, stream));
+        break;
+      case 4096:
+        CUDA_CHECK(cudaLaunchCooperativeKernel((void*)FlashSortBs1Kernel<K_PADDED, kBlockSize, 4096>, grid, block, kernel_args, 0, stream));
+        break;
+      case 8192:
+        CUDA_CHECK(cudaLaunchCooperativeKernel((void*)FlashSortBs1Kernel<K_PADDED, kBlockSize, 8192>, grid, block, kernel_args, 0, stream));
+        break;
     }
 
+    // The final result is in intermediate_indices_1 and intermediate_scores_1.
+    // The reduction logic swaps pointers, and the final write goes to these buffers.
     data->topk_scores = data->intermediate_scores_1.get();
     data->topk_indices = data->intermediate_indices_1.get();
   };
