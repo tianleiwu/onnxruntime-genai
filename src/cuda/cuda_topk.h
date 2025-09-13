@@ -131,9 +131,11 @@ void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vo
 }  // namespace hybrid_sort
 
 /**
- * @brief A high-performance, single-kernel cooperative sort algorithm specifically optimized for a batch size of one (batch_size=1).
+ * @brief A high-performance, single-kernel cooperative sort algorithm. Will fall back to hybrid_sort
+ * if the problem size is too large for a cooperative launch.
  */
 namespace flash_sort {
+bool IsSupported(int batch_size, int vocab_size, int k);
 void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vocab_size, int batch_size, int k);
 }  // namespace flash_sort
 
@@ -147,3 +149,4 @@ void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vo
 
 }  // namespace cuda
 }  // namespace Generators
+

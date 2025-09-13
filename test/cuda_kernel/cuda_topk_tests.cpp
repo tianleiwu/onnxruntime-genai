@@ -130,15 +130,11 @@ void RunParityTests(const TopKTestParams& params) {
     }
   }
 
-  if (params.batch_size == 1 && params.k <= Generators::cuda::kFlashSortMaxK) {
-    int cooperative_launch_support = 0;
-    cudaDeviceGetAttribute(&cooperative_launch_support, cudaDevAttrCooperativeLaunch, 0);
-    if (cooperative_launch_support) {
-      test_algo("FLASH_SORT", [&]() {
-        Generators::cuda::flash_sort::RunTopK(topk_data.get(), stream, scores_in_d.get(),
-                                              params.vocab_size, params.batch_size, params.k);
-      });
-    }
+  if (Generators::cuda::flash_sort::IsSupported(params.batch_size, params.vocab_size, params.k)) {
+    test_algo("FLASH_SORT", [&]() {
+      Generators::cuda::flash_sort::RunTopK(topk_data.get(), stream, scores_in_d.get(),
+                                            params.vocab_size, params.batch_size, params.k);
+    });
   }
 
   test_algo("RADIX_SORT", [&]() {
@@ -176,4 +172,3 @@ TEST(TopKTests, ParityTests) {
   }
 }
 #endif
-

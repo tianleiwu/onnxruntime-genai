@@ -221,18 +221,14 @@ void RunBenchmarks(const BenchmarkParams& params, std::vector<CsvSummaryResult>&
   }
   
   // Benchmark Flash Sort
-  if (params.batch_size == 1 && params.k <= Generators::cuda::kFlashSortMaxK) {
-    int cooperative_launch_support = 0;
-    cudaDeviceGetAttribute(&cooperative_launch_support, cudaDevAttrCooperativeLaunch, 0);
-    if (cooperative_launch_support) {
-        auto [mean_ms, stdev_ms, p95_ms] = bench_algo([&]() {
-        Generators::cuda::flash_sort::RunTopK(data.get(), stream, scores_in_d.get(), params.vocab_size,
-                                                    params.batch_size, params.k);
-        });
-        all_results.push_back({params, "FLASH_SORT", mean_ms, stdev_ms, p95_ms});
-        current_csv_result.flash_sort_latency = mean_ms;
-        algo_latencies["FLASH_SORT"] = mean_ms;
-    }
+  if (Generators::cuda::flash_sort::IsSupported(params.batch_size, params.vocab_size, params.k)) {
+    auto [mean_ms, stdev_ms, p95_ms] = bench_algo([&]() {
+      Generators::cuda::flash_sort::RunTopK(data.get(), stream, scores_in_d.get(), params.vocab_size,
+                                            params.batch_size, params.k);
+    });
+    all_results.push_back({params, "FLASH_SORT", mean_ms, stdev_ms, p95_ms});
+    current_csv_result.flash_sort_latency = mean_ms;
+    algo_latencies["FLASH_SORT"] = mean_ms;
   }
 
   // Find the best algorithm overall for this configuration

@@ -74,6 +74,7 @@ TopkData::TopkData(int batch_size, int vocab_size, cudaStream_t stream, void* bu
 
   // Get and cache the device ID once during initialization.
   CUDA_CHECK(cudaGetDevice(&device_id));
+
   // Initialize the local cache.
   local_algo_cache_.fill(TopkAlgo::UNKNOWN);
 
@@ -144,19 +145,15 @@ void RunTopK(TopkData* topk_data, cudaStream_t stream, const float* scores_in, i
     case TopkAlgo::FLASH:
       flash_sort::RunTopK(topk_data, stream, scores_in, vocab_size, batch_size, k);
       return;
+    case TopkAlgo::RADIX:
+      radix_sort::RunTopK(topk_data, stream, scores_in, vocab_size, batch_size, k);
+      return;
+    case TopkAlgo::FULL:
+      full_sort::RunTopK(topk_data, stream, scores_in, vocab_size, batch_size, k);
+      return;
     default:
       // Fallback to below algorithms if something went wrong during benchmarking.
       break;
-  }
-
-  if (batch_size == 1 && k <= kFlashSortMaxK) {
-    flash_sort::RunTopK(topk_data, stream, scores_in, vocab_size, batch_size, k);
-    return;
-  }
-
-  if (k <= kHybridSortMaxK) {
-    hybrid_sort::RunTopK(topk_data, stream, scores_in, vocab_size, batch_size, k);
-    return;
   }
 
   // For very large k, CUB-based segmented full sort or per-batch radix sort are the fallbacks.
@@ -169,4 +166,3 @@ void RunTopK(TopkData* topk_data, cudaStream_t stream, const float* scores_in, i
 
 }  // namespace cuda
 }  // namespace Generators
-
