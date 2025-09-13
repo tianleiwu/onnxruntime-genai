@@ -60,6 +60,8 @@ __global__ void FlashSortBs1Kernel(const float* __restrict__ input_scores,
     float thread_keys[ItemsPerThread];
     int thread_values[ItemsPerThread];
 
+    // This loop uses a striped loading pattern, which is already well-coalesced.
+    // Each iteration of the loop results in a single, wide memory transaction for each warp.
     for (int i = 0; i < ItemsPerThread; ++i) {
       int global_idx = partition_start + threadIdx.x + i * kBlockSize;
       if (global_idx < vocab_size) {
@@ -70,6 +72,9 @@ __global__ void FlashSortBs1Kernel(const float* __restrict__ input_scores,
         thread_values[i] = -1;
       }
     }
+    // The striped load results in what CUB considers a "blocked" arrangement of items across threads.
+    // This function sorts the data and outputs it in a "striped" arrangement, which is ideal for
+    // extracting the top K elements efficiently.
     BlockRadixSort(temp_storage).SortDescendingBlockedToStriped(thread_keys, thread_values);
 
     if (threadIdx.x < K_PADDED) {
@@ -92,8 +97,11 @@ __global__ void FlashSortBs1Kernel(const float* __restrict__ input_scores,
     int num_active_blocks = (partitions_remaining + 1) / 2;
     if (partition_idx < num_active_blocks) {
       constexpr int kSortSize = K_PADDED * 2;
-      __shared__ float smem_scores[kSortSize];
-      __shared__ int smem_indices[kSortSize];
+      // Pad smem_scores to avoid shared memory bank conflicts with smem_indices.
+      // Alignment is to ensure starting addresses are on 128-byte boundaries, optimal for new GPUs.
+      constexpr int kPadding = kSortSize / 32;
+      __shared__ __align__(128) float smem_scores[kSortSize + kPadding];
+      __shared__ __align__(128) int smem_indices[kSortSize];
       int first_child_partition = partition_idx * 2;
       int second_child_partition = first_child_partition + 1;
       int num_partitions_to_process = (second_child_partition < partitions_remaining) ? 2 : 1;
@@ -196,8 +204,11 @@ __global__ void FlashSortKernel(const float* __restrict__ input_scores,
     int num_active_blocks = (partitions_remaining + 1) / 2;
     if (partition_idx < num_active_blocks) {
       constexpr int kSortSize = K_PADDED * 2;
-      __shared__ float smem_scores[kSortSize];
-      __shared__ int smem_indices[kSortSize];
+      // Pad smem_scores to avoid shared memory bank conflicts with smem_indices.
+      // Alignment is to ensure starting addresses are on 128-byte boundaries, optimal for new GPUs.
+      constexpr int kPadding = kSortSize / 32;
+      __shared__ __align__(128) float smem_scores[kSortSize + kPadding];
+      __shared__ __align__(128) int smem_indices[kSortSize];
       int first_child_partition = partition_idx * 2;
       int second_child_partition = first_child_partition + 1;
       int num_partitions_to_process = (second_child_partition < partitions_remaining) ? 2 : 1;
@@ -435,4 +446,5 @@ bool IsSupported(int batch_size, int vocab_size, int k) {
 }  // namespace flash_sort
 }  // namespace cuda
 }  // namespace Generators
+
 
