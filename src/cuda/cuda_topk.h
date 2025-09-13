@@ -18,9 +18,9 @@ __host__ __device__ inline size_t AlignUp(size_t size, size_t alignment) {
 }
 
 constexpr int kGpuBufferAlignment = 256;
-constexpr int kHybridSortMaxK = 256;      // The maximum k allowed for hybrid sort.
-constexpr int kFlashSortMaxK = 256;       // The maximum k allowed for flash sort.
-constexpr int kMaxBenchmarkK = 64;        // The maximum k for online benchmarking.
+constexpr int kHybridSortMaxK = 256;         // The maximum k allowed for hybrid sort.
+constexpr int kFlashSortMaxK = 256;          // The maximum k allowed for flash sort.
+constexpr int kMaxBenchmarkLocalCache = 64;  // The maximum local cache of online benchmarking results.
 
 // Enum for the different Top-K algorithms used in online benchmarking.
 enum class TopkAlgo { SELECTION,
@@ -47,7 +47,7 @@ struct TopkData {
   int device_id;
 
   // A local, lock-free cache for the best algorithm for each k.
-  std::array<TopkAlgo, kMaxBenchmarkK + 1> local_algo_cache_;
+  std::array<TopkAlgo, kMaxBenchmarkLocalCache + 1> local_algo_cache_;
 
   // --- Intermediate Buffers for Top-K Algorithms (Pointers into memory_buffer_span_) ---
 
@@ -147,4 +147,3 @@ void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vo
 
 }  // namespace cuda
 }  // namespace Generators
-

@@ -117,38 +117,36 @@ void RunTopK(TopkData* topk_data, cudaStream_t stream, const float* scores_in, i
   assert(batch_size > 0);
   assert(k > 0 && k <= vocab_size);
 
-  // For small k, use online benchmarking to find the best algorithm and cache the result.
-  if (k <= kMaxBenchmarkK) {
-    // Check the local cache first for the fastest path.
-    TopkAlgo algo = topk_data->local_algo_cache_.at(k);
+  // Check the local cache first.
+  TopkAlgo algo = (k <= kMaxBenchmarkLocalCache) ? topk_data->local_algo_cache_.at(k) : TopkAlgo::UNKNOWN;
+  if (algo == TopkAlgo::UNKNOWN) {
+    // Local cache miss, check the global persistent cache.
+    algo = GetTopkBenchmarkCache(topk_data->device_id, batch_size, vocab_size, k);
 
     if (algo == TopkAlgo::UNKNOWN) {
-      // Local cache miss, check the global persistent cache.
-      algo = GetTopkBenchmarkCache(topk_data->device_id, batch_size, vocab_size, k);
+      // Global cache also miss, run benchmark.
+      algo = BenchmarkAndSelectBestAlgo(topk_data, stream, scores_in, vocab_size, batch_size, k);
+    }
 
-      if (algo == TopkAlgo::UNKNOWN) {
-        // Global cache also miss, run benchmark.
-        algo = BenchmarkAndSelectBestAlgo(topk_data, stream, scores_in, vocab_size, batch_size, k);
-      }
-
-      // Update the local cache for subsequent calls.
+    // Update the local cache for subsequent calls.
+    if (k <= kMaxBenchmarkLocalCache) {
       topk_data->local_algo_cache_[k] = algo;
     }
+  }
 
-    switch (algo) {
-      case TopkAlgo::SELECTION:
-        selection_sort::RunTopK(topk_data, stream, scores_in, vocab_size, batch_size, k);
-        return;
-      case TopkAlgo::HYBRID:
-        hybrid_sort::RunTopK(topk_data, stream, scores_in, vocab_size, batch_size, k);
-        return;
-      case TopkAlgo::FLASH:
-        flash_sort::RunTopK(topk_data, stream, scores_in, vocab_size, batch_size, k);
-        return;
-      default:
-        // Fallback to below algorithms if something went wrong during benchmarking.
-        break;
-    }
+  switch (algo) {
+    case TopkAlgo::SELECTION:
+      selection_sort::RunTopK(topk_data, stream, scores_in, vocab_size, batch_size, k);
+      return;
+    case TopkAlgo::HYBRID:
+      hybrid_sort::RunTopK(topk_data, stream, scores_in, vocab_size, batch_size, k);
+      return;
+    case TopkAlgo::FLASH:
+      flash_sort::RunTopK(topk_data, stream, scores_in, vocab_size, batch_size, k);
+      return;
+    default:
+      // Fallback to below algorithms if something went wrong during benchmarking.
+      break;
   }
 
   if (batch_size == 1 && k <= kFlashSortMaxK) {
