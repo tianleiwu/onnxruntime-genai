@@ -17,6 +17,8 @@ namespace flash_sort {
 
 namespace cg = cooperative_groups;
 
+constexpr int kReductionFactor = 4;
+
 // Utility to swap pointers, used during the reduction phase.
 __host__ __device__ inline void swap_ptr(float*& a, float*& b) {
   float* tmp = a;
@@ -50,18 +52,39 @@ __global__ void FlashSortBs1Kernel(const float* __restrict__ input_scores,
   const int partition_idx = blockIdx.x;
   const int num_partitions = gridDim.x;
 
+  constexpr int ItemsPerThread = kPartitionSize / kBlockSize;
+  using BlockRadixSort = cub::BlockRadixSort<float, kBlockSize, ItemsPerThread, int>;
+
+  // --- Shared Memory Union ---
+  // A union is used to reuse shared memory between Stage 1 and Stage 2, which
+  // are executed sequentially. This prevents exceeding shared memory limits.
+  constexpr int kSortSize = K_PADDED * kReductionFactor;
+  constexpr int kPadding = kSortSize / 32;
+
+  union SharedStorage {
+    typename BlockRadixSort::TempStorage stage1_storage;
+    struct {
+      __align__(128) float scores[kSortSize + kPadding];
+      __align__(128) int indices[kSortSize];
+    } stage2_storage;
+  };
+  __shared__ SharedStorage smem;
+
+
+  // --- Prefetching Optimization ---
+  // if (partition_idx + 1 < num_partitions) {
+  //   const int next_partition_start = (partition_idx + 1) * kPartitionSize;
+  //   if (threadIdx.x == 0) {
+  //     asm("prefetch.global.L1 [%0];" :: "l"(&input_scores[next_partition_start]));
+  //   }
+  // }
+
   // --- Stage 1: Find Top-K within each partition ---
   {
-    constexpr int ItemsPerThread = kPartitionSize / kBlockSize;
-    using BlockRadixSort = cub::BlockRadixSort<float, kBlockSize, ItemsPerThread, int>;
-    __shared__ typename BlockRadixSort::TempStorage temp_storage;
-
     const int partition_start = partition_idx * kPartitionSize;
     float thread_keys[ItemsPerThread];
     int thread_values[ItemsPerThread];
 
-    // This loop uses a striped loading pattern, which is already well-coalesced.
-    // Each iteration of the loop results in a single, wide memory transaction for each warp.
     for (int i = 0; i < ItemsPerThread; ++i) {
       int global_idx = partition_start + threadIdx.x + i * kBlockSize;
       if (global_idx < vocab_size) {
@@ -72,10 +95,7 @@ __global__ void FlashSortBs1Kernel(const float* __restrict__ input_scores,
         thread_values[i] = -1;
       }
     }
-    // The striped load results in what CUB considers a "blocked" arrangement of items across threads.
-    // This function sorts the data and outputs it in a "striped" arrangement, which is ideal for
-    // extracting the top K elements efficiently.
-    BlockRadixSort(temp_storage).SortDescendingBlockedToStriped(thread_keys, thread_values);
+    BlockRadixSort(smem.stage1_storage).SortDescendingBlockedToStriped(thread_keys, thread_values);
 
     if (threadIdx.x < K_PADDED) {
       size_t offset = static_cast<size_t>(partition_idx) * K_PADDED + threadIdx.x;
@@ -94,35 +114,30 @@ __global__ void FlashSortBs1Kernel(const float* __restrict__ input_scores,
 
   int partitions_remaining = num_partitions;
   while (partitions_remaining > 1) {
-    int num_active_blocks = (partitions_remaining + 1) / 2;
+    int num_active_blocks = (partitions_remaining + kReductionFactor - 1) / kReductionFactor;
     if (partition_idx < num_active_blocks) {
-      constexpr int kSortSize = K_PADDED * 2;
-      // Pad smem_scores to avoid shared memory bank conflicts with smem_indices.
-      // Alignment is to ensure starting addresses are on 128-byte boundaries, optimal for new GPUs.
-      constexpr int kPadding = kSortSize / 32;
-      __shared__ __align__(128) float smem_scores[kSortSize + kPadding];
-      __shared__ __align__(128) int smem_indices[kSortSize];
-      int first_child_partition = partition_idx * 2;
-      int second_child_partition = first_child_partition + 1;
-      int num_partitions_to_process = (second_child_partition < partitions_remaining) ? 2 : 1;
+      int first_child_partition = partition_idx * kReductionFactor;
+      int num_partitions_to_process = min(kReductionFactor, partitions_remaining - first_child_partition);
+      
       for (int i = threadIdx.x; i < kSortSize; i += kBlockSize) {
         if (i < K_PADDED * num_partitions_to_process) {
           int part_idx = i / K_PADDED;
           int element_idx = i % K_PADDED;
           size_t global_offset = (first_child_partition + part_idx) * K_PADDED + element_idx;
-          smem_scores[i] = scores_in[global_offset];
-          smem_indices[i] = indices_in[global_offset];
+          smem.stage2_storage.scores[i] = scores_in[global_offset];
+          smem.stage2_storage.indices[i] = indices_in[global_offset];
         } else {
-          smem_scores[i] = -FLT_MAX;
-          smem_indices[i] = -1;
+          smem.stage2_storage.scores[i] = -FLT_MAX;
+          smem.stage2_storage.indices[i] = -1;
         }
       }
       __syncthreads();
-      bitonic_sort::SharedMemBitonicSort_SoA<kBlockSize, kSortSize>(smem_scores, smem_indices);
+      bitonic_sort::SharedMemBitonicSort_SoA<kBlockSize, kSortSize>(smem.stage2_storage.scores, smem.stage2_storage.indices);
+      
       if (threadIdx.x < K_PADDED) {
         size_t out_offset = static_cast<size_t>(partition_idx) * K_PADDED + threadIdx.x;
-        scores_out[out_offset] = smem_scores[threadIdx.x];
-        indices_out[out_offset] = smem_indices[threadIdx.x];
+        scores_out[out_offset] = smem.stage2_storage.scores[threadIdx.x];
+        indices_out[out_offset] = smem.stage2_storage.indices[threadIdx.x];
       }
     }
     partitions_remaining = num_active_blocks;
@@ -156,6 +171,23 @@ __global__ void FlashSortKernel(const float* __restrict__ input_scores,
   const int partition_idx = blockIdx.x;
   const int batch_idx = blockIdx.y;
   const int num_partitions = gridDim.x;
+  
+  constexpr int ItemsPerThread = kPartitionSize / kBlockSize;
+  using BlockRadixSort = cub::BlockRadixSort<float, kBlockSize, ItemsPerThread, int>;
+
+  // --- Shared Memory Union ---
+  constexpr int kReductionFactor = 2;
+  constexpr int kSortSize = K_PADDED * kReductionFactor;
+  constexpr int kPadding = kSortSize / 32;
+
+  union SharedStorage {
+    typename BlockRadixSort::TempStorage stage1_storage;
+    struct {
+      __align__(128) float scores[kSortSize + kPadding];
+      __align__(128) int indices[kSortSize];
+    } stage2_storage;
+  };
+  __shared__ SharedStorage smem;
 
   const float* batch_input_scores = input_scores + static_cast<size_t>(batch_idx) * vocab_size;
   const size_t batch_intermediate_offset = static_cast<size_t>(batch_idx) * num_partitions * K_PADDED;
@@ -166,13 +198,16 @@ __global__ void FlashSortKernel(const float* __restrict__ input_scores,
   int* batch_final_indices_out = final_indices_out + static_cast<size_t>(batch_idx) * k_final;
   float* batch_final_scores_out = final_scores_out + static_cast<size_t>(batch_idx) * k_final;
 
-  // Stages 1, 2 and Final Output are identical to the merged version.
-  // The only difference is the use of batch-adjusted pointers.
+  // --- Prefetching Optimization ---
+  // if (partition_idx + 1 < num_partitions) {
+  //   const int next_partition_start = (partition_idx + 1) * kPartitionSize;
+  //   if (threadIdx.x == 0) {
+  //     asm("prefetch.global.L1 [%0];" :: "l"(&batch_input_scores[next_partition_start]));
+  //   }
+  // }
+
   // --- Stage 1: Find Top-K within each partition ---
   {
-    constexpr int ItemsPerThread = kPartitionSize / kBlockSize;
-    using BlockRadixSort = cub::BlockRadixSort<float, kBlockSize, ItemsPerThread, int>;
-    __shared__ typename BlockRadixSort::TempStorage temp_storage;
     const int partition_start = partition_idx * kPartitionSize;
     float thread_keys[ItemsPerThread];
     int thread_values[ItemsPerThread];
@@ -186,7 +221,7 @@ __global__ void FlashSortKernel(const float* __restrict__ input_scores,
         thread_values[i] = -1;
       }
     }
-    BlockRadixSort(temp_storage).SortDescendingBlockedToStriped(thread_keys, thread_values);
+    BlockRadixSort(smem.stage1_storage).SortDescendingBlockedToStriped(thread_keys, thread_values);
     if (threadIdx.x < K_PADDED) {
       size_t offset = static_cast<size_t>(partition_idx) * K_PADDED + threadIdx.x;
       batch_intermediate_scores_1[offset] = thread_keys[0];
@@ -201,35 +236,30 @@ __global__ void FlashSortKernel(const float* __restrict__ input_scores,
   float* scores_out = batch_intermediate_scores_2;
   int partitions_remaining = num_partitions;
   while (partitions_remaining > 1) {
-    int num_active_blocks = (partitions_remaining + 1) / 2;
+    int num_active_blocks = (partitions_remaining + kReductionFactor - 1) / kReductionFactor;
     if (partition_idx < num_active_blocks) {
-      constexpr int kSortSize = K_PADDED * 2;
-      // Pad smem_scores to avoid shared memory bank conflicts with smem_indices.
-      // Alignment is to ensure starting addresses are on 128-byte boundaries, optimal for new GPUs.
-      constexpr int kPadding = kSortSize / 32;
-      __shared__ __align__(128) float smem_scores[kSortSize + kPadding];
-      __shared__ __align__(128) int smem_indices[kSortSize];
-      int first_child_partition = partition_idx * 2;
-      int second_child_partition = first_child_partition + 1;
-      int num_partitions_to_process = (second_child_partition < partitions_remaining) ? 2 : 1;
+      int first_child_partition = partition_idx * kReductionFactor;
+      int num_partitions_to_process = min(kReductionFactor, partitions_remaining - first_child_partition);
+      
       for (int i = threadIdx.x; i < kSortSize; i += kBlockSize) {
         if (i < K_PADDED * num_partitions_to_process) {
           int part_idx = i / K_PADDED;
           int element_idx = i % K_PADDED;
           size_t global_offset = (first_child_partition + part_idx) * K_PADDED + element_idx;
-          smem_scores[i] = scores_in[global_offset];
-          smem_indices[i] = indices_in[global_offset];
+          smem.stage2_storage.scores[i] = scores_in[global_offset];
+          smem.stage2_storage.indices[i] = indices_in[global_offset];
         } else {
-          smem_scores[i] = -FLT_MAX;
-          smem_indices[i] = -1;
+          smem.stage2_storage.scores[i] = -FLT_MAX;
+          smem.stage2_storage.indices[i] = -1;
         }
       }
       __syncthreads();
-      bitonic_sort::SharedMemBitonicSort_SoA<kBlockSize, kSortSize>(smem_scores, smem_indices);
+      bitonic_sort::SharedMemBitonicSort_SoA<kBlockSize, kSortSize>(smem.stage2_storage.scores, smem.stage2_storage.indices);
+      
       if (threadIdx.x < K_PADDED) {
         size_t out_offset = static_cast<size_t>(partition_idx) * K_PADDED + threadIdx.x;
-        scores_out[out_offset] = smem_scores[threadIdx.x];
-        indices_out[out_offset] = smem_indices[threadIdx.x];
+        scores_out[out_offset] = smem.stage2_storage.scores[threadIdx.x];
+        indices_out[out_offset] = smem.stage2_storage.indices[threadIdx.x];
       }
     }
     partitions_remaining = num_active_blocks;
@@ -249,20 +279,6 @@ void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vo
   constexpr int kBlockSize = 256;
   const int partition_size = data->hybrid_sort_partition_size;
   const int num_partitions = CeilDiv(vocab_size, partition_size);
-
-  // For cooperative kernels, the total number of blocks in the grid is limited by what the device can support.
-  // This limit is typically the number of SMs multiplied by the max active blocks per SM for a given kernel.
-  // Instead of querying this at runtime (which is complex with templated kernels), we use a
-  // conservative threshold. If the required grid size exceeds this, we fall back to a
-  // non-cooperative algorithm like hybrid_sort, which is the next best for small k.
-  const int total_blocks = num_partitions * batch_size;
-  constexpr int kMaxCooperativeBlocks = 512;
-
-  if (total_blocks > kMaxCooperativeBlocks) {
-    // The grid is too large for a cooperative launch, so fall back to hybrid sort.
-    hybrid_sort::RunTopK(data, stream, scores_in, vocab_size, batch_size, k);
-    return;
-  }
 
   // Buffer 1 is the final destination for the output.
   int* final_indices_out = data->intermediate_indices_1;
@@ -417,22 +433,45 @@ bool IsSupported(int batch_size, int vocab_size, int k) {
     K_PADDED = kFlashSortMaxK;
   }
 
-  // Size of shared memory used in kernel: thread_keys, thread_values, smem_score, smem_indices
-  int shared_mem_bytes = (partition_size / kBlockSize + K_PADDED * 2) * (sizeof(float) + sizeof(int));
+  // --- Correct Shared Memory Calculation ---
+  // The kernel uses static shared memory in two sequential stages. The compiler sums their sizes.
+  // We calculate this size here to provide a runtime check against device limits,
+  // even though this is typically a compile-time constraint.
+
+  // Stage 1: CUB BlockRadixSort temp storage. Its size is opaque on the host,
+  // but we can approximate it based on its largest member, BlockExchange, which needs
+  // enough space to hold all keys in a partition.
+  const size_t stage1_smem_size = static_cast<size_t>(partition_size) * sizeof(float);
+
+  // Stage 2: Reduction buffer.
+  constexpr int kReductionFactor = 4;
+  const int sort_size = K_PADDED * kReductionFactor;
+  const int padding = sort_size / 32;
+  const size_t stage2_smem_size = (static_cast<size_t>(sort_size) + padding) * sizeof(float) + static_cast<size_t>(sort_size) * sizeof(int);
+
+  const size_t total_static_smem = std::max(stage1_smem_size, stage2_smem_size);
 
   int device;
   CUDA_CHECK(cudaGetDevice(&device));
+
+  int max_smem_per_block = 0;
+  CUDA_CHECK(cudaDeviceGetAttribute(&max_smem_per_block, cudaDevAttrMaxSharedMemoryPerBlock, device));
+  if (total_static_smem > static_cast<size_t>(max_smem_per_block)) {
+    return false;
+  }
 
   int num_sm = 0;
   CUDA_CHECK(cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, device));
 
   int max_blocks_per_sm = 0;
-  // Assume blockDim is known or passed into IsSupported
+  // The final parameter to this API is for DYNAMIC shared memory. Since this kernel uses
+  // only STATIC shared memory, this value must be 0. The static size is read by the
+  // driver directly from the kernel's function attributes.
   CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
       &max_blocks_per_sm,
       kernel,
       kBlockSize,
-      shared_mem_bytes));
+      0));  // Pass 0 for dynamic shared memory.
 
   int max_active_blocks = num_sm * max_blocks_per_sm;
 
@@ -446,5 +485,4 @@ bool IsSupported(int batch_size, int vocab_size, int k) {
 }  // namespace flash_sort
 }  // namespace cuda
 }  // namespace Generators
-
 
