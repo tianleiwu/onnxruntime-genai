@@ -16,7 +16,8 @@ namespace flash_sort {
 
 namespace cg = cooperative_groups;
 
-constexpr int kReductionFactor = 2;
+// A fixed reduction factor is used for simplicity and performance.
+constexpr int kReductionFactor = 4;
 
 // Utility to swap pointers, used during the reduction phase.
 __host__ __device__ inline void swap_ptr(float*& a, float*& b) {
@@ -39,14 +40,11 @@ __host__ __device__ inline void swap_ptr(int*& a, int*& b) {
 // indexing and pointer arithmetic, which can lead to better performance.
 template <int K_PADDED, int kBlockSize, int kPartitionSize>
 __global__ void FlashSortBs1Kernel(const float* __restrict__ input_scores,
-                                   int* __restrict__ final_indices_out,
-                                   float* __restrict__ final_scores_out,
                                    int* __restrict__ intermediate_indices_1,
                                    float* __restrict__ intermediate_scores_1,
                                    int* __restrict__ intermediate_indices_2,
                                    float* __restrict__ intermediate_scores_2,
-                                   int vocab_size,
-                                   int k_final) {
+                                   int vocab_size) {
   auto grid = cg::this_grid();
   const int partition_idx = blockIdx.x;
   const int num_partitions = gridDim.x;
@@ -98,10 +96,10 @@ __global__ void FlashSortBs1Kernel(const float* __restrict__ input_scores,
   grid.sync();
 
   // --- Stage 2: Iterative Tree Reduction ---
-  int* indices_in = intermediate_indices_1;
-  float* scores_in = intermediate_scores_1;
-  int* indices_out = intermediate_indices_2;
-  float* scores_out = intermediate_scores_2;
+  int* p_indices_in = intermediate_indices_1;
+  float* p_scores_in = intermediate_scores_1;
+  int* p_indices_out = intermediate_indices_2;
+  float* p_scores_out = intermediate_scores_2;
 
   int partitions_remaining = num_partitions;
   while (partitions_remaining > 1) {
@@ -114,9 +112,9 @@ __global__ void FlashSortBs1Kernel(const float* __restrict__ input_scores,
         if (i < K_PADDED * num_partitions_to_process) {
           int part_idx = i / K_PADDED;
           int element_idx = i % K_PADDED;
-          size_t global_offset = (first_child_partition + part_idx) * K_PADDED + element_idx;
-          smem.stage2_storage.scores[i] = scores_in[global_offset];
-          smem.stage2_storage.indices[i] = indices_in[global_offset];
+          size_t local_offset = (first_child_partition + part_idx) * K_PADDED + element_idx;
+          smem.stage2_storage.scores[i] = p_scores_in[local_offset];
+          smem.stage2_storage.indices[i] = p_indices_in[local_offset];
         } else {
           smem.stage2_storage.scores[i] = -FLT_MAX;
           smem.stage2_storage.indices[i] = -1;
@@ -127,20 +125,14 @@ __global__ void FlashSortBs1Kernel(const float* __restrict__ input_scores,
       
       if (threadIdx.x < K_PADDED) {
         size_t out_offset = static_cast<size_t>(partition_idx) * K_PADDED + threadIdx.x;
-        scores_out[out_offset] = smem.stage2_storage.scores[threadIdx.x];
-        indices_out[out_offset] = smem.stage2_storage.indices[threadIdx.x];
+        p_scores_out[out_offset] = smem.stage2_storage.scores[threadIdx.x];
+        p_indices_out[out_offset] = smem.stage2_storage.indices[threadIdx.x];
       }
     }
     partitions_remaining = num_active_blocks;
-    swap_ptr(scores_in, scores_out);
-    swap_ptr(indices_in, indices_out);
+    swap_ptr(p_scores_in, p_scores_out);
+    swap_ptr(p_indices_in, p_indices_out);
     grid.sync();
-  }
-
-  // --- Final Output ---
-  if (partition_idx == 0 && threadIdx.x < k_final) {
-    final_scores_out[threadIdx.x] = scores_in[threadIdx.x];
-    final_indices_out[threadIdx.x] = indices_in[threadIdx.x];
   }
 }
 #else
@@ -150,14 +142,11 @@ __global__ void FlashSortBs1Kernel(const float* __restrict__ input_scores,
 // --- General Kernel for Any Batch Size ---
 template <int K_PADDED, int kBlockSize, int kPartitionSize>
 __global__ void FlashSortKernel(const float* __restrict__ input_scores,
-                                int* __restrict__ final_indices_out,
-                                float* __restrict__ final_scores_out,
                                 int* __restrict__ intermediate_indices_1,
                                 float* __restrict__ intermediate_scores_1,
                                 int* __restrict__ intermediate_indices_2,
                                 float* __restrict__ intermediate_scores_2,
-                                int vocab_size,
-                                int k_final) {
+                                int vocab_size) {
   cg::grid_group grid = cg::this_grid();
   const int partition_idx = blockIdx.x;
   const int batch_idx = blockIdx.y;
@@ -167,7 +156,6 @@ __global__ void FlashSortKernel(const float* __restrict__ input_scores,
   using BlockRadixSort = cub::BlockRadixSort<float, kBlockSize, ItemsPerThread, int>;
 
   // --- Shared Memory Union ---
-  constexpr int kReductionFactor = 2;
   constexpr int kSortSize = K_PADDED * kReductionFactor;
   constexpr int kPadding = kSortSize / 32;
 
@@ -181,13 +169,9 @@ __global__ void FlashSortKernel(const float* __restrict__ input_scores,
   __shared__ SharedStorage smem;
 
   const float* batch_input_scores = input_scores + static_cast<size_t>(batch_idx) * vocab_size;
-  const size_t batch_intermediate_offset = static_cast<size_t>(batch_idx) * num_partitions * K_PADDED;
-  int* batch_intermediate_indices_1 = intermediate_indices_1 + batch_intermediate_offset;
-  float* batch_intermediate_scores_1 = intermediate_scores_1 + batch_intermediate_offset;
-  int* batch_intermediate_indices_2 = intermediate_indices_2 + batch_intermediate_offset;
-  float* batch_intermediate_scores_2 = intermediate_scores_2 + batch_intermediate_offset;
-  int* batch_final_indices_out = final_indices_out + static_cast<size_t>(batch_idx) * k_final;
-  float* batch_final_scores_out = final_scores_out + static_cast<size_t>(batch_idx) * k_final;
+  const size_t batch_intermediate_offset_stage1 = static_cast<size_t>(batch_idx) * num_partitions * K_PADDED;
+  int* batch_intermediate_indices_1 = intermediate_indices_1 + batch_intermediate_offset_stage1;
+  float* batch_intermediate_scores_1 = intermediate_scores_1 + batch_intermediate_offset_stage1;
 
   // --- Stage 1: Find Top-K within each partition ---
   {
@@ -212,15 +196,24 @@ __global__ void FlashSortKernel(const float* __restrict__ input_scores,
     }
   }
   grid.sync();
+
   // --- Stage 2: Iterative Tree Reduction ---
-  int* indices_in = batch_intermediate_indices_1;
-  float* scores_in = batch_intermediate_scores_1;
-  int* indices_out = batch_intermediate_indices_2;
-  float* scores_out = batch_intermediate_scores_2;
+  int* p_indices_in = intermediate_indices_1;
+  float* p_scores_in = intermediate_scores_1;
+  int* p_indices_out = intermediate_indices_2;
+  float* p_scores_out = intermediate_scores_2;
+
   int partitions_remaining = num_partitions;
   while (partitions_remaining > 1) {
     int num_active_blocks = (partitions_remaining + kReductionFactor - 1) / kReductionFactor;
     if (partition_idx < num_active_blocks) {
+      const size_t in_batch_offset = static_cast<size_t>(batch_idx) * partitions_remaining * K_PADDED;
+      const size_t out_batch_offset = static_cast<size_t>(batch_idx) * num_active_blocks * K_PADDED;
+      int* indices_in_batch = p_indices_in + in_batch_offset;
+      float* scores_in_batch = p_scores_in + in_batch_offset;
+      int* indices_out_batch = p_indices_out + out_batch_offset;
+      float* scores_out_batch = p_scores_out + out_batch_offset;
+
       int first_child_partition = partition_idx * kReductionFactor;
       int num_partitions_to_process = min(kReductionFactor, partitions_remaining - first_child_partition);
       
@@ -228,9 +221,9 @@ __global__ void FlashSortKernel(const float* __restrict__ input_scores,
         if (i < K_PADDED * num_partitions_to_process) {
           int part_idx = i / K_PADDED;
           int element_idx = i % K_PADDED;
-          size_t global_offset = (first_child_partition + part_idx) * K_PADDED + element_idx;
-          smem.stage2_storage.scores[i] = scores_in[global_offset];
-          smem.stage2_storage.indices[i] = indices_in[global_offset];
+          size_t local_offset = (first_child_partition + part_idx) * K_PADDED + element_idx;
+          smem.stage2_storage.scores[i] = scores_in_batch[local_offset];
+          smem.stage2_storage.indices[i] = indices_in_batch[local_offset];
         } else {
           smem.stage2_storage.scores[i] = -FLT_MAX;
           smem.stage2_storage.indices[i] = -1;
@@ -241,19 +234,14 @@ __global__ void FlashSortKernel(const float* __restrict__ input_scores,
       
       if (threadIdx.x < K_PADDED) {
         size_t out_offset = static_cast<size_t>(partition_idx) * K_PADDED + threadIdx.x;
-        scores_out[out_offset] = smem.stage2_storage.scores[threadIdx.x];
-        indices_out[out_offset] = smem.stage2_storage.indices[threadIdx.x];
+        scores_out_batch[out_offset] = smem.stage2_storage.scores[threadIdx.x];
+        indices_out_batch[out_offset] = smem.stage2_storage.indices[threadIdx.x];
       }
     }
     partitions_remaining = num_active_blocks;
-    swap_ptr(scores_in, scores_out);
-    swap_ptr(indices_in, indices_out);
+    swap_ptr(p_scores_in, p_scores_out);
+    swap_ptr(p_indices_in, p_indices_out);
     grid.sync();
-  }
-  // --- Final Output ---
-  if (partition_idx == 0 && threadIdx.x < k_final) {
-    batch_final_scores_out[threadIdx.x] = scores_in[threadIdx.x];
-    batch_final_indices_out[threadIdx.x] = indices_in[threadIdx.x];
   }
 }
 
@@ -263,32 +251,41 @@ void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vo
   const int partition_size = data->flash_sort_partition_size;
   const int num_partitions = CeilDiv(vocab_size, partition_size);
 
-  // Buffer 1 is the final destination for the output.
-  int* final_indices_out = data->intermediate_indices_1;
-  float* final_scores_out = data->intermediate_scores_1;
+  // Determine the number of reduction loops to find the final output buffer
+  int num_reduction_loops = 0;
+  if (num_partitions > 1) {
+    int partitions = num_partitions;
+    while (partitions > 1) {
+      partitions = (partitions + kReductionFactor - 1) / kReductionFactor;
+      num_reduction_loops++;
+    }
+  }
 
-  // Buffer 2 will be the FIRST intermediate buffer (for Stage 1 output).
-  int* intermediate_indices_1 = data->intermediate_indices_2;
-  float* intermediate_scores_1 = data->intermediate_scores_2;
+  // Stage 1 writes to buffer 1 (data->intermediate_..._1)
+  // After odd loops, result is in buffer 2. After even loops, result is in buffer 1.
+  if (num_reduction_loops % 2 == 1) {
+    data->topk_scores = data->intermediate_scores_2;
+    data->topk_indices = data->intermediate_indices_2;
+  } else {
+    data->topk_scores = data->intermediate_scores_1;
+    data->topk_indices = data->intermediate_indices_1;
+  }
 
-  // Buffer 1 will be the SECOND intermediate buffer (for ping-pong reduction).
-  int* intermediate_indices_2 = data->intermediate_indices_1;
-  float* intermediate_scores_2 = data->intermediate_scores_1;
+  int k_padded_val = kFlashSortMaxK;
+  if (k <= 4) k_padded_val = 4;
+  else if (k <= 8) k_padded_val = 8;
+  else if (k <= 16) k_padded_val = 16;
+  else if (k <= 32) k_padded_val = 32;
+  else if (k <= 64) k_padded_val = 64;
+  data->topk_stride = k_padded_val;
 
-  data->topk_scores = final_scores_out;
-  data->topk_indices = final_indices_out;
-  data->topk_stride = k;
-
-  void* kernel_args[9];
+  void* kernel_args[6];
   kernel_args[0] = (void*)&scores_in;
-  kernel_args[1] = (void*)&final_indices_out;
-  kernel_args[2] = (void*)&final_scores_out;
-  kernel_args[3] = (void*)&intermediate_indices_1;
-  kernel_args[4] = (void*)&intermediate_scores_1;
-  kernel_args[5] = (void*)&intermediate_indices_2;
-  kernel_args[6] = (void*)&intermediate_scores_2;
-  kernel_args[7] = (void*)&vocab_size;
-  kernel_args[8] = (void*)&k;
+  kernel_args[1] = (void*)&data->intermediate_indices_1;
+  kernel_args[2] = (void*)&data->intermediate_scores_1;
+  kernel_args[3] = (void*)&data->intermediate_indices_2;
+  kernel_args[4] = (void*)&data->intermediate_scores_2;
+  kernel_args[5] = (void*)&vocab_size;
     
   // This lambda handles selecting the kernel and launching it with the correct K_PADDED value.
   auto launch_flash_sort = [&](auto k_padded) {
