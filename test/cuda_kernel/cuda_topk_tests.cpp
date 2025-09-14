@@ -118,7 +118,7 @@ void RunParityTests(const TopKTestParams& params) {
   if (params.k <= Generators::cuda::kHybridSortMaxK) {
     test_algo("HYBRID_SORT", [&]() {
       Generators::cuda::hybrid_sort::RunTopK(topk_data.get(), stream, scores_in_d.get(),
-                                              params.vocab_size, params.batch_size, params.k);
+                                             params.vocab_size, params.batch_size, params.k);
     });
   }
 
@@ -126,6 +126,13 @@ void RunParityTests(const TopKTestParams& params) {
     test_algo("FLASH_SORT", [&]() {
       Generators::cuda::flash_sort::RunTopK(topk_data.get(), stream, scores_in_d.get(),
                                             params.vocab_size, params.batch_size, params.k);
+    });
+  }
+
+  if (Generators::cuda::llm_sort::IsSupported(params.batch_size, params.vocab_size, params.k)) {
+    test_algo("LLM_SORT", [&]() {
+      Generators::cuda::llm_sort::RunTopK(topk_data.get(), stream, scores_in_d.get(),
+                                          params.vocab_size, params.batch_size, params.k);
     });
   }
 

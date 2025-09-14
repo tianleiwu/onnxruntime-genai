@@ -110,6 +110,16 @@ static TopkAlgo BenchmarkAndSelectBestAlgo(TopkData* topk_data,
     }
   }
 
+  if (llm_sort::IsSupported(batch_size, vocab_size, k)) {
+    float llm_latency = TimeKernel(stream, [&]() {
+      llm_sort::RunTopK(topk_data, stream, scores_in, vocab_size, batch_size, k);
+    });
+    if (llm_latency < min_latency) {
+      min_latency = llm_latency;
+      best_algo = TopkAlgo::LLM;
+    }
+  }
+
   // Cache the result in the shared cache for future calls to avoid re-benchmarking.
   int device_id = topk_data->device_id;
   SetTopkBenchmarkCache(device_id, batch_size, vocab_size, k, best_algo);
