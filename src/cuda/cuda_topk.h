@@ -40,8 +40,11 @@ struct TopkData {
   // Calculates the total memory required for all buffers.
   static size_t CalculateTotalSize(int batch_size, int vocab_size, cudaStream_t stream);
 
-  // The estimated best partition size for hybrid sort.
+  // The estimated best partition size for hybrid sort
   int hybrid_sort_partition_size;
+
+  // The estimated best partition size for flash sort
+  int flash_sort_partition_size;
 
   // Caching the device_id to avoid repeated calls to cudaGetDevice
   int device_id;

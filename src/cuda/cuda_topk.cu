@@ -43,7 +43,9 @@ size_t TopkData::CalculateTotalSize(int batch_size, int vocab_size, cudaStream_t
 void TopkData::InitializeBuffers(int batch_size, int vocab_size, cudaStream_t stream) {
   uint8_t* current_ptr = memory_buffer_span_.data();
   size_t max_buffer_elements = std::max({static_cast<size_t>(vocab_size) * batch_size,
-                                         hybrid_sort::GetIntermediateSize(batch_size, vocab_size, hybrid_sort_partition_size)});
+                                         hybrid_sort::GetIntermediateSize(batch_size, vocab_size, hybrid_sort_partition_size),
+                                         flash_sort::GetIntermediateSize(batch_size, vocab_size, hybrid_sort_partition_size)
+                                        });
 
   intermediate_indices_1 = reinterpret_cast<int*>(current_ptr);
   current_ptr += AlignUp(max_buffer_elements * sizeof(int), kGpuBufferAlignment);
@@ -71,6 +73,7 @@ void TopkData::InitializeBuffers(int batch_size, int vocab_size, cudaStream_t st
 
 TopkData::TopkData(int batch_size, int vocab_size, cudaStream_t stream, void* buffer, size_t buffer_size) {
   hybrid_sort_partition_size = hybrid_sort::EstimateBestPartitionSize(vocab_size);
+  flash_sort_partition_size = flash_sort::EstimateBestPartitionSize(vocab_size);
 
   // Get and cache the device ID once during initialization.
   CUDA_CHECK(cudaGetDevice(&device_id));

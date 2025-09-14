@@ -116,18 +116,10 @@ void RunParityTests(const TopKTestParams& params) {
   });
 
   if (params.k <= Generators::cuda::kHybridSortMaxK) {
-    for (int partition_size : {1024, 2048, 4096, 8192}) {
-      if (partition_size > 1024 && partition_size > params.vocab_size * 2) {
-        continue;
-      }
-
-      topk_data->hybrid_sort_partition_size = partition_size;
-      std::string algo_name = "HYBRID (" + std::to_string(partition_size) + ")";
-      test_algo(algo_name, [&]() {
-        Generators::cuda::hybrid_sort::RunTopK(topk_data.get(), stream, scores_in_d.get(),
-                                               params.vocab_size, params.batch_size, params.k);
-      });
-    }
+    test_algo("HYBRID_SORT", [&]() {
+      Generators::cuda::hybrid_sort::RunTopK(topk_data.get(), stream, scores_in_d.get(),
+                                              params.vocab_size, params.batch_size, params.k);
+    });
   }
 
   if (Generators::cuda::flash_sort::IsSupported(params.batch_size, params.vocab_size, params.k)) {

@@ -9,7 +9,6 @@
 #include <type_traits>  // For std::integral_constant
 #include "cuda_topk.h"
 #include "cuda_topk_bitonic_sort_helper.cuh"
-#include "cuda_topk_hybrid_sort.cuh"
 
 namespace Generators {
 namespace cuda {
@@ -17,7 +16,7 @@ namespace flash_sort {
 
 namespace cg = cooperative_groups;
 
-constexpr int kReductionFactor = 4;
+constexpr int kReductionFactor = 2;
 
 // Utility to swap pointers, used during the reduction phase.
 __host__ __device__ inline void swap_ptr(float*& a, float*& b) {
@@ -70,14 +69,6 @@ __global__ void FlashSortBs1Kernel(const float* __restrict__ input_scores,
   };
   __shared__ SharedStorage smem;
 
-
-  // --- Prefetching Optimization ---
-  // if (partition_idx + 1 < num_partitions) {
-  //   const int next_partition_start = (partition_idx + 1) * kPartitionSize;
-  //   if (threadIdx.x == 0) {
-  //     asm("prefetch.global.L1 [%0];" :: "l"(&input_scores[next_partition_start]));
-  //   }
-  // }
 
   // --- Stage 1: Find Top-K within each partition ---
   {
@@ -198,14 +189,6 @@ __global__ void FlashSortKernel(const float* __restrict__ input_scores,
   int* batch_final_indices_out = final_indices_out + static_cast<size_t>(batch_idx) * k_final;
   float* batch_final_scores_out = final_scores_out + static_cast<size_t>(batch_idx) * k_final;
 
-  // --- Prefetching Optimization ---
-  // if (partition_idx + 1 < num_partitions) {
-  //   const int next_partition_start = (partition_idx + 1) * kPartitionSize;
-  //   if (threadIdx.x == 0) {
-  //     asm("prefetch.global.L1 [%0];" :: "l"(&batch_input_scores[next_partition_start]));
-  //   }
-  // }
-
   // --- Stage 1: Find Top-K within each partition ---
   {
     const int partition_start = partition_idx * kPartitionSize;
@@ -277,7 +260,7 @@ __global__ void FlashSortKernel(const float* __restrict__ input_scores,
 // --- Unified Host-Side Launcher ---
 void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vocab_size, int batch_size, int k) {
   constexpr int kBlockSize = 256;
-  const int partition_size = data->hybrid_sort_partition_size;
+  const int partition_size = data->flash_sort_partition_size;
   const int num_partitions = CeilDiv(vocab_size, partition_size);
 
   // Buffer 1 is the final destination for the output.
@@ -366,6 +349,18 @@ void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vo
   CUDA_CHECK_LAUNCH();
 }
 
+inline size_t GetIntermediateSize(int batch_size, int vocab_size, int partition_size) {
+  const int num_partitions = (vocab_size + partition_size - 1) / partition_size;
+  return static_cast<size_t>(batch_size) * num_partitions * kFlashSortMaxK;
+}
+
+inline int EstimateBestPartitionSize(int vocab_size) {
+  if (vocab_size <= 1024) return 1024;
+  if (vocab_size <= 2048) return 2048;
+  if (vocab_size <= 4096) return 4096;
+  return 8192;
+}
+
 bool IsSupported(int batch_size, int vocab_size, int k) {
   if (k > kFlashSortMaxK) {
     return false;
@@ -379,7 +374,7 @@ bool IsSupported(int batch_size, int vocab_size, int k) {
   }
 
   constexpr int kBlockSize = 256;
-  const int partition_size = hybrid_sort::EstimateBestPartitionSize(vocab_size);
+  const int partition_size = EstimateBestPartitionSize(vocab_size);
   const int num_partitions = CeilDiv(vocab_size, partition_size);
   const int total_blocks = num_partitions * batch_size;
 
@@ -412,53 +407,22 @@ bool IsSupported(int batch_size, int vocab_size, int k) {
   };
 
   void* kernel = nullptr;
-  int K_PADDED = 0;
   if (k <= 4) {
     kernel = get_kernel(std::integral_constant<int, 4>());
-    K_PADDED = 4;
   } else if (k <= 8) {
     kernel = get_kernel(std::integral_constant<int, 8>());
-    K_PADDED = 8;
   } else if (k <= 16) {
     kernel = get_kernel(std::integral_constant<int, 16>());
-    K_PADDED = 16;
   } else if (k <= 32) {
     kernel = get_kernel(std::integral_constant<int, 32>());
-    K_PADDED = 32;
   } else if (k <= 64) {
     kernel = get_kernel(std::integral_constant<int, 64>());
-    K_PADDED = 64;
   } else {
     kernel = get_kernel(std::integral_constant<int, kFlashSortMaxK>());
-    K_PADDED = kFlashSortMaxK;
   }
-
-  // --- Correct Shared Memory Calculation ---
-  // The kernel uses static shared memory in two sequential stages. The compiler sums their sizes.
-  // We calculate this size here to provide a runtime check against device limits,
-  // even though this is typically a compile-time constraint.
-
-  // Stage 1: CUB BlockRadixSort temp storage. Its size is opaque on the host,
-  // but we can approximate it based on its largest member, BlockExchange, which needs
-  // enough space to hold all keys in a partition.
-  const size_t stage1_smem_size = static_cast<size_t>(partition_size) * sizeof(float);
-
-  // Stage 2: Reduction buffer.
-  constexpr int kReductionFactor = 4;
-  const int sort_size = K_PADDED * kReductionFactor;
-  const int padding = sort_size / 32;
-  const size_t stage2_smem_size = (static_cast<size_t>(sort_size) + padding) * sizeof(float) + static_cast<size_t>(sort_size) * sizeof(int);
-
-  const size_t total_static_smem = std::max(stage1_smem_size, stage2_smem_size);
 
   int device;
   CUDA_CHECK(cudaGetDevice(&device));
-
-  int max_smem_per_block = 0;
-  CUDA_CHECK(cudaDeviceGetAttribute(&max_smem_per_block, cudaDevAttrMaxSharedMemoryPerBlock, device));
-  if (total_static_smem > static_cast<size_t>(max_smem_per_block)) {
-    return false;
-  }
 
   int num_sm = 0;
   CUDA_CHECK(cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, device));
