@@ -251,7 +251,7 @@ void RunBenchmarks(const BenchmarkParams& params, std::vector<CsvSummaryResult>&
                                           params.batch_size, params.k);
     });
     all_results.push_back({params, "LLM_SORT", mean_ms, stdev_ms, p95_ms});
-    current_csv_result.flash_sort_latency = mean_ms;
+    current_csv_result.llm_sort_latency = mean_ms;
     algo_latencies["LLM_SORT"] = mean_ms;
   }
 
@@ -285,7 +285,7 @@ TEST(TopKBenchmarks, PerformanceTests) {
   std::vector<CsvSummaryResult> csv_summary_results;
 
   constexpr bool is_build_pipeline = true;
-  if constexpr (is_build_pipeline) {  // limited test in CI pipeline
+  if constexpr (is_build_pipeline) {
     std::vector<int> batch_sizes = {1, 4};
     std::vector<int> vocab_sizes = {151936, 201088};
     std::vector<int> ks = {1, 2, 4, 8, 16, 32, 50, 64};
@@ -301,8 +301,8 @@ TEST(TopKBenchmarks, PerformanceTests) {
     for (const auto& params : test_cases) {
       RunBenchmarks(params, csv_summary_results);
     }
-  } else {  // not build pipeline
-    // Comprehensive tests to find proper threshold for selection sort vs hybrid sort for small k.
+  } else {
+    // Run comprehensive tests when it is not in CI pipeline.
     std::vector<int> batch_sizes = {1, 2, 4, 8};
     std::vector<int> vocab_sizes = {512, 1024, 2048, 4096};
     for (int v = 8 * 1024; v < 64 * 1024; v += 8 * 1024) {

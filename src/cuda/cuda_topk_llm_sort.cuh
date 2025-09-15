@@ -16,17 +16,18 @@ namespace llm_sort {
 
 namespace cg = cooperative_groups;
 
-// --- Two-Step Reduction Kernel (Batch Size = 1) ---
-// This specialized kernel is only for batch_size = 1 and a limited number of partitions (up to 64).
+// --- Two-Step Reduction Kernel ---
+// This specialized kernel is optimized for a limited number of partitions (up to 64).
 template <int K_PADDED, int kBlockSize, int kPartitionSize, int Factor1, int Factor2>
-__global__ void FlashSortTwoStepBs1Kernel(const float* __restrict__ input_scores,
-                                          int* __restrict__ intermediate_indices_1,
-                                          float* __restrict__ intermediate_scores_1,
-                                          int* __restrict__ intermediate_indices_2,
-                                          float* __restrict__ intermediate_scores_2,
-                                          int vocab_size) {
+__global__ void FlashSortTwoStepKernel(const float* __restrict__ input_scores,
+                                       int* __restrict__ intermediate_indices_1,
+                                       float* __restrict__ intermediate_scores_1,
+                                       int* __restrict__ intermediate_indices_2,
+                                       float* __restrict__ intermediate_scores_2,
+                                       int vocab_size) {
   auto grid = cg::this_grid();
   const int partition_idx = blockIdx.x;
+  const int batch_idx = blockIdx.y;
   const int num_partitions = gridDim.x;
 
   static_assert(kPartitionSize % kBlockSize == 0, "kPartitionSize must be a multiple of kBlockSize");
@@ -53,13 +54,18 @@ __global__ void FlashSortTwoStepBs1Kernel(const float* __restrict__ input_scores
 
   // --- Stage 1: Find Top-K within each partition ---
   {
+    const float* batch_input_scores = input_scores + static_cast<size_t>(batch_idx) * vocab_size;
+    const size_t batch_intermediate_offset_stage1 = static_cast<size_t>(batch_idx) * num_partitions * K_PADDED;
+    int* batch_intermediate_indices_1 = intermediate_indices_1 + batch_intermediate_offset_stage1;
+    float* batch_intermediate_scores_1 = intermediate_scores_1 + batch_intermediate_offset_stage1;
+
     const int partition_start = partition_idx * kPartitionSize;
     float thread_keys[ItemsPerThread];
     int thread_values[ItemsPerThread];
     for (int i = 0; i < ItemsPerThread; ++i) {
       int global_idx = partition_start + threadIdx.x + i * kBlockSize;
       if (global_idx < vocab_size) {
-        thread_keys[i] = input_scores[global_idx];
+        thread_keys[i] = batch_input_scores[global_idx];
         thread_values[i] = global_idx;
       } else {
         thread_keys[i] = -FLT_MAX;
@@ -69,8 +75,8 @@ __global__ void FlashSortTwoStepBs1Kernel(const float* __restrict__ input_scores
     BlockRadixSort(smem.stage1_storage).SortDescendingBlockedToStriped(thread_keys, thread_values);
     if (threadIdx.x < K_PADDED) {
       size_t offset = static_cast<size_t>(partition_idx) * K_PADDED + threadIdx.x;
-      intermediate_scores_1[offset] = thread_keys[0];
-      intermediate_indices_1[offset] = thread_values[0];
+      batch_intermediate_scores_1[offset] = thread_keys[0];
+      batch_intermediate_indices_1[offset] = thread_values[0];
     }
   }
   grid.sync();
@@ -80,12 +86,19 @@ __global__ void FlashSortTwoStepBs1Kernel(const float* __restrict__ input_scores
   if (Factor1 > 1) {
     partitions_after_step1 = CeilDiv(num_partitions, Factor1);
     if (partition_idx < partitions_after_step1) {
+      const size_t in_batch_offset = static_cast<size_t>(batch_idx) * num_partitions * K_PADDED;
+      const size_t out_batch_offset = static_cast<size_t>(batch_idx) * partitions_after_step1 * K_PADDED;
+      const int* indices_in_batch = intermediate_indices_1 + in_batch_offset;
+      const float* scores_in_batch = intermediate_scores_1 + in_batch_offset;
+      int* indices_out_batch = intermediate_indices_2 + out_batch_offset;
+      float* scores_out_batch = intermediate_scores_2 + out_batch_offset;
+
       int first_child = partition_idx * Factor1;
       int num_to_process = min(Factor1, num_partitions - first_child);
       for (int i = threadIdx.x; i < kSortSize1; i += kBlockSize) {
         if (i < K_PADDED * num_to_process) {
-          smem.step1_storage.scores[i] = intermediate_scores_1[(first_child + i / K_PADDED) * K_PADDED + (i % K_PADDED)];
-          smem.step1_storage.indices[i] = intermediate_indices_1[(first_child + i / K_PADDED) * K_PADDED + (i % K_PADDED)];
+          smem.step1_storage.scores[i] = scores_in_batch[(first_child + i / K_PADDED) * K_PADDED + (i % K_PADDED)];
+          smem.step1_storage.indices[i] = indices_in_batch[(first_child + i / K_PADDED) * K_PADDED + (i % K_PADDED)];
         } else {
           smem.step1_storage.scores[i] = -FLT_MAX;
           smem.step1_storage.indices[i] = -1;
@@ -94,8 +107,8 @@ __global__ void FlashSortTwoStepBs1Kernel(const float* __restrict__ input_scores
       __syncthreads();
       bitonic_sort::SharedMemBitonicSort_SoA<kBlockSize, kSortSize1>(smem.step1_storage.scores, smem.step1_storage.indices);
       if (threadIdx.x < K_PADDED) {
-        intermediate_scores_2[static_cast<size_t>(partition_idx) * K_PADDED + threadIdx.x] = smem.step1_storage.scores[threadIdx.x];
-        intermediate_indices_2[static_cast<size_t>(partition_idx) * K_PADDED + threadIdx.x] = smem.step1_storage.indices[threadIdx.x];
+        scores_out_batch[static_cast<size_t>(partition_idx) * K_PADDED + threadIdx.x] = smem.step1_storage.scores[threadIdx.x];
+        indices_out_batch[static_cast<size_t>(partition_idx) * K_PADDED + threadIdx.x] = smem.step1_storage.indices[threadIdx.x];
       }
     }
     grid.sync();
@@ -105,10 +118,20 @@ __global__ void FlashSortTwoStepBs1Kernel(const float* __restrict__ input_scores
   if (Factor2 > 1) {
     int partitions_after_step2 = CeilDiv(partitions_after_step1, Factor2);
     if (partition_idx < partitions_after_step2) {
+      const float* scores_in;
+      const int* indices_in;
+      if (Factor1 > 1) {
+        scores_in = intermediate_scores_2 + static_cast<size_t>(batch_idx) * partitions_after_step1 * K_PADDED;
+        indices_in = intermediate_indices_2 + static_cast<size_t>(batch_idx) * partitions_after_step1 * K_PADDED;
+      } else {
+        scores_in = intermediate_scores_1 + static_cast<size_t>(batch_idx) * num_partitions * K_PADDED;
+        indices_in = intermediate_indices_1 + static_cast<size_t>(batch_idx) * num_partitions * K_PADDED;
+      }
+      float* scores_out_batch = intermediate_scores_1 + static_cast<size_t>(batch_idx) * partitions_after_step2 * K_PADDED;
+      int* indices_out_batch = intermediate_indices_1 + static_cast<size_t>(batch_idx) * partitions_after_step2 * K_PADDED;
+
       int first_child = partition_idx * Factor2;
       int num_to_process = min(Factor2, partitions_after_step1 - first_child);
-      float* scores_in = (Factor1 > 1) ? intermediate_scores_2 : intermediate_scores_1;
-      int* indices_in = (Factor1 > 1) ? intermediate_indices_2 : intermediate_indices_1;
 
       for (int i = threadIdx.x; i < kSortSize2; i += kBlockSize) {
         if (i < K_PADDED * num_to_process) {
@@ -123,8 +146,8 @@ __global__ void FlashSortTwoStepBs1Kernel(const float* __restrict__ input_scores
       bitonic_sort::SharedMemBitonicSort_SoA<kBlockSize, kSortSize2>(smem.step2_storage.scores, smem.step2_storage.indices);
       if (threadIdx.x < K_PADDED) {
         // Final result goes to buffer 1, as it's the second step
-        intermediate_scores_1[static_cast<size_t>(partition_idx) * K_PADDED + threadIdx.x] = smem.step2_storage.scores[threadIdx.x];
-        intermediate_indices_1[static_cast<size_t>(partition_idx) * K_PADDED + threadIdx.x] = smem.step2_storage.indices[threadIdx.x];
+        scores_out_batch[static_cast<size_t>(partition_idx) * K_PADDED + threadIdx.x] = smem.step2_storage.scores[threadIdx.x];
+        indices_out_batch[static_cast<size_t>(partition_idx) * K_PADDED + threadIdx.x] = smem.step2_storage.indices[threadIdx.x];
       }
     }
   }
@@ -217,6 +240,18 @@ void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vo
     data->topk_indices = data->intermediate_indices_1;
   }
 
+  // Set the stride for the output buffers. The final result of a reduction step
+  // will have a stride of K_PADDED * num_partitions_after_reduction.
+  // We can simplify this by always using the intermediate buffers directly
+  // and setting the stride to the k_padded_val, since the final result for each batch item
+  // is compactly stored at the beginning of its segment.
+  int num_partitions_out = 1;
+  if (num_reduction_steps == 1) {
+    num_partitions_out = CeilDiv(num_partitions, factor1);
+  } else if (num_reduction_steps == 2) {
+    num_partitions_out = CeilDiv(CeilDiv(num_partitions, factor1), factor2);
+  }
+
   int k_padded_val;
   if (k <= 4)
     k_padded_val = 4;
@@ -232,7 +267,8 @@ void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vo
     k_padded_val = 64;
   else
     k_padded_val = kFlashSortMaxK;
-  data->topk_stride = k_padded_val;
+
+  data->topk_stride = k_padded_val * num_partitions_out;
 
   void* kernel_args[6];
   kernel_args[0] = (void*)&scores_in;
@@ -246,20 +282,20 @@ void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vo
     constexpr int K_PADDED = decltype(k_padded)::value;
     constexpr int F1 = decltype(f1)::value;
     constexpr int F2 = decltype(f2)::value;
-    dim3 grid(num_partitions);
+    dim3 grid(num_partitions, batch_size);
     dim3 block(kBlockSize);
     switch (partition_size) {
       case kAllowedPartitionSizes[0]:
-        CUDA_CHECK(cudaLaunchCooperativeKernel((void*)FlashSortTwoStepBs1Kernel<K_PADDED, kBlockSize, kAllowedPartitionSizes[0], F1, F2>, grid, block, kernel_args, 0, stream));
+        CUDA_CHECK(cudaLaunchCooperativeKernel((void*)FlashSortTwoStepKernel<K_PADDED, kBlockSize, kAllowedPartitionSizes[0], F1, F2>, grid, block, kernel_args, 0, stream));
         break;
       case kAllowedPartitionSizes[1]:
-        CUDA_CHECK(cudaLaunchCooperativeKernel((void*)FlashSortTwoStepBs1Kernel<K_PADDED, kBlockSize, kAllowedPartitionSizes[1], F1, F2>, grid, block, kernel_args, 0, stream));
+        CUDA_CHECK(cudaLaunchCooperativeKernel((void*)FlashSortTwoStepKernel<K_PADDED, kBlockSize, kAllowedPartitionSizes[1], F1, F2>, grid, block, kernel_args, 0, stream));
         break;
       case kAllowedPartitionSizes[2]:
-        CUDA_CHECK(cudaLaunchCooperativeKernel((void*)FlashSortTwoStepBs1Kernel<K_PADDED, kBlockSize, kAllowedPartitionSizes[2], F1, F2>, grid, block, kernel_args, 0, stream));
+        CUDA_CHECK(cudaLaunchCooperativeKernel((void*)FlashSortTwoStepKernel<K_PADDED, kBlockSize, kAllowedPartitionSizes[2], F1, F2>, grid, block, kernel_args, 0, stream));
         break;
-      case kAllowedPartitionSizes[3]:
-        CUDA_CHECK(cudaLaunchCooperativeKernel((void*)FlashSortTwoStepBs1Kernel<K_PADDED, kBlockSize, kAllowedPartitionSizes[3], F1, F2>, grid, block, kernel_args, 0, stream));
+      default:  // kAllowedPartitionSizes[3]:
+        CUDA_CHECK(cudaLaunchCooperativeKernel((void*)FlashSortTwoStepKernel<K_PADDED, kBlockSize, kAllowedPartitionSizes[3], F1, F2>, grid, block, kernel_args, 0, stream));
         break;
     }
   };
@@ -297,7 +333,7 @@ void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vo
 }
 
 bool IsSupported(int batch_size, int vocab_size, int k) {
-  if (k > kFlashSortMaxK || batch_size != 1) {
+  if (k > kFlashSortMaxK) {
     return false;
   }
   const int partition_size = EstimateBestPartitionSize(vocab_size);
@@ -311,7 +347,68 @@ bool IsSupported(int batch_size, int vocab_size, int k) {
 
   int cooperative_launch_support = 0;
   cudaDeviceGetAttribute(&cooperative_launch_support, cudaDevAttrCooperativeLaunch, 0);
-  return cooperative_launch_support == 1;
+  if (!cooperative_launch_support) {
+    return false;
+  }
+
+  constexpr int kBlockSize = 256;
+  const int total_blocks = num_partitions * batch_size;
+
+  auto get_kernel = [&](auto k_padded) {
+    constexpr int K_PADDED = decltype(k_padded)::value;
+    // Use the largest factors to get a representative kernel for occupancy check,
+    // as resource usage should be maximal or equal in this case.
+    constexpr int F1 = 8;
+    constexpr int F2 = 8;
+    switch (partition_size) {
+      case kAllowedPartitionSizes[0]:
+        return (void*)FlashSortTwoStepKernel<K_PADDED, kBlockSize, kAllowedPartitionSizes[0], F1, F2>;
+      case kAllowedPartitionSizes[1]:
+        return (void*)FlashSortTwoStepKernel<K_PADDED, kBlockSize, kAllowedPartitionSizes[1], F1, F2>;
+      case kAllowedPartitionSizes[2]:
+        return (void*)FlashSortTwoStepKernel<K_PADDED, kBlockSize, kAllowedPartitionSizes[2], F1, F2>;
+      default:  // kAllowedPartitionSizes[3]
+        return (void*)FlashSortTwoStepKernel<K_PADDED, kBlockSize, kAllowedPartitionSizes[3], F1, F2>;
+    }
+  };
+
+  void* kernel = nullptr;
+  if (k <= 4) {
+    kernel = get_kernel(std::integral_constant<int, 4>());
+  } else if (k <= 8) {
+    kernel = get_kernel(std::integral_constant<int, 8>());
+  } else if (k <= 16) {
+    kernel = get_kernel(std::integral_constant<int, 16>());
+  } else if (k <= 32) {
+    kernel = get_kernel(std::integral_constant<int, 32>());
+  } else if (k <= 56) {
+    kernel = get_kernel(std::integral_constant<int, 56>());
+  } else if (k <= 64) {
+    kernel = get_kernel(std::integral_constant<int, 64>());
+  } else {
+    kernel = get_kernel(std::integral_constant<int, kFlashSortMaxK>());
+  }
+
+  int device;
+  CUDA_CHECK(cudaGetDevice(&device));
+
+  int num_sm = 0;
+  CUDA_CHECK(cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, device));
+
+  int max_blocks_per_sm = 0;
+  CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+      &max_blocks_per_sm,
+      kernel,
+      kBlockSize,
+      0));  // Pass 0 for dynamic shared memory. This kernel uses only STATIC shared memory.
+
+  int max_active_blocks = num_sm * max_blocks_per_sm;
+
+  if (total_blocks > max_active_blocks) {
+    return false;
+  }
+
+  return true;
 }
 
 }  // namespace llm_sort

@@ -49,12 +49,11 @@ __global__ void FlashSortKernel(const float* __restrict__ input_scores,
 
   // --- Shared Memory Union ---
   constexpr int kSortSize = K_PADDED * kReductionFactor;
-  constexpr int kPadding = kSortSize / 32;
 
   union SharedStorage {
     typename BlockRadixSort::TempStorage stage1_storage;
     struct {
-      __align__(128) float scores[kSortSize + kPadding];
+      __align__(128) float scores[kSortSize];
       __align__(128) int indices[kSortSize];
     } stage2_storage;
   };
