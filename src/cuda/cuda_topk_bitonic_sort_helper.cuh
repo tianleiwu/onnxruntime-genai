@@ -9,6 +9,56 @@ namespace Generators {
 namespace cuda {
 namespace bitonic_sort {
 
+// Define a struct for the Array-of-Structs (AoS) layout.
+// This groups a score and its corresponding index together.
+struct KeyValue {
+  float score;
+  int index;
+};
+
+// AoS implementation for bitonic sort in shared memory.
+// Operates on an array of KeyValue structs.
+template <int kBlockSize, int SortSize>
+__device__ void SharedMemBitonicSort_AoS(KeyValue* smem_data) {
+  // Stage 1: Build bitonic sequences
+  for (int k = 2; k <= SortSize; k <<= 1) {
+    for (int j = k >> 1; j > 0; j >>= 1) {
+      for (int i = threadIdx.x; i < SortSize; i += kBlockSize) {
+        int ixj = i ^ j;
+        if (ixj > i) {
+          bool ascending = ((i & k) == 0);
+          KeyValue* a = &smem_data[i];
+          KeyValue* b = &smem_data[ixj];
+          bool is_greater = (a->score > b->score) || (a->score == b->score && a->index < b->index);
+          if (is_greater != ascending) {
+            KeyValue temp = *a;
+            *a = *b;
+            *b = temp;
+          }
+        }
+      }
+      __syncthreads();
+    }
+  }
+
+  // Stage 2: Final merge to sort descending
+  for (int j = SortSize >> 1; j > 0; j >>= 1) {
+    for (int i = threadIdx.x; i < SortSize; i += kBlockSize) {
+      int ixj = i ^ j;
+      if (ixj > i) {
+        KeyValue* a = &smem_data[i];
+        KeyValue* b = &smem_data[ixj];
+        if ((a->score < b->score) || (a->score == b->score && a->index > b->index)) {
+          KeyValue temp = *a;
+          *a = *b;
+          *b = temp;
+        }
+      }
+    }
+    __syncthreads();
+  }
+}
+
 // Generic implementation for bitonic sort in shared memory.
 // operating on separate score and index arrays (Struct of Arrays layout).
 template <int kBlockSize, int SortSize>

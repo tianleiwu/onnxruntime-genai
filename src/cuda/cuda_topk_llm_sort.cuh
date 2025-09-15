@@ -70,6 +70,9 @@ __global__ void LlmSortKernel(const float* __restrict__ input_scores,
   const int batch_idx = blockIdx.y;
   const int num_partitions = gridDim.x;
 
+  // Use AoS for small K, SoA for large K. Threshold of 32 is a common heuristic.
+  constexpr bool kUseAoS = (K_PADDED <= 32);
+
   static_assert(kPartitionSize % kBlockSize == 0, "kPartitionSize must be a multiple of kBlockSize");
   constexpr int ItemsPerThread = kPartitionSize / kBlockSize;
 
@@ -85,15 +88,24 @@ __global__ void LlmSortKernel(const float* __restrict__ input_scores,
     struct {
       __align__(128) float scores[kSortSize1];
       __align__(128) int indices[kSortSize1];
-    } step1_storage;
+    } step1_storage_SoA;
+    struct {
+      __align__(128) bitonic_sort::KeyValue data[kSortSize1];
+    } step1_storage_AoS;
     struct {
       __align__(128) float scores[kSortSize2];
       __align__(128) int indices[kSortSize2];
-    } step2_storage;
+    } step2_storage_SoA;
+    struct {
+      __align__(128) bitonic_sort::KeyValue data[kSortSize2];
+    } step2_storage_AoS;
     struct {
       __align__(128) float scores[kSortSize3];
       __align__(128) int indices[kSortSize3];
-    } step3_storage;
+    } step3_storage_SoA;
+    struct {
+      __align__(128) bitonic_sort::KeyValue data[kSortSize3];
+    } step3_storage_AoS;
   };
   __shared__ SharedStorage smem;
 
@@ -131,7 +143,6 @@ __global__ void LlmSortKernel(const float* __restrict__ input_scores,
   if (Factor1 > 1) {
     partitions_after_step1 = CeilDiv(num_partitions, Factor1);
     if (partition_idx < partitions_after_step1) {
-      // Reads from buffer 1, writes to buffer 2
       const float* scores_in_batch = intermediate_scores_1 + static_cast<size_t>(batch_idx) * num_partitions * K_PADDED;
       const int* indices_in_batch = intermediate_indices_1 + static_cast<size_t>(batch_idx) * num_partitions * K_PADDED;
       float* scores_out_batch = intermediate_scores_2 + static_cast<size_t>(batch_idx) * partitions_after_step1 * K_PADDED;
@@ -139,20 +150,43 @@ __global__ void LlmSortKernel(const float* __restrict__ input_scores,
 
       int first_child = partition_idx * Factor1;
       int num_to_process = min(Factor1, num_partitions - first_child);
-      for (int i = threadIdx.x; i < kSortSize1; i += kBlockSize) {
-        if (i < K_PADDED * num_to_process) {
-          smem.step1_storage.scores[i] = scores_in_batch[(first_child + i / K_PADDED) * K_PADDED + (i % K_PADDED)];
-          smem.step1_storage.indices[i] = indices_in_batch[(first_child + i / K_PADDED) * K_PADDED + (i % K_PADDED)];
-        } else {
-          smem.step1_storage.scores[i] = -FLT_MAX;
-          smem.step1_storage.indices[i] = -1;
+
+      if constexpr (kUseAoS) {
+        for (int i = threadIdx.x; i < kSortSize1; i += kBlockSize) {
+          if (i < K_PADDED * num_to_process) {
+            size_t offset = (first_child + i / K_PADDED) * K_PADDED + (i % K_PADDED);
+            smem.step1_storage_AoS.data[i].score = scores_in_batch[offset];
+            smem.step1_storage_AoS.data[i].index = indices_in_batch[offset];
+          } else {
+            smem.step1_storage_AoS.data[i].score = -FLT_MAX;
+            smem.step1_storage_AoS.data[i].index = -1;
+          }
         }
-      }
-      __syncthreads();
-      bitonic_sort::SharedMemBitonicSort_SoA<kBlockSize, kSortSize1>(smem.step1_storage.scores, smem.step1_storage.indices);
-      if (threadIdx.x < K_PADDED) {
-        scores_out_batch[static_cast<size_t>(partition_idx) * K_PADDED + threadIdx.x] = smem.step1_storage.scores[threadIdx.x];
-        indices_out_batch[static_cast<size_t>(partition_idx) * K_PADDED + threadIdx.x] = smem.step1_storage.indices[threadIdx.x];
+        __syncthreads();
+        bitonic_sort::SharedMemBitonicSort_AoS<kBlockSize, kSortSize1>(smem.step1_storage_AoS.data);
+        if (threadIdx.x < K_PADDED) {
+          size_t out_offset = static_cast<size_t>(partition_idx) * K_PADDED + threadIdx.x;
+          scores_out_batch[out_offset] = smem.step1_storage_AoS.data[threadIdx.x].score;
+          indices_out_batch[out_offset] = smem.step1_storage_AoS.data[threadIdx.x].index;
+        }
+      } else {  // Use SoA
+        for (int i = threadIdx.x; i < kSortSize1; i += kBlockSize) {
+          if (i < K_PADDED * num_to_process) {
+            size_t offset = (first_child + i / K_PADDED) * K_PADDED + (i % K_PADDED);
+            smem.step1_storage_SoA.scores[i] = scores_in_batch[offset];
+            smem.step1_storage_SoA.indices[i] = indices_in_batch[offset];
+          } else {
+            smem.step1_storage_SoA.scores[i] = -FLT_MAX;
+            smem.step1_storage_SoA.indices[i] = -1;
+          }
+        }
+        __syncthreads();
+        bitonic_sort::SharedMemBitonicSort_SoA<kBlockSize, kSortSize1>(smem.step1_storage_SoA.scores, smem.step1_storage_SoA.indices);
+        if (threadIdx.x < K_PADDED) {
+          size_t out_offset = static_cast<size_t>(partition_idx) * K_PADDED + threadIdx.x;
+          scores_out_batch[out_offset] = smem.step1_storage_SoA.scores[threadIdx.x];
+          indices_out_batch[out_offset] = smem.step1_storage_SoA.indices[threadIdx.x];
+        }
       }
     }
     grid.sync();
@@ -163,7 +197,6 @@ __global__ void LlmSortKernel(const float* __restrict__ input_scores,
   if (Factor2 > 1) {
     partitions_after_step2 = CeilDiv(partitions_after_step1, Factor2);
     if (partition_idx < partitions_after_step2) {
-      // Reads from buffer 2, writes to buffer 1
       const float* scores_in_batch = intermediate_scores_2 + static_cast<size_t>(batch_idx) * partitions_after_step1 * K_PADDED;
       const int* indices_in_batch = intermediate_indices_2 + static_cast<size_t>(batch_idx) * partitions_after_step1 * K_PADDED;
       float* scores_out_batch = intermediate_scores_1 + static_cast<size_t>(batch_idx) * partitions_after_step2 * K_PADDED;
@@ -171,20 +204,43 @@ __global__ void LlmSortKernel(const float* __restrict__ input_scores,
 
       int first_child = partition_idx * Factor2;
       int num_to_process = min(Factor2, partitions_after_step1 - first_child);
-      for (int i = threadIdx.x; i < kSortSize2; i += kBlockSize) {
-        if (i < K_PADDED * num_to_process) {
-          smem.step2_storage.scores[i] = scores_in_batch[(first_child + i / K_PADDED) * K_PADDED + (i % K_PADDED)];
-          smem.step2_storage.indices[i] = indices_in_batch[(first_child + i / K_PADDED) * K_PADDED + (i % K_PADDED)];
-        } else {
-          smem.step2_storage.scores[i] = -FLT_MAX;
-          smem.step2_storage.indices[i] = -1;
+
+      if constexpr (kUseAoS) {
+        for (int i = threadIdx.x; i < kSortSize2; i += kBlockSize) {
+          if (i < K_PADDED * num_to_process) {
+            size_t offset = (first_child + i / K_PADDED) * K_PADDED + (i % K_PADDED);
+            smem.step2_storage_AoS.data[i].score = scores_in_batch[offset];
+            smem.step2_storage_AoS.data[i].index = indices_in_batch[offset];
+          } else {
+            smem.step2_storage_AoS.data[i].score = -FLT_MAX;
+            smem.step2_storage_AoS.data[i].index = -1;
+          }
         }
-      }
-      __syncthreads();
-      bitonic_sort::SharedMemBitonicSort_SoA<kBlockSize, kSortSize2>(smem.step2_storage.scores, smem.step2_storage.indices);
-      if (threadIdx.x < K_PADDED) {
-        scores_out_batch[static_cast<size_t>(partition_idx) * K_PADDED + threadIdx.x] = smem.step2_storage.scores[threadIdx.x];
-        indices_out_batch[static_cast<size_t>(partition_idx) * K_PADDED + threadIdx.x] = smem.step2_storage.indices[threadIdx.x];
+        __syncthreads();
+        bitonic_sort::SharedMemBitonicSort_AoS<kBlockSize, kSortSize2>(smem.step2_storage_AoS.data);
+        if (threadIdx.x < K_PADDED) {
+          size_t out_offset = static_cast<size_t>(partition_idx) * K_PADDED + threadIdx.x;
+          scores_out_batch[out_offset] = smem.step2_storage_AoS.data[threadIdx.x].score;
+          indices_out_batch[out_offset] = smem.step2_storage_AoS.data[threadIdx.x].index;
+        }
+      } else {  // Use SoA
+        for (int i = threadIdx.x; i < kSortSize2; i += kBlockSize) {
+          if (i < K_PADDED * num_to_process) {
+            size_t offset = (first_child + i / K_PADDED) * K_PADDED + (i % K_PADDED);
+            smem.step2_storage_SoA.scores[i] = scores_in_batch[offset];
+            smem.step2_storage_SoA.indices[i] = indices_in_batch[offset];
+          } else {
+            smem.step2_storage_SoA.scores[i] = -FLT_MAX;
+            smem.step2_storage_SoA.indices[i] = -1;
+          }
+        }
+        __syncthreads();
+        bitonic_sort::SharedMemBitonicSort_SoA<kBlockSize, kSortSize2>(smem.step2_storage_SoA.scores, smem.step2_storage_SoA.indices);
+        if (threadIdx.x < K_PADDED) {
+          size_t out_offset = static_cast<size_t>(partition_idx) * K_PADDED + threadIdx.x;
+          scores_out_batch[out_offset] = smem.step2_storage_SoA.scores[threadIdx.x];
+          indices_out_batch[out_offset] = smem.step2_storage_SoA.indices[threadIdx.x];
+        }
       }
     }
     grid.sync();
@@ -194,7 +250,6 @@ __global__ void LlmSortKernel(const float* __restrict__ input_scores,
   if (Factor3 > 1) {
     int partitions_after_step3 = CeilDiv(partitions_after_step2, Factor3);
     if (partition_idx < partitions_after_step3) {
-      // Reads from buffer 1, writes to buffer 2
       const float* scores_in_batch = intermediate_scores_1 + static_cast<size_t>(batch_idx) * partitions_after_step2 * K_PADDED;
       const int* indices_in_batch = intermediate_indices_1 + static_cast<size_t>(batch_idx) * partitions_after_step2 * K_PADDED;
       float* scores_out_batch = intermediate_scores_2 + static_cast<size_t>(batch_idx) * partitions_after_step3 * K_PADDED;
@@ -202,20 +257,43 @@ __global__ void LlmSortKernel(const float* __restrict__ input_scores,
 
       int first_child = partition_idx * Factor3;
       int num_to_process = min(Factor3, partitions_after_step2 - first_child);
-      for (int i = threadIdx.x; i < kSortSize3; i += kBlockSize) {
-        if (i < K_PADDED * num_to_process) {
-          smem.step3_storage.scores[i] = scores_in_batch[(first_child + i / K_PADDED) * K_PADDED + (i % K_PADDED)];
-          smem.step3_storage.indices[i] = indices_in_batch[(first_child + i / K_PADDED) * K_PADDED + (i % K_PADDED)];
-        } else {
-          smem.step3_storage.scores[i] = -FLT_MAX;
-          smem.step3_storage.indices[i] = -1;
+
+      if constexpr (kUseAoS) {
+        for (int i = threadIdx.x; i < kSortSize3; i += kBlockSize) {
+          if (i < K_PADDED * num_to_process) {
+            size_t offset = (first_child + i / K_PADDED) * K_PADDED + (i % K_PADDED);
+            smem.step3_storage_AoS.data[i].score = scores_in_batch[offset];
+            smem.step3_storage_AoS.data[i].index = indices_in_batch[offset];
+          } else {
+            smem.step3_storage_AoS.data[i].score = -FLT_MAX;
+            smem.step3_storage_AoS.data[i].index = -1;
+          }
         }
-      }
-      __syncthreads();
-      bitonic_sort::SharedMemBitonicSort_SoA<kBlockSize, kSortSize3>(smem.step3_storage.scores, smem.step3_storage.indices);
-      if (threadIdx.x < K_PADDED) {
-        scores_out_batch[static_cast<size_t>(partition_idx) * K_PADDED + threadIdx.x] = smem.step3_storage.scores[threadIdx.x];
-        indices_out_batch[static_cast<size_t>(partition_idx) * K_PADDED + threadIdx.x] = smem.step3_storage.indices[threadIdx.x];
+        __syncthreads();
+        bitonic_sort::SharedMemBitonicSort_AoS<kBlockSize, kSortSize3>(smem.step3_storage_AoS.data);
+        if (threadIdx.x < K_PADDED) {
+          size_t out_offset = static_cast<size_t>(partition_idx) * K_PADDED + threadIdx.x;
+          scores_out_batch[out_offset] = smem.step3_storage_AoS.data[threadIdx.x].score;
+          indices_out_batch[out_offset] = smem.step3_storage_AoS.data[threadIdx.x].index;
+        }
+      } else {  // Use SoA
+        for (int i = threadIdx.x; i < kSortSize3; i += kBlockSize) {
+          if (i < K_PADDED * num_to_process) {
+            size_t offset = (first_child + i / K_PADDED) * K_PADDED + (i % K_PADDED);
+            smem.step3_storage_SoA.scores[i] = scores_in_batch[offset];
+            smem.step3_storage_SoA.indices[i] = indices_in_batch[offset];
+          } else {
+            smem.step3_storage_SoA.scores[i] = -FLT_MAX;
+            smem.step3_storage_SoA.indices[i] = -1;
+          }
+        }
+        __syncthreads();
+        bitonic_sort::SharedMemBitonicSort_SoA<kBlockSize, kSortSize3>(smem.step3_storage_SoA.scores, smem.step3_storage_SoA.indices);
+        if (threadIdx.x < K_PADDED) {
+          size_t out_offset = static_cast<size_t>(partition_idx) * K_PADDED + threadIdx.x;
+          scores_out_batch[out_offset] = smem.step3_storage_SoA.scores[threadIdx.x];
+          indices_out_batch[out_offset] = smem.step3_storage_SoA.indices[threadIdx.x];
+        }
       }
     }
     // No grid.sync() needed after the final step.

@@ -44,6 +44,8 @@ __global__ void FlashSortKernel(const float* __restrict__ input_scores,
   const int batch_idx = blockIdx.y;
   const int num_partitions = gridDim.x;
 
+  // Use AoS for small K, SoA for large K. Threshold of 32 is a common heuristic.
+  constexpr bool kUseAoS = (K_PADDED <= 32);
   constexpr int ItemsPerThread = kPartitionSize / kBlockSize;
   using BlockRadixSort = cub::BlockRadixSort<float, kBlockSize, ItemsPerThread, int>;
 
@@ -55,7 +57,10 @@ __global__ void FlashSortKernel(const float* __restrict__ input_scores,
     struct {
       __align__(128) float scores[kSortSize];
       __align__(128) int indices[kSortSize];
-    } stage2_storage;
+    } stage2_storage_SoA;
+    struct {
+      __align__(128) bitonic_sort::KeyValue data[kSortSize];
+    } stage2_storage_AoS;
   };
   __shared__ SharedStorage smem;
 
@@ -108,25 +113,48 @@ __global__ void FlashSortKernel(const float* __restrict__ input_scores,
       int first_child_partition = partition_idx * kReductionFactor;
       int num_partitions_to_process = min(kReductionFactor, partitions_remaining - first_child_partition);
 
-      for (int i = threadIdx.x; i < kSortSize; i += kBlockSize) {
-        if (i < K_PADDED * num_partitions_to_process) {
-          int part_idx = i / K_PADDED;
-          int element_idx = i % K_PADDED;
-          size_t local_offset = (first_child_partition + part_idx) * K_PADDED + element_idx;
-          smem.stage2_storage.scores[i] = scores_in_batch[local_offset];
-          smem.stage2_storage.indices[i] = indices_in_batch[local_offset];
-        } else {
-          smem.stage2_storage.scores[i] = -FLT_MAX;
-          smem.stage2_storage.indices[i] = -1;
+      if constexpr (kUseAoS) {
+        for (int i = threadIdx.x; i < kSortSize; i += kBlockSize) {
+          if (i < K_PADDED * num_partitions_to_process) {
+            int part_idx = i / K_PADDED;
+            int element_idx = i % K_PADDED;
+            size_t local_offset = (first_child_partition + part_idx) * K_PADDED + element_idx;
+            smem.stage2_storage_AoS.data[i].score = scores_in_batch[local_offset];
+            smem.stage2_storage_AoS.data[i].index = indices_in_batch[local_offset];
+          } else {
+            smem.stage2_storage_AoS.data[i].score = -FLT_MAX;
+            smem.stage2_storage_AoS.data[i].index = -1;
+          }
         }
-      }
-      __syncthreads();
-      bitonic_sort::SharedMemBitonicSort_SoA<kBlockSize, kSortSize>(smem.stage2_storage.scores, smem.stage2_storage.indices);
+        __syncthreads();
+        bitonic_sort::SharedMemBitonicSort_AoS<kBlockSize, kSortSize>(smem.stage2_storage_AoS.data);
 
-      if (threadIdx.x < K_PADDED) {
-        size_t out_offset = static_cast<size_t>(partition_idx) * K_PADDED + threadIdx.x;
-        scores_out_batch[out_offset] = smem.stage2_storage.scores[threadIdx.x];
-        indices_out_batch[out_offset] = smem.stage2_storage.indices[threadIdx.x];
+        if (threadIdx.x < K_PADDED) {
+          size_t out_offset = static_cast<size_t>(partition_idx) * K_PADDED + threadIdx.x;
+          scores_out_batch[out_offset] = smem.stage2_storage_AoS.data[threadIdx.x].score;
+          indices_out_batch[out_offset] = smem.stage2_storage_AoS.data[threadIdx.x].index;
+        }
+      } else {  // Use SoA
+        for (int i = threadIdx.x; i < kSortSize; i += kBlockSize) {
+          if (i < K_PADDED * num_partitions_to_process) {
+            int part_idx = i / K_PADDED;
+            int element_idx = i % K_PADDED;
+            size_t local_offset = (first_child_partition + part_idx) * K_PADDED + element_idx;
+            smem.stage2_storage_SoA.scores[i] = scores_in_batch[local_offset];
+            smem.stage2_storage_SoA.indices[i] = indices_in_batch[local_offset];
+          } else {
+            smem.stage2_storage_SoA.scores[i] = -FLT_MAX;
+            smem.stage2_storage_SoA.indices[i] = -1;
+          }
+        }
+        __syncthreads();
+        bitonic_sort::SharedMemBitonicSort_SoA<kBlockSize, kSortSize>(smem.stage2_storage_SoA.scores, smem.stage2_storage_SoA.indices);
+
+        if (threadIdx.x < K_PADDED) {
+          size_t out_offset = static_cast<size_t>(partition_idx) * K_PADDED + threadIdx.x;
+          scores_out_batch[out_offset] = smem.stage2_storage_SoA.scores[threadIdx.x];
+          indices_out_batch[out_offset] = smem.stage2_storage_SoA.indices[threadIdx.x];
+        }
       }
     }
     partitions_remaining = num_active_blocks;
