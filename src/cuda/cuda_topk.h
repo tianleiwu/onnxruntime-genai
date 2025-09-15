@@ -154,7 +154,7 @@ void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vo
 }  // namespace flash_sort
 
 /**
- * @brief A high-performance, single-kernel cooperative sort algorithm with 2-steps reduction optimized for popular LLM.
+ * @brief A high-performance, single-kernel cooperative cascaded sort algorithm optimized for popular LLM.
  */
 namespace llm_sort {
 bool IsSupported(int batch_size, int vocab_size, int k);
