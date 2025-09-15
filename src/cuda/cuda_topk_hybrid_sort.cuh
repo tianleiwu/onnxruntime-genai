@@ -145,7 +145,7 @@ void HybridSort_ReducePartitions(TopkData* data, cudaStream_t stream, int num_pa
       case 4:
         bitonic_sort::reduction::BlockReduceTopK_SoA<block_size, K, 4><<<grid_reduce, block_reduce, 0, stream>>>(input_scores, input_indices, output_scores, output_indices, current_num_partitions);
         break;
-      case 2:
+      default:
         bitonic_sort::reduction::BlockReduceTopK_SoA<block_size, K, 2><<<grid_reduce, block_reduce, 0, stream>>>(input_scores, input_indices, output_scores, output_indices, current_num_partitions);
         break;
     }
@@ -185,12 +185,9 @@ void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vo
         HybridSort_Stage1_FindPartitionsTopK<block_size, 4096, K><<<grid_stage1, block_stage1, 0, stream>>>(
             scores_in, data->intermediate_indices_1, data->intermediate_scores_1, vocab_size, num_partitions);
         break;
-      case 8192:
+      default:
         HybridSort_Stage1_FindPartitionsTopK<block_size, 8192, K><<<grid_stage1, block_stage1, 0, stream>>>(
             scores_in, data->intermediate_indices_1, data->intermediate_scores_1, vocab_size, num_partitions);
-        break;
-      default:
-        assert(false && "Unsupported partition_size");
         break;
     }
     CUDA_CHECK(cudaGetLastError());
@@ -211,8 +208,6 @@ inline int EstimateBestPartitionSize(int vocab_size) {
   if (vocab_size <= 1024) return 1024;
   if (vocab_size <= 2048) return 2048;
   if (vocab_size <= 4096) return 4096;
-  if (vocab_size <= 8192) return 8192;
-
   return 8192;
 }
 

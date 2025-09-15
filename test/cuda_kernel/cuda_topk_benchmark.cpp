@@ -287,8 +287,8 @@ TEST(TopKBenchmarks, PerformanceTests) {
   constexpr bool is_build_pipeline = true;
   if constexpr (is_build_pipeline) {  // limited test in CI pipeline
     std::vector<int> batch_sizes = {1, 4};
-    std::vector<int> vocab_sizes = {201088};
-    std::vector<int> ks = {50, 1, 2, 4, 8, 16, 32, 64};
+    std::vector<int> vocab_sizes = {151936, 201088};
+    std::vector<int> ks = {1, 2, 4, 8, 16, 32, 50, 64};
 
     std::vector<BenchmarkParams> test_cases;
     for (int batch_size : batch_sizes) {
