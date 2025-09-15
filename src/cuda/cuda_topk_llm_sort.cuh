@@ -16,15 +16,43 @@ namespace llm_sort {
 
 namespace cg = cooperative_groups;
 
-// --- Two-Step Reduction Kernel ---
-// This specialized kernel is optimized for a limited number of partitions (up to 64).
+// A helper struct to hold the reduction factors.
+struct ReductionFactors {
+  int factor1 = 1;
+  int factor2 = 1;
+  int num_reduction_steps = 0;
+};
+
+// Computes the optimal two-step reduction factors for a given number of partitions.
+constexpr ReductionFactors GetReductionFactors(int num_partitions) {
+  if (num_partitions <= 1) {
+    return {1, 1, 0};
+  }
+
+  if (num_partitions <= 8) {
+    int f1 = (num_partitions <= 2) ? 2 : ((num_partitions <= 4) ? 4 : 8);
+    return {f1, 1, 1};
+  }
+
+  // num_partitions > 8, so it's always 2 steps
+  if (num_partitions <= 16) {
+    return {4, 4, 2};
+  }
+  if (num_partitions <= 32) {
+    return {8, 4, 2};
+  }
+  // 33-64 partitions
+  return {8, 8, 2};
+}
+
+// Two-Step Reduction kernel highly optimized for LLM usage.
 template <int K_PADDED, int kBlockSize, int kPartitionSize, int Factor1, int Factor2>
-__global__ void FlashSortTwoStepKernel(const float* __restrict__ input_scores,
-                                       int* __restrict__ intermediate_indices_1,
-                                       float* __restrict__ intermediate_scores_1,
-                                       int* __restrict__ intermediate_indices_2,
-                                       float* __restrict__ intermediate_scores_2,
-                                       int vocab_size) {
+__global__ void LlmSortKernel(const float* __restrict__ input_scores,
+                              int* __restrict__ intermediate_indices_1,
+                              float* __restrict__ intermediate_scores_1,
+                              int* __restrict__ intermediate_indices_2,
+                              float* __restrict__ intermediate_scores_2,
+                              int vocab_size) {
   auto grid = cg::this_grid();
   const int partition_idx = blockIdx.x;
   const int batch_idx = blockIdx.y;
@@ -158,11 +186,12 @@ inline size_t GetIntermediateSize(int batch_size, int vocab_size, int partition_
   return static_cast<size_t>(batch_size) * num_partitions * kFlashSortMaxK;
 }
 
-// Below is to optimize parition size for common vocab_size (padded to multiple of 256) used in open source LLM:
-//   32256, 32512, 128256, 128512, 152064, 152320, 200192, 200448, 201216, 201472, 262400, 262656.
+// Parition sizes are optimized for common vocab_size (padded to multiple of 256) used in open source LLM:
+//    32256, 32512, 128256, 128512, 152064, 152320, 200192, 200448, 201216, 201472, 262400, 262656.
 // Constraints: partition_size are multiple of 256, partition_size <= 8192.
 // Goal: mimize average waste ratio to get total partitions be one of 2, 4, 8, 16, 32 and 64.
-// For example, vocab_size=201088, ideal partition size is 3142 to fit 64 partitions. The waste ratio is 1 - 3142/3328 = 0.055.
+// For example, vocab_size=201088, ideal partition size is 3142 for 64 partitions. The waste ratio is 1 - 3142/3328 = 0.055.
+// The maximum vocab_size that this kernel can support is decided by below choices (i.e. 4864 * 64 = 311296).
 constexpr std::array<int, 4> kAllowedPartitionSizes = {2048, 3328, 4352, 4864};
 
 constexpr std::array<int, 7> kTargetPartitionCounts = {1, 2, 4, 8, 16, 32, 64};
@@ -204,32 +233,10 @@ void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vo
   const int num_partitions = CeilDiv(vocab_size, partition_size);
 
   // --- Host-side lookup for reduction factors ---
-  int factor1 = 1, factor2 = 1;
-  int num_reduction_steps = 0;
-
-  if (num_partitions > 1) {
-    if (num_partitions <= 8) {
-      num_reduction_steps = 1;
-      if (num_partitions <= 2)
-        factor1 = 2;
-      else if (num_partitions <= 4)
-        factor1 = 4;
-      else
-        factor1 = 8;
-    } else {
-      num_reduction_steps = 2;
-      if (num_partitions <= 16) {
-        factor1 = 4;
-        factor2 = 4;
-      } else if (num_partitions <= 32) {  // 17-32 partitions
-        factor1 = 8;
-        factor2 = 4;
-      } else {  // 33-64 partitions
-        factor1 = 8;
-        factor2 = 8;
-      }
-    }
-  }
+  const auto factors = GetReductionFactors(num_partitions);
+  const int factor1 = factors.factor1;
+  const int factor2 = factors.factor2;
+  const int num_reduction_steps = factors.num_reduction_steps;
 
   // Determine final output buffer based on number of steps
   if (num_reduction_steps % 2 == 1) {
@@ -286,16 +293,16 @@ void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vo
     dim3 block(kBlockSize);
     switch (partition_size) {
       case kAllowedPartitionSizes[0]:
-        CUDA_CHECK(cudaLaunchCooperativeKernel((void*)FlashSortTwoStepKernel<K_PADDED, kBlockSize, kAllowedPartitionSizes[0], F1, F2>, grid, block, kernel_args, 0, stream));
+        CUDA_CHECK(cudaLaunchCooperativeKernel((void*)LlmSortKernel<K_PADDED, kBlockSize, kAllowedPartitionSizes[0], F1, F2>, grid, block, kernel_args, 0, stream));
         break;
       case kAllowedPartitionSizes[1]:
-        CUDA_CHECK(cudaLaunchCooperativeKernel((void*)FlashSortTwoStepKernel<K_PADDED, kBlockSize, kAllowedPartitionSizes[1], F1, F2>, grid, block, kernel_args, 0, stream));
+        CUDA_CHECK(cudaLaunchCooperativeKernel((void*)LlmSortKernel<K_PADDED, kBlockSize, kAllowedPartitionSizes[1], F1, F2>, grid, block, kernel_args, 0, stream));
         break;
       case kAllowedPartitionSizes[2]:
-        CUDA_CHECK(cudaLaunchCooperativeKernel((void*)FlashSortTwoStepKernel<K_PADDED, kBlockSize, kAllowedPartitionSizes[2], F1, F2>, grid, block, kernel_args, 0, stream));
+        CUDA_CHECK(cudaLaunchCooperativeKernel((void*)LlmSortKernel<K_PADDED, kBlockSize, kAllowedPartitionSizes[2], F1, F2>, grid, block, kernel_args, 0, stream));
         break;
       default:  // kAllowedPartitionSizes[3]:
-        CUDA_CHECK(cudaLaunchCooperativeKernel((void*)FlashSortTwoStepKernel<K_PADDED, kBlockSize, kAllowedPartitionSizes[3], F1, F2>, grid, block, kernel_args, 0, stream));
+        CUDA_CHECK(cudaLaunchCooperativeKernel((void*)LlmSortKernel<K_PADDED, kBlockSize, kAllowedPartitionSizes[3], F1, F2>, grid, block, kernel_args, 0, stream));
         break;
     }
   };
@@ -354,39 +361,65 @@ bool IsSupported(int batch_size, int vocab_size, int k) {
   constexpr int kBlockSize = 256;
   const int total_blocks = num_partitions * batch_size;
 
-  auto get_kernel = [&](auto k_padded) {
+  const auto factors = GetReductionFactors(num_partitions);
+  const int factor1 = factors.factor1;
+  const int factor2 = factors.factor2;
+
+  void* kernel = nullptr;
+  auto set_kernel_ptr = [&](auto k_padded, auto f1, auto f2) {
     constexpr int K_PADDED = decltype(k_padded)::value;
-    // Use the largest factors to get a representative kernel for occupancy check,
-    // as resource usage should be maximal or equal in this case.
-    constexpr int F1 = 8;
-    constexpr int F2 = 8;
+    constexpr int F1 = decltype(f1)::value;
+    constexpr int F2 = decltype(f2)::value;
     switch (partition_size) {
       case kAllowedPartitionSizes[0]:
-        return (void*)FlashSortTwoStepKernel<K_PADDED, kBlockSize, kAllowedPartitionSizes[0], F1, F2>;
+        kernel = (void*)LlmSortKernel<K_PADDED, kBlockSize, kAllowedPartitionSizes[0], F1, F2>;
+        break;
       case kAllowedPartitionSizes[1]:
-        return (void*)FlashSortTwoStepKernel<K_PADDED, kBlockSize, kAllowedPartitionSizes[1], F1, F2>;
+        kernel = (void*)LlmSortKernel<K_PADDED, kBlockSize, kAllowedPartitionSizes[1], F1, F2>;
+        break;
       case kAllowedPartitionSizes[2]:
-        return (void*)FlashSortTwoStepKernel<K_PADDED, kBlockSize, kAllowedPartitionSizes[2], F1, F2>;
+        kernel = (void*)LlmSortKernel<K_PADDED, kBlockSize, kAllowedPartitionSizes[2], F1, F2>;
+        break;
       default:  // kAllowedPartitionSizes[3]
-        return (void*)FlashSortTwoStepKernel<K_PADDED, kBlockSize, kAllowedPartitionSizes[3], F1, F2>;
+        kernel = (void*)LlmSortKernel<K_PADDED, kBlockSize, kAllowedPartitionSizes[3], F1, F2>;
+        break;
     }
   };
 
-  void* kernel = nullptr;
+  auto dispatch_f2 = [&](auto k_padded, auto f1) {
+    if (factor2 == 1)
+      set_kernel_ptr(k_padded, f1, std::integral_constant<int, 1>());
+    else if (factor2 == 4)
+      set_kernel_ptr(k_padded, f1, std::integral_constant<int, 4>());
+    else if (factor2 == 8)
+      set_kernel_ptr(k_padded, f1, std::integral_constant<int, 8>());
+  };
+
+  auto dispatch_f1 = [&](auto k_padded) {
+    if (factor1 == 1)
+      dispatch_f2(k_padded, std::integral_constant<int, 1>());
+    else if (factor1 == 2)
+      dispatch_f2(k_padded, std::integral_constant<int, 2>());
+    else if (factor1 == 4)
+      dispatch_f2(k_padded, std::integral_constant<int, 4>());
+    else if (factor1 == 8)
+      dispatch_f2(k_padded, std::integral_constant<int, 8>());
+  };
+
   if (k <= 4) {
-    kernel = get_kernel(std::integral_constant<int, 4>());
+    dispatch_f1(std::integral_constant<int, 4>());
   } else if (k <= 8) {
-    kernel = get_kernel(std::integral_constant<int, 8>());
+    dispatch_f1(std::integral_constant<int, 8>());
   } else if (k <= 16) {
-    kernel = get_kernel(std::integral_constant<int, 16>());
+    dispatch_f1(std::integral_constant<int, 16>());
   } else if (k <= 32) {
-    kernel = get_kernel(std::integral_constant<int, 32>());
+    dispatch_f1(std::integral_constant<int, 32>());
   } else if (k <= 56) {
-    kernel = get_kernel(std::integral_constant<int, 56>());
+    dispatch_f1(std::integral_constant<int, 56>());
   } else if (k <= 64) {
-    kernel = get_kernel(std::integral_constant<int, 64>());
+    dispatch_f1(std::integral_constant<int, 64>());
   } else {
-    kernel = get_kernel(std::integral_constant<int, kFlashSortMaxK>());
+    dispatch_f1(std::integral_constant<int, kFlashSortMaxK>());
   }
 
   int device;
