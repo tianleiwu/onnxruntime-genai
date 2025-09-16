@@ -9,6 +9,7 @@
 #include <type_traits>  // For std::integral_constant
 #include "cuda_topk.h"
 #include "cuda_topk_bitonic_sort_helper.cuh"
+#include "cuda_topk_common.cuh"
 
 // Bitonic sort currently requires shared memory scores has size of power of 2.
 // So we disable K=50 optimization until we pad the scores to power of 2.
@@ -75,10 +76,9 @@ __global__ void LlmSortKernel(const float* __restrict__ input_scores,
   const int batch_idx = blockIdx.y;
   const int num_partitions = gridDim.x;
 
-  static_assert(kPartitionSize % kBlockSize == 0, "kPartitionSize must be a multiple of kBlockSize");
   constexpr int ItemsPerThread = kPartitionSize / kBlockSize;
-
-  using BlockRadixSort = cub::BlockRadixSort<float, kBlockSize, ItemsPerThread, int>;
+  using BlockRadixSortScore = cub::BlockRadixSort<float, kBlockSize, ItemsPerThread, int>;
+  using BlockRadixSortIndex = cub::BlockRadixSort<unsigned int, kBlockSize, ItemsPerThread, float>;
 
   // --- Shared Memory Union ---
   constexpr int kSortSize1 = K_PADDED * Factor1;
@@ -86,7 +86,8 @@ __global__ void LlmSortKernel(const float* __restrict__ input_scores,
   constexpr int kSortSize3 = K_PADDED * Factor3;
 
   union SharedStorage {
-    typename BlockRadixSort::TempStorage stage1_storage;
+    typename BlockRadixSortScore::TempStorage stage1_storage_score;
+    typename BlockRadixSortIndex::TempStorage stage1_storage_index;
     struct {
       __align__(128) float scores[kSortSize1];
       __align__(128) int indices[kSortSize1];
@@ -103,32 +104,9 @@ __global__ void LlmSortKernel(const float* __restrict__ input_scores,
   __shared__ SharedStorage smem;
 
   // --- Stage 1: Find Top-K within each partition ---
-  {
-    const float* batch_input_scores = input_scores + static_cast<size_t>(batch_idx) * vocab_size;
-    const size_t batch_intermediate_offset_stage1 = static_cast<size_t>(batch_idx) * num_partitions * K_PADDED;
-    int* batch_intermediate_indices_1 = intermediate_indices_1 + batch_intermediate_offset_stage1;
-    float* batch_intermediate_scores_1 = intermediate_scores_1 + batch_intermediate_offset_stage1;
+  topk_common::FindPartitionTopK<kBlockSize, kPartitionSize, K_PADDED>(
+      input_scores, intermediate_indices_1, intermediate_scores_1, vocab_size, num_partitions, smem);
 
-    const int partition_start = partition_idx * kPartitionSize;
-    float thread_keys[ItemsPerThread];
-    int thread_values[ItemsPerThread];
-    for (int i = 0; i < ItemsPerThread; ++i) {
-      int global_idx = partition_start + threadIdx.x + i * kBlockSize;
-      if (global_idx < vocab_size) {
-        thread_keys[i] = batch_input_scores[global_idx];
-        thread_values[i] = global_idx;
-      } else {
-        thread_keys[i] = -FLT_MAX;
-        thread_values[i] = INT_MAX;
-      }
-    }
-    BlockRadixSort(smem.stage1_storage).SortDescendingBlockedToStriped(thread_keys, thread_values);
-    if (threadIdx.x < K_PADDED) {
-      size_t offset = static_cast<size_t>(partition_idx) * K_PADDED + threadIdx.x;
-      batch_intermediate_scores_1[offset] = thread_keys[0];
-      batch_intermediate_indices_1[offset] = thread_values[0];
-    }
-  }
   grid.sync();
 
   // --- Stage 2, Step 1: First Reduction ---
@@ -500,3 +478,4 @@ bool IsSupported(int batch_size, int vocab_size, int k) {
 }  // namespace llm_sort
 }  // namespace cuda
 }  // namespace Generators
+

@@ -31,8 +31,8 @@ __device__ void SharedMemBitonicSort_Large(float* smem_scores, int* smem_indices
     // required direction of the current sub-sequence.
     // Ascending region: swap if first element is greater.
     // Descending region: swap if first element is smaller.
-    // This simplifies to: swap if (is_i_greater == ascending).
-    if (is_i_greater == ascending) {
+    // This simplifies to: swap if (is_i_greater != ascending).
+    if (is_i_greater != ascending) {
       float temp_score = smem_scores[i];
       smem_scores[i] = smem_scores[j];
       smem_scores[j] = temp_score;
@@ -63,17 +63,16 @@ __device__ void SharedMemBitonicSort_Large(float* smem_scores, int* smem_indices
                 int partner = idx ^ stride;
 
                 if (partner > idx) {
-                    //  A standard bitonic network sorts ascending with `(idx & size) == 0`.
-                    // To sort descending, the direction must be inverted.
-                    bool ascending = ((idx & size) != 0);
+                    // A standard bitonic network sorts ascending with `(idx & size) == 0`.
+                    bool ascending = ((idx & size) == 0);
                     compareAndSwap(idx, partner, ascending);
                 }
             }
         } else {
             int partner = tid ^ stride;
             if (partner > tid) {
-                // Invert direction for descending sort.
-                bool ascending = ((tid & size) != 0);
+                // A standard bitonic network sorts ascending with `(idx & size) == 0`.
+                bool ascending = ((tid & size) == 0);
                 compareAndSwap(tid, partner, ascending);
             }
         }
@@ -125,13 +124,13 @@ __device__ void SharedMemBitonicSort_Small(float* smem_scores, int* smem_indices
                 int paired_ix = ix ^ j;
                 if (paired_ix > ix) {
                     // A standard bitonic network sorts ascending with `(ix & k) == 0`.
-                    // To sort descending, the direction must be inverted.
-                    bool ascending = ((ix & k) != 0);
+                    // The swap condition is inverted to produce a descending sort.
+                    bool ascending = ((ix & k) == 0);
 
                     bool is_ix_greater = (smem_scores[ix] > smem_scores[paired_ix]) ||
                                          (smem_scores[ix] == smem_scores[paired_ix] && smem_indices[ix] < smem_indices[paired_ix]);
 
-                    if (is_ix_greater == ascending) {
+                    if (is_ix_greater != ascending) {
                         float temp_score = smem_scores[ix];
                         smem_scores[ix] = smem_scores[paired_ix];
                         smem_scores[paired_ix] = temp_score;
@@ -172,11 +171,11 @@ __device__ void SharedMemBitonicSort_Big(float* smem_scores, int* smem_indices) 
           int idx_j = smem_indices[ixj];
 
           // A standard bitonic network sorts ascending with `(i & k) == 0`.
-          // To sort descending, the direction must be inverted.
-          bool ascending = ((i & k) != 0);
+          // The swap condition is inverted to produce a descending sort.
+          bool ascending = ((i & k) == 0);
           bool is_i_greater = (a_i > a_j) || (a_i == a_j && idx_i < idx_j);
 
-          if (is_i_greater == ascending) {
+          if (is_i_greater != ascending) {
             smem_scores[i] = a_j;
             smem_scores[ixj] = a_i;
             smem_indices[i] = idx_j;
@@ -225,11 +224,11 @@ __device__ void SharedMemBitonicSort_Pad(float* smem_scores, int* smem_indices) 
           int idx_j = smem_indices[ixj];
 
           // A standard bitonic network sorts ascending with `(i & k) == 0`.
-          // To sort descending, the direction must be inverted.
-          bool ascending = ((i & k) != 0);
+          // The swap condition is inverted to produce a descending sort.
+          bool ascending = ((i & k) == 0);
           bool is_i_greater = (a_i > a_j) || (a_i == a_j && idx_i < idx_j);
 
-          if (is_i_greater == ascending) {
+          if (is_i_greater != ascending) {
             smem_scores[i]   = a_j;
             smem_scores[ixj] = a_i;
             smem_indices[i]   = idx_j;
@@ -312,15 +311,15 @@ __global__ void BlockReduceTopK(const float* __restrict__ scores_in, const int* 
   const int block_start_partition = blockIdx.x * PartitionsPerBlock;
   const int num_partitions_to_process = min(PartitionsPerBlock, num_partitions_in - block_start_partition);
 
-  const int in_base_offset = batch_idx * num_partitions_in * K;
-  const int out_base_offset = (batch_idx * gridDim.x + blockIdx.x) * K;
+  const size_t in_base_offset = static_cast<size_t>(batch_idx) * num_partitions_in * K;
+  const size_t out_base_offset = (static_cast<size_t>(batch_idx) * gridDim.x + blockIdx.x) * K;
 
   // Load data from global memory into shared memory using an SoA layout
   for (int i = threadIdx.x; i < SortSize; i += kBlockSize) {
     if (i < K * num_partitions_to_process) {
       int partition_idx = i / K;
       int element_idx = i % K;
-      int global_offset = in_base_offset + (block_start_partition + partition_idx) * K + element_idx;
+      size_t global_offset = in_base_offset + static_cast<size_t>(block_start_partition + partition_idx) * K + element_idx;
       smem_scores[i] = scores_in[global_offset];
       smem_indices[i] = indices_in[global_offset];
     } else {

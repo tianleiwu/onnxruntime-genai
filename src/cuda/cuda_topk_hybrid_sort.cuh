@@ -7,6 +7,7 @@
 #include <cuda_runtime.h>
 #include "cuda_topk.h"
 #include "cuda_topk_bitonic_sort_helper.cuh"
+#include "cuda_topk_common.cuh"
 
 namespace Generators {
 namespace cuda {
@@ -18,43 +19,18 @@ __global__ void HybridSort_Stage1_FindPartitionsTopK(const float* __restrict__ s
                                                      int* __restrict__ intermediate_indices,
                                                      float* __restrict__ intermediate_scores,
                                                      int vocab_size, int num_partitions) {
-  static_assert(kPartitionSize % kBlockSize == 0, "kPartitionSize must be a multiple of kBlockSize");
   constexpr int ItemsPerThread = kPartitionSize / kBlockSize;
-  typedef cub::BlockRadixSort<float, kBlockSize, ItemsPerThread, int> BlockRadixSort;
-  __shared__ typename BlockRadixSort::TempStorage temp_storage;
+  using BlockRadixSortScore = cub::BlockRadixSort<float, kBlockSize, ItemsPerThread, int>;
+  using BlockRadixSortIndex = cub::BlockRadixSort<unsigned int, kBlockSize, ItemsPerThread, float>;
 
-  const int batch_idx = blockIdx.y;
-  const int partition_idx = blockIdx.x;
-  const int partition_start = partition_idx * kPartitionSize;
-  const float* batch_scores_in = scores_in + static_cast<size_t>(batch_idx) * vocab_size;
+  union SharedStorage {
+    typename BlockRadixSortScore::TempStorage stage1_storage_score;
+    typename BlockRadixSortIndex::TempStorage stage1_storage_index;
+  };
+  __shared__ SharedStorage smem;
 
-  float thread_keys[ItemsPerThread];
-  int thread_values[ItemsPerThread];
-
-  // Coalesced load from global memory. The boundary check handles both the standard
-  // case and the "on-the-fly" padding for the Flash version, where some threads
-  // in the final partition will deliberately read out of bounds of the original
-  // vocab_size and generate a sentinel value instead.
-  for (int i = 0; i < ItemsPerThread; ++i) {
-    int global_idx = partition_start + threadIdx.x + i * kBlockSize;
-    if (global_idx < vocab_size) {
-      thread_keys[i] = batch_scores_in[global_idx];
-      thread_values[i] = global_idx;
-    } else {
-      thread_keys[i] = -FLT_MAX;
-      thread_values[i] = INT_MAX;
-    }
-  }
-
-  // Sort the keys and values held in registers across the entire block.
-  BlockRadixSort(temp_storage).SortDescendingBlockedToStriped(thread_keys, thread_values);
-
-  // The first K threads now hold the top K elements for this partition. Write them out.
-  if (threadIdx.x < K) {
-    size_t offset = (static_cast<size_t>(batch_idx) * num_partitions + partition_idx) * K;
-    intermediate_scores[offset + threadIdx.x] = thread_keys[0];
-    intermediate_indices[offset + threadIdx.x] = thread_values[0];
-  }
+  topk_common::FindPartitionTopK<kBlockSize, kPartitionSize, K>(
+      scores_in, intermediate_indices, intermediate_scores, vocab_size, num_partitions, smem);
 }
 
 // Helper to calculate the size of intermediate buffers needed by hybrid sort.
@@ -186,10 +162,10 @@ void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vo
         HybridSort_Stage1_FindPartitionsTopK<block_size, 4096, K><<<grid_stage1, block_stage1, 0, stream>>>(
             scores_in, data->intermediate_indices_1, data->intermediate_scores_1, vocab_size, num_partitions);
         break;
-      default:
-        HybridSort_Stage1_FindPartitionsTopK<block_size, 8192, K><<<grid_stage1, block_stage1, 0, stream>>>(
-            scores_in, data->intermediate_indices_1, data->intermediate_scores_1, vocab_size, num_partitions);
-        break;
+      // default:
+      //   HybridSort_Stage1_FindPartitionsTopK<block_size, 8192, K><<<grid_stage1, block_stage1, 0, stream>>>(
+      //       scores_in, data->intermediate_indices_1, data->intermediate_scores_1, vocab_size, num_partitions);
+      //   break;
     }
     CUDA_CHECK(cudaGetLastError());
     HybridSort_ReducePartitions<K>(data, stream, num_partitions, batch_size, k);
@@ -218,12 +194,14 @@ void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vo
 inline int EstimateBestPartitionSize(int vocab_size) {
   if (vocab_size <= 1024) return 1024;
   if (vocab_size <= 2048) return 2048;
-  if (vocab_size <= 4096) return 4096;
-  // TODO: This is tuned when reduction factor is 2.
-  // We need revisit it since we allow reduction factors 2, 4, 8 now.
-  return 8192;
+  // if (vocab_size <= 4096) return 4096;
+  // // TODO: This is tuned when reduction factor is 2.
+  // // We need revisit it since we allow reduction factors 2, 4, 8 now.
+  // return 8192;
+  return 4096;
 }
 
 }  // namespace hybrid_sort
 }  // namespace cuda
 }  // namespace Generators
+

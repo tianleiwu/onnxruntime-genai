@@ -9,6 +9,7 @@
 #include <type_traits>  // For std::integral_constant
 #include "cuda_topk.h"
 #include "cuda_topk_bitonic_sort_helper.cuh"
+#include "cuda_topk_common.cuh"
 
 namespace Generators {
 namespace cuda {
@@ -45,13 +46,15 @@ __global__ void FlashSortKernel(const float* __restrict__ input_scores,
   const int num_partitions = gridDim.x;
 
   constexpr int ItemsPerThread = kPartitionSize / kBlockSize;
-  using BlockRadixSort = cub::BlockRadixSort<float, kBlockSize, ItemsPerThread, int>;
+  using BlockRadixSortScore = cub::BlockRadixSort<float, kBlockSize, ItemsPerThread, int>;
+  using BlockRadixSortIndex = cub::BlockRadixSort<unsigned int, kBlockSize, ItemsPerThread, float>;
 
   // --- Shared Memory Union ---
   constexpr int kSortSize = K_PADDED * kReductionFactor;
 
   union SharedStorage {
-    typename BlockRadixSort::TempStorage stage1_storage;
+    typename BlockRadixSortScore::TempStorage stage1_storage_score;
+    typename BlockRadixSortIndex::TempStorage stage1_storage_index;
     struct {
       __align__(128) float scores[kSortSize];
       __align__(128) int indices[kSortSize];
@@ -59,33 +62,10 @@ __global__ void FlashSortKernel(const float* __restrict__ input_scores,
   };
   __shared__ SharedStorage smem;
 
-  const float* batch_input_scores = input_scores + static_cast<size_t>(batch_idx) * vocab_size;
-  const size_t batch_intermediate_offset_stage1 = static_cast<size_t>(batch_idx) * num_partitions * K_PADDED;
-  int* batch_intermediate_indices_1 = intermediate_indices_1 + batch_intermediate_offset_stage1;
-  float* batch_intermediate_scores_1 = intermediate_scores_1 + batch_intermediate_offset_stage1;
-
   // --- Stage 1: Find Top-K within each partition ---
-  {
-    const int partition_start = partition_idx * kPartitionSize;
-    float thread_keys[ItemsPerThread];
-    int thread_values[ItemsPerThread];
-    for (int i = 0; i < ItemsPerThread; ++i) {
-      int global_idx = partition_start + threadIdx.x + i * kBlockSize;
-      if (global_idx < vocab_size) {
-        thread_keys[i] = batch_input_scores[global_idx];
-        thread_values[i] = global_idx;
-      } else {
-        thread_keys[i] = -FLT_MAX;
-        thread_values[i] = INT_MAX;
-      }
-    }
-    BlockRadixSort(smem.stage1_storage).SortDescendingBlockedToStriped(thread_keys, thread_values);
-    if (threadIdx.x < K_PADDED) {
-      size_t offset = static_cast<size_t>(partition_idx) * K_PADDED + threadIdx.x;
-      batch_intermediate_scores_1[offset] = thread_keys[0];
-      batch_intermediate_indices_1[offset] = thread_values[0];
-    }
-  }
+  topk_common::FindPartitionTopK<kBlockSize, kPartitionSize, K_PADDED>(
+      input_scores, intermediate_indices_1, intermediate_scores_1, vocab_size, num_partitions, smem);
+
   grid.sync();
 
   // --- Stage 2: Iterative Tree Reduction ---
@@ -100,8 +80,8 @@ __global__ void FlashSortKernel(const float* __restrict__ input_scores,
     if (partition_idx < num_active_blocks) {
       const size_t in_batch_offset = static_cast<size_t>(batch_idx) * partitions_remaining * K_PADDED;
       const size_t out_batch_offset = static_cast<size_t>(batch_idx) * num_active_blocks * K_PADDED;
-      int* indices_in_batch = p_indices_in + in_batch_offset;
-      float* scores_in_batch = p_scores_in + in_batch_offset;
+      const int* indices_in_batch = p_indices_in + in_batch_offset;
+      const float* scores_in_batch = p_scores_in + in_batch_offset;
       int* indices_out_batch = p_indices_out + out_batch_offset;
       float* scores_out_batch = p_scores_out + out_batch_offset;
 
@@ -112,7 +92,7 @@ __global__ void FlashSortKernel(const float* __restrict__ input_scores,
         if (i < K_PADDED * num_partitions_to_process) {
           int part_idx = i / K_PADDED;
           int element_idx = i % K_PADDED;
-          size_t local_offset = (first_child_partition + part_idx) * K_PADDED + element_idx;
+          size_t local_offset = static_cast<size_t>(first_child_partition + part_idx) * K_PADDED + element_idx;
           smem.stage2_storage.scores[i] = scores_in_batch[local_offset];
           smem.stage2_storage.indices[i] = indices_in_batch[local_offset];
         } else {
@@ -311,3 +291,4 @@ bool IsSupported(int batch_size, int vocab_size, int k) {
 }  // namespace flash_sort
 }  // namespace cuda
 }  // namespace Generators
+
