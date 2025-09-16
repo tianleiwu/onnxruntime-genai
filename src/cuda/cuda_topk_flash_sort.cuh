@@ -215,7 +215,10 @@ void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vo
   } else if (k <= 64) {
     launch_flash_sort(std::integral_constant<int, 64>());
   } else {
-    launch_flash_sort(std::integral_constant<int, kFlashSortMaxK>());
+    static_assert(kFlashSortMaxK == 64 || kFlashSortMaxK == 128 || kFlashSortMaxK == 256);
+    if constexpr (kFlashSortMaxK > 64) {
+      launch_flash_sort(std::integral_constant<int, kFlashSortMaxK>());
+    }
   }
 
   CUDA_CHECK_LAUNCH();
@@ -278,7 +281,9 @@ bool IsSupported(int batch_size, int vocab_size, int k) {
   } else if (k <= 64) {
     kernel = get_kernel(std::integral_constant<int, 64>());
   } else {
-    kernel = get_kernel(std::integral_constant<int, kFlashSortMaxK>());
+    if constexpr (kFlashSortMaxK > 64) {
+      kernel = get_kernel(std::integral_constant<int, kFlashSortMaxK>());
+    }
   }
 
   int device;

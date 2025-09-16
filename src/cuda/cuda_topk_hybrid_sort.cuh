@@ -140,13 +140,13 @@ void HybridSort_ReducePartitions(TopkData* data, cudaStream_t stream, int num_pa
 
     switch (partitions_per_block) {
       case 8:
-        bitonic_sort::reduction::BlockReduceTopK_SoA<block_size, K, 8><<<grid_reduce, block_reduce, 0, stream>>>(input_scores, input_indices, output_scores, output_indices, current_num_partitions);
+        bitonic_sort::BlockReduceTopK_SoA<block_size, K, 8><<<grid_reduce, block_reduce, 0, stream>>>(input_scores, input_indices, output_scores, output_indices, current_num_partitions);
         break;
       case 4:
-        bitonic_sort::reduction::BlockReduceTopK_SoA<block_size, K, 4><<<grid_reduce, block_reduce, 0, stream>>>(input_scores, input_indices, output_scores, output_indices, current_num_partitions);
+        bitonic_sort::BlockReduceTopK_SoA<block_size, K, 4><<<grid_reduce, block_reduce, 0, stream>>>(input_scores, input_indices, output_scores, output_indices, current_num_partitions);
         break;
       default:
-        bitonic_sort::reduction::BlockReduceTopK_SoA<block_size, K, 2><<<grid_reduce, block_reduce, 0, stream>>>(input_scores, input_indices, output_scores, output_indices, current_num_partitions);
+        bitonic_sort::BlockReduceTopK_SoA<block_size, K, 2><<<grid_reduce, block_reduce, 0, stream>>>(input_scores, input_indices, output_scores, output_indices, current_num_partitions);
         break;
     }
 
