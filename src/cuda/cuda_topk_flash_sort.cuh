@@ -121,7 +121,7 @@ __global__ void FlashSortKernel(const float* __restrict__ input_scores,
         }
       }
       __syncthreads();
-      bitonic_sort::SharedMemBitonicSort_SoA<kBlockSize, kSortSize>(smem.stage2_storage.scores, smem.stage2_storage.indices);
+      bitonic_sort::SharedMemBitonicSort<kBlockSize, kSortSize>(smem.stage2_storage.scores, smem.stage2_storage.indices);
 
       if (threadIdx.x < K_PADDED) {
         size_t out_offset = static_cast<size_t>(partition_idx) * K_PADDED + threadIdx.x;
@@ -215,9 +215,10 @@ void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vo
   } else if (k <= 64) {
     launch_flash_sort(std::integral_constant<int, 64>());
   } else {
-    static_assert(kFlashSortMaxK == 64 || kFlashSortMaxK == 128 || kFlashSortMaxK == 256);
+    static_assert(kFlashSortMaxK == 64 || kFlashSortMaxK == 128);
     if constexpr (kFlashSortMaxK > 64) {
-      launch_flash_sort(std::integral_constant<int, kFlashSortMaxK>());
+      assert(k <= 128);
+      launch_flash_sort(std::integral_constant<int, 128>());
     }
   }
 

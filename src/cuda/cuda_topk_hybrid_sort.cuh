@@ -90,7 +90,7 @@ __global__ void FinalSinglePartitionSort(const float* __restrict__ scores_in, co
   __syncthreads();
 
   // Sort the K_padded candidates in shared memory
-  bitonic_sort::SharedMemBitonicSort_SoA<kBlockSize, K_padded>(smem_scores, smem_indices);
+  bitonic_sort::SharedMemBitonicSort<kBlockSize, K_padded>(smem_scores, smem_indices);
 
   // Write out the final top-k_final results
   if (threadIdx.x < k_final) {
@@ -140,13 +140,13 @@ void HybridSort_ReducePartitions(TopkData* data, cudaStream_t stream, int num_pa
 
     switch (partitions_per_block) {
       case 8:
-        bitonic_sort::BlockReduceTopK_SoA<block_size, K, 8><<<grid_reduce, block_reduce, 0, stream>>>(input_scores, input_indices, output_scores, output_indices, current_num_partitions);
+        bitonic_sort::BlockReduceTopK<block_size, K, 8><<<grid_reduce, block_reduce, 0, stream>>>(input_scores, input_indices, output_scores, output_indices, current_num_partitions);
         break;
       case 4:
-        bitonic_sort::BlockReduceTopK_SoA<block_size, K, 4><<<grid_reduce, block_reduce, 0, stream>>>(input_scores, input_indices, output_scores, output_indices, current_num_partitions);
+        bitonic_sort::BlockReduceTopK<block_size, K, 4><<<grid_reduce, block_reduce, 0, stream>>>(input_scores, input_indices, output_scores, output_indices, current_num_partitions);
         break;
       default:
-        bitonic_sort::BlockReduceTopK_SoA<block_size, K, 2><<<grid_reduce, block_reduce, 0, stream>>>(input_scores, input_indices, output_scores, output_indices, current_num_partitions);
+        bitonic_sort::BlockReduceTopK<block_size, K, 2><<<grid_reduce, block_reduce, 0, stream>>>(input_scores, input_indices, output_scores, output_indices, current_num_partitions);
         break;
     }
 
@@ -196,8 +196,22 @@ void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vo
 
   if (k <= 64) {
     launch_stage1_flash(std::integral_constant<int, 64>());
-  } else {
-    launch_stage1_flash(std::integral_constant<int, kHybridSortMaxK>());
+    return;
+  }
+
+  static_assert(kHybridSortMaxK == 64 || kHybridSortMaxK == 128 || kHybridSortMaxK == 256);
+  if constexpr (kHybridSortMaxK > 64) {
+    if (k <= 128) {
+      launch_stage1_flash(std::integral_constant<int, 128>());
+      return;
+    }
+  }
+
+  if constexpr (kHybridSortMaxK > 128) {
+    if (k <= 256) {
+      launch_stage1_flash(std::integral_constant<int, 256>());
+      return;
+    }
   }
 }
 
@@ -208,6 +222,8 @@ inline int EstimateBestPartitionSize(int vocab_size) {
   if (vocab_size <= 1024) return 1024;
   if (vocab_size <= 2048) return 2048;
   if (vocab_size <= 4096) return 4096;
+  // TODO: This is tuned when reduction factor is 2.
+  // We need revisit it since we allow reduction factors 2, 4, 8 now.
   return 8192;
 }
 

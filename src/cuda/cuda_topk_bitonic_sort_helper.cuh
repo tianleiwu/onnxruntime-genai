@@ -10,80 +10,10 @@ namespace Generators {
 namespace cuda {
 namespace bitonic_sort {
 
-// This helper always evaluates to true, but encodes the value into the type
-template<int...> struct debug_always_true : std::true_type {};
-
-#ifdef DEBUG_INSTANTIATION_ENABLE
-  #define DEBUG_INSTANTIATION(kBlockSize, SortSize);                                 \
-    static_assert(debug_always_true<kBlockSize, SortSize>::value,                   \
-      "SharedMemBitonicSort slow path instantiated with kBlockSize and SortSize")
-#else
-  #define DEBUG_INSTANTIATION(kBlockSize, SortSize); do {} while (0)
-#endif
-
-/*
-// Generic implementation for bitonic sort in shared memory.
-// operating on separate score and index arrays (Struct of Arrays layout).
-// IMPORTANT NOTE: This implementation contains a latent bug that manifests as a race
-// condition when the number of threads (`kBlockSize`) is exactly equal to the number
-// of elements being sorted (`SortSize`). This function should only be called when
-// that condition is not met. The static_assert below enforces this.
-template <int kBlockSize, int SortSize>
-__device__ void SharedMemBitonicSort_SoA(float* smem_scores, int* smem_indices) {
-  // Enforce the constraint that kBlockSize must not be equal to SortSize to avoid a latent bug.
-  static_assert(kBlockSize != SortSize, "SharedMemBitonicSort_SoA has a bug when kBlockSize == SortSize");
-  // Stage 1: Build bitonic sequences
-  for (int k = 2; k <= SortSize; k <<= 1) {
-    for (int j = k >> 1; j > 0; j >>= 1) {
-      for (int i = threadIdx.x; i < SortSize; i += kBlockSize) {
-        int ixj = i ^ j;
-        if (ixj > i) {
-          bool ascending = ((i & k) == 0);
-          float score_i = smem_scores[i];
-          float score_ixj = smem_scores[ixj];
-          int index_i = smem_indices[i];
-          int index_ixj = smem_indices[ixj];
-
-          bool is_greater = (score_i > score_ixj) || (score_i == score_ixj && index_i < index_ixj);
-          if (is_greater != ascending) {
-            smem_scores[i] = score_ixj;
-            smem_scores[ixj] = score_i;
-            smem_indices[i] = index_ixj;
-            smem_indices[ixj] = index_i;
-          }
-        }
-      }
-      __syncthreads();
-    }
-  }
-
-  // Stage 2: Final merge to sort descending
-  for (int j = SortSize >> 1; j > 0; j >>= 1) {
-    for (int i = threadIdx.x; i < SortSize; i += kBlockSize) {
-      int ixj = i ^ j;
-      if (ixj > i) {
-        float score_i = smem_scores[i];
-        float score_ixj = smem_scores[ixj];
-        int index_i = smem_indices[i];
-        int index_ixj = smem_indices[ixj];
-
-        if ((score_i < score_ixj) || (score_i == score_ixj && index_i > index_ixj)) {
-          smem_scores[i] = score_ixj;
-          smem_scores[ixj] = score_i;
-          smem_indices[i] = index_ixj;
-          smem_indices[ixj] = index_i;
-        }
-      }
-    }
-    __syncthreads();
-  }
-}
-*/
-
 // Full bitonic sort implementation for cases where kBlockSize < SortSize.
 template <int kBlockSize, int SortSize>
 __device__ void SharedMemBitonicSort_Large(float* smem_scores, int* smem_indices) {
-  DEBUG_INSTANTIATION(kBlockSize, SortSize);
+  
   static_assert(SortSize > 0 && (SortSize & (SortSize - 1)) == 0,
                 "SortSize must be a power of 2");
   static_assert(kBlockSize > 0 && (kBlockSize & (kBlockSize - 1)) == 0,
@@ -133,7 +63,7 @@ __device__ void SharedMemBitonicSort_Large(float* smem_scores, int* smem_indices
                 int partner = idx ^ stride;
 
                 if (partner > idx) {
-                    // BUG FIX: A standard bitonic network sorts ascending with `(idx & size) == 0`.
+                    //  A standard bitonic network sorts ascending with `(idx & size) == 0`.
                     // To sort descending, the direction must be inverted.
                     bool ascending = ((idx & size) != 0);
                     compareAndSwap(idx, partner, ascending);
@@ -142,7 +72,7 @@ __device__ void SharedMemBitonicSort_Large(float* smem_scores, int* smem_indices
         } else {
             int partner = tid ^ stride;
             if (partner > tid) {
-                // BUG FIX: Invert direction for descending sort.
+                // Invert direction for descending sort.
                 bool ascending = ((tid & size) != 0);
                 compareAndSwap(tid, partner, ascending);
             }
@@ -183,7 +113,7 @@ __device__ void SharedMemBitonicSort_Small(float* smem_scores, int* smem_indices
   static_assert(SortSize > 0 && (SortSize & (SortSize - 1)) == 0,
                 "SortSize must be a power of 2");
   static_assert(kBlockSize >= SortSize);
-  DEBUG_INSTANTIATION(kBlockSize, SortSize);
+  
     // This implementation uses one thread per element for the sort.
     const int ix = threadIdx.x;
 
@@ -194,7 +124,7 @@ __device__ void SharedMemBitonicSort_Small(float* smem_scores, int* smem_indices
             if (ix < SortSize) {
                 int paired_ix = ix ^ j;
                 if (paired_ix > ix) {
-                    // BUG FIX: A standard bitonic network sorts ascending with `(ix & k) == 0`.
+                    // A standard bitonic network sorts ascending with `(ix & k) == 0`.
                     // To sort descending, the direction must be inverted.
                     bool ascending = ((ix & k) != 0);
 
@@ -224,9 +154,8 @@ __device__ void SharedMemBitonicSort_Small(float* smem_scores, int* smem_indices
 // - Result: sorted in-place by score descending, tie-breaker index ascending.
 template <int kBlockSize, int SortSize>
 __device__ void SharedMemBitonicSort_Big(float* smem_scores, int* smem_indices) {
-  static_assert(SortSize >= 2, "SortSize must be >= 2");
-  static_assert((SortSize & (SortSize - 1)) == 0, "SortSize must be power of two");
- DEBUG_INSTANTIATION(kBlockSize, SortSize);
+  static_assert(SortSize > 0 && (SortSize & (SortSize - 1)) == 0, "SortSize must be power of two");
+ 
   const int tid = threadIdx.x;
   constexpr int N = SortSize;
 
@@ -242,7 +171,7 @@ __device__ void SharedMemBitonicSort_Big(float* smem_scores, int* smem_indices) 
           int idx_i = smem_indices[i];
           int idx_j = smem_indices[ixj];
 
-          // BUG FIX: A standard bitonic network sorts ascending with `(i & k) == 0`.
+          // A standard bitonic network sorts ascending with `(i & k) == 0`.
           // To sort descending, the direction must be inverted.
           bool ascending = ((i & k) != 0);
           bool is_i_greater = (a_i > a_j) || (a_i == a_j && idx_i < idx_j);
@@ -271,7 +200,7 @@ constexpr int NextPowerOfTwo(int n) {
 // Supports arbitrary SortSize by padding to next power of two.
 template <int kBlockSize, int SortSize>
 __device__ void SharedMemBitonicSort_Pad(float* smem_scores, int* smem_indices) {
-DEBUG_INSTANTIATION(kBlockSize, SortSize);
+
   const int tid = threadIdx.x;
   constexpr int N = SortSize;
 
@@ -295,7 +224,7 @@ DEBUG_INSTANTIATION(kBlockSize, SortSize);
           int idx_i = smem_indices[i];
           int idx_j = smem_indices[ixj];
 
-          // BUG FIX: A standard bitonic network sorts ascending with `(i & k) == 0`.
+          // A standard bitonic network sorts ascending with `(i & k) == 0`.
           // To sort descending, the direction must be inverted.
           bool ascending = ((i & k) != 0);
           bool is_i_greater = (a_i > a_j) || (a_i == a_j && idx_i < idx_j);
@@ -315,32 +244,19 @@ DEBUG_INSTANTIATION(kBlockSize, SortSize);
 }
 
 template <int kBlockSize, int SortSize>
-__device__ void SharedMemBitonicSort_SoA(float* smem_scores, int* smem_indices) {
-  if constexpr ((SortSize & (SortSize - 1)) != 0) {
-    SharedMemBitonicSort_Pad<kBlockSize, SortSize>(smem_scores, smem_indices);
-  } else {
-    if constexpr (kBlockSize >= SortSize) {
-      SharedMemBitonicSort_Small<kBlockSize, SortSize>(smem_scores, smem_indices);
-    } else {
-      SharedMemBitonicSort_Big<kBlockSize, SortSize>(smem_scores, smem_indices);
-    }
-  }
-}
-
-template <int kBlockSize, int SortSize, int K>
-__device__ void SharedMemBitonicTopK(float* smem_scores, int* smem_indices) {
-  // The partial sort implementation was algorithmically flawed. To ensure correctness,
-  // we now always fall back to a full sort. The performance is still very high, and this
-  // guarantees correct output for all cases.
+__device__ void SharedMemBitonicSort(float* smem_scores, int* smem_indices) {
   if constexpr ((SortSize & (SortSize - 1)) != 0) {
     // Non-power-of-two sizes must be padded and fully sorted.
     SharedMemBitonicSort_Pad<kBlockSize, SortSize>(smem_scores, smem_indices);
-  } else if constexpr (kBlockSize >= SortSize) {
-    // With enough threads, a full sort is very fast.
-    SharedMemBitonicSort_Small<kBlockSize, SortSize>(smem_scores, smem_indices);
   } else {
-    // Fewer threads than elements. Use the optimized full sort for power-of-two sizes.
-    SharedMemBitonicSort_Large<kBlockSize, SortSize>(smem_scores, smem_indices);
+    if constexpr (kBlockSize >= SortSize) {
+      // With enough threads, a full sort is very fast.
+      SharedMemBitonicSort_Small<kBlockSize, SortSize>(smem_scores, smem_indices);
+    } else {
+      // Fewer threads than elements. Use the generic full sort for power-of-two sizes.
+      SharedMemBitonicSort_Big<kBlockSize, SortSize>(smem_scores, smem_indices);
+      // SharedMemBitonicSort_Large<kBlockSize, SortSize>(smem_scores, smem_indices);
+    }
   }
 }
 
@@ -366,6 +282,7 @@ __device__ void RegisterBitonicSort(float scores[N], int indices[N]) {
       }
     }
   }
+
   for (int j = N >> 1; j > 0; j >>= 1) {
 #pragma unroll
     for (int i = 0; i < N; ++i) {
@@ -385,7 +302,7 @@ __device__ void RegisterBitonicSort(float scores[N], int indices[N]) {
 }
 
 template <int kBlockSize, int K, int PartitionsPerBlock>
-__global__ void BlockReduceTopK_SoA(const float* __restrict__ scores_in, const int* __restrict__ indices_in,
+__global__ void BlockReduceTopK(const float* __restrict__ scores_in, const int* __restrict__ indices_in,
                                     float* __restrict__ scores_out, int* __restrict__ indices_out, int num_partitions_in) {
   constexpr int SortSize = K * PartitionsPerBlock;
   __shared__ float smem_scores[SortSize];
@@ -414,7 +331,7 @@ __global__ void BlockReduceTopK_SoA(const float* __restrict__ scores_in, const i
   __syncthreads();
 
   // Perform the sort on the SoA data in shared memory.
-  SharedMemBitonicSort_SoA<kBlockSize, SortSize>(smem_scores, smem_indices);
+  SharedMemBitonicSort<kBlockSize, SortSize>(smem_scores, smem_indices);
 
   // Write the top K results back to global memory
   if (threadIdx.x < K) {

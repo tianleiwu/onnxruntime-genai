@@ -154,8 +154,7 @@ __global__ void LlmSortKernel(const float* __restrict__ input_scores,
         }
       }
       __syncthreads();
-      // bitonic_sort::SharedMemBitonicSort_SoA<kBlockSize, kSortSize1>(smem.step1_storage.scores, smem.step1_storage.indices);
-      bitonic_sort::SharedMemBitonicTopK<kBlockSize, kSortSize1, K_PADDED>(smem.step1_storage.scores, smem.step1_storage.indices);
+      bitonic_sort::SharedMemBitonicSort<kBlockSize, kSortSize1>(smem.step1_storage.scores, smem.step1_storage.indices);
       if (threadIdx.x < K_PADDED) {
         scores_out_batch[static_cast<size_t>(partition_idx) * K_PADDED + threadIdx.x] = smem.step1_storage.scores[threadIdx.x];
         indices_out_batch[static_cast<size_t>(partition_idx) * K_PADDED + threadIdx.x] = smem.step1_storage.indices[threadIdx.x];
@@ -187,8 +186,7 @@ __global__ void LlmSortKernel(const float* __restrict__ input_scores,
         }
       }
       __syncthreads();
-      // bitonic_sort::SharedMemBitonicSort_SoA<kBlockSize, kSortSize2>(smem.step2_storage.scores, smem.step2_storage.indices);
-      bitonic_sort::SharedMemBitonicTopK<kBlockSize, kSortSize2, K_PADDED>(smem.step2_storage.scores, smem.step2_storage.indices);
+      bitonic_sort::SharedMemBitonicSort<kBlockSize, kSortSize2>(smem.step2_storage.scores, smem.step2_storage.indices);
       if (threadIdx.x < K_PADDED) {
         scores_out_batch[static_cast<size_t>(partition_idx) * K_PADDED + threadIdx.x] = smem.step2_storage.scores[threadIdx.x];
         indices_out_batch[static_cast<size_t>(partition_idx) * K_PADDED + threadIdx.x] = smem.step2_storage.indices[threadIdx.x];
@@ -219,8 +217,7 @@ __global__ void LlmSortKernel(const float* __restrict__ input_scores,
         }
       }
       __syncthreads();
-      // bitonic_sort::SharedMemBitonicSort_SoA<kBlockSize, kSortSize3>(smem.step3_storage.scores, smem.step3_storage.indices);
-      bitonic_sort::SharedMemBitonicTopK<kBlockSize, kSortSize3, K_PADDED>(smem.step3_storage.scores, smem.step3_storage.indices);
+      bitonic_sort::SharedMemBitonicSort<kBlockSize, kSortSize3>(smem.step3_storage.scores, smem.step3_storage.indices);
       if (threadIdx.x < K_PADDED) {
         scores_out_batch[static_cast<size_t>(partition_idx) * K_PADDED + threadIdx.x] = smem.step3_storage.scores[threadIdx.x];
         indices_out_batch[static_cast<size_t>(partition_idx) * K_PADDED + threadIdx.x] = smem.step3_storage.indices[threadIdx.x];
@@ -336,7 +333,7 @@ void LaunchLlmSortKernel(TopkData* data, cudaStream_t stream, const float* score
 
 // --- Unified Host-Side Launcher ---
 void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vocab_size, int batch_size, int k) {
-  assert(IsSupported(batch_size, vocab_size, k));
+  assert(IsSupported(batch_size, vocab_size, k)); // caller shall check IsSupported before calling this function.
 
   const int partition_size = data->llm_sort_partition_size;
   const int num_partitions = CeilDiv(vocab_size, partition_size);
@@ -357,6 +354,9 @@ void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vo
   if (num_reduction_steps > 1) num_partitions_out = CeilDiv(num_partitions_out, factors.factor2);
   if (num_reduction_steps > 2) num_partitions_out = CeilDiv(num_partitions_out, factors.factor3);
 
+  // The logic below can be adjusted to support k up to 256, but that will increase build time and binary size.
+  static_assert(kLlmSortMaxK == 64);
+
   int k_padded_val;
   if (k <= 4)
     k_padded_val = 4;
@@ -366,10 +366,8 @@ void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vo
     k_padded_val = 16;
   else if (k <= 32)
     k_padded_val = 32;
-  else if (k <= 64)
-    k_padded_val = 64;
   else
-    k_padded_val = kLlmSortMaxK;
+    k_padded_val = 64;
   data->topk_stride = k_padded_val * num_partitions_out;
 
   // Dispatch to the correct templated launch helper based on k_padded_val
@@ -381,14 +379,8 @@ void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vo
     LaunchLlmSortKernel<16>(data, stream, scores_in, vocab_size, batch_size, k);
   else if (k_padded_val == 32)
     LaunchLlmSortKernel<32>(data, stream, scores_in, vocab_size, batch_size, k);
-  else if (k_padded_val == 64)
+  else
     LaunchLlmSortKernel<64>(data, stream, scores_in, vocab_size, batch_size, k);
-  else {
-    static_assert(kLlmSortMaxK == 64 || kLlmSortMaxK == 128 || kLlmSortMaxK == 256);
-    if constexpr (kLlmSortMaxK > 64) {
-      LaunchLlmSortKernel<kLlmSortMaxK>(data, stream, scores_in, vocab_size, batch_size, k);
-    }
-  }
 
   CUDA_CHECK_LAUNCH();
 }
@@ -471,10 +463,8 @@ bool IsSupported(int batch_size, int vocab_size, int k) {
     k_padded_val = 16;
   else if (k <= 32)
     k_padded_val = 32;
-  else if (k <= 64)
-    k_padded_val = 64;
   else
-    k_padded_val = kLlmSortMaxK;
+    k_padded_val = 64;
 
   // Dispatch to the correct templated support checker based on k_padded_val
   if (k_padded_val == 4)
@@ -485,12 +475,8 @@ bool IsSupported(int batch_size, int vocab_size, int k) {
     return CheckLlmSortSupport<16>(batch_size, vocab_size, k, partition_size, num_partitions);
   if (k_padded_val == 32)
     return CheckLlmSortSupport<32>(batch_size, vocab_size, k, partition_size, num_partitions);
-  if constexpr (kLlmSortMaxK > 64) {
-    if (k_padded_val == 64)
-      return CheckLlmSortSupport<64>(batch_size, vocab_size, k, partition_size, num_partitions);
-  }
 
-  return CheckLlmSortSupport<kLlmSortMaxK>(batch_size, vocab_size, k, partition_size, num_partitions);
+  return CheckLlmSortSupport<64>(batch_size, vocab_size, k, partition_size, num_partitions);
 }
 
 }  // namespace llm_sort
