@@ -24,8 +24,14 @@ template<int...> struct debug_always_true : std::true_type {};
 /*
 // Generic implementation for bitonic sort in shared memory.
 // operating on separate score and index arrays (Struct of Arrays layout).
+// IMPORTANT NOTE: This implementation contains a latent bug that manifests as a race
+// condition when the number of threads (`kBlockSize`) is exactly equal to the number
+// of elements being sorted (`SortSize`). This function should only be called when
+// that condition is not met. The static_assert below enforces this.
 template <int kBlockSize, int SortSize>
 __device__ void SharedMemBitonicSort_SoA(float* smem_scores, int* smem_indices) {
+  // Enforce the constraint that kBlockSize must not be equal to SortSize to avoid a latent bug.
+  static_assert(kBlockSize != SortSize, "SharedMemBitonicSort_SoA has a bug when kBlockSize == SortSize");
   // Stage 1: Build bitonic sequences
   for (int k = 2; k <= SortSize; k <<= 1) {
     for (int j = k >> 1; j > 0; j >>= 1) {
@@ -72,7 +78,7 @@ __device__ void SharedMemBitonicSort_SoA(float* smem_scores, int* smem_indices) 
     __syncthreads();
   }
 }
-*/
+
 
 // Optimized implementation for finding top K elements in shared memory.
 // Uses bitonic sort for small K, and heap-based approach for larger arrays.
@@ -250,6 +256,7 @@ __device__ void SharedMemBitonicSort_Large(float* smem_scores, int* smem_indices
     __syncthreads();
   }
 }
+*/
 
 /**
  * @brief Performs an in-place bitonic sort on data in shared memory.
@@ -424,8 +431,8 @@ DEBUG_INSTANTIATION(kBlockSize, SortSize);
   // If SortSize < Npad, fill sentinels.
   for (int i = tid; i < Npad; i += kBlockSize) {
     if (i >= N) {
-      smem_scores[i] = -CUDART_INF_F;   // sentinel (very small value for descending sort)
-      smem_indices[i] = INT_MAX;        // tie-breaker sentinel
+      smem_scores[i] = -FLT_MAX;  // sentinel (very small value for descending sort)
+      smem_indices[i] = INT_MAX;  // tie-breaker sentinel
     }
   }
   __syncthreads();
@@ -484,20 +491,16 @@ template <int kBlockSize, int SortSize, int K>
 __device__ void SharedMemBitonicTopK(float* smem_scores, int* smem_indices) {
   if constexpr ((SortSize & (SortSize - 1)) != 0) {
     SharedMemBitonicSort_Pad<kBlockSize, SortSize>(smem_scores, smem_indices);
-  } else {
-    if constexpr (kBlockSize >= SortSize) {
-      SharedMemBitonicSort_Small<kBlockSize, SortSize>(smem_scores, smem_indices);
-    } else {
-      SharedMemBitonicSort_Big<kBlockSize, SortSize>(smem_scores, smem_indices);
-    }
-  }
-  // For small K relative to SortSize, use partial bitonic sort
-  // For larger K, fall back to full sort (could be optimized further with heap)
-  if constexpr (K <= SortSize / 4) {
+  } else if constexpr (kBlockSize >= SortSize) {
+    SharedMemBitonicSort_Small<kBlockSize, SortSize>(smem_scores, smem_indices);
+  } /* else if constexpr (K <= SortSize / 4) {
+    // For small K relative to SortSize, use partial bitonic sort
     SharedMemBitonicTopK_SoA<kBlockSize, SortSize, K>(smem_scores, smem_indices);
-  } else {
-    // For larger K, use full bitonic sort (same as before but optimized)
-    SharedMemBitonicSort_Large<kBlockSize, SortSize>(smem_scores, smem_indices);
+  }*/ else {
+    // For larger K, use optimized full bitonic sort
+    // SharedMemBitonicSort_Large<kBlockSize, SortSize>(smem_scores, smem_indices);
+    // Below is less optimized version:
+    SharedMemBitonicSort_Big<kBlockSize, SortSize>(smem_scores, smem_indices);
   }
 }
 
@@ -565,7 +568,7 @@ __global__ void BlockReduceTopK_SoA(const float* __restrict__ scores_in, const i
       smem_indices[i] = indices_in[global_offset];
     } else {
       smem_scores[i] = -FLT_MAX;
-      smem_indices[i] = -1;
+      smem_indices[i] = INT_MAX;
     }
   }
   __syncthreads();

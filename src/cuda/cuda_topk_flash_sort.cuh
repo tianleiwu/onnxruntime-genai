@@ -76,7 +76,7 @@ __global__ void FlashSortKernel(const float* __restrict__ input_scores,
         thread_values[i] = global_idx;
       } else {
         thread_keys[i] = -FLT_MAX;
-        thread_values[i] = -1;
+        thread_values[i] = INT_MAX;
       }
     }
     BlockRadixSort(smem.stage1_storage).SortDescendingBlockedToStriped(thread_keys, thread_values);
@@ -117,7 +117,7 @@ __global__ void FlashSortKernel(const float* __restrict__ input_scores,
           smem.stage2_storage.indices[i] = indices_in_batch[local_offset];
         } else {
           smem.stage2_storage.scores[i] = -FLT_MAX;
-          smem.stage2_storage.indices[i] = -1;
+          smem.stage2_storage.indices[i] = INT_MAX;
         }
       }
       __syncthreads();

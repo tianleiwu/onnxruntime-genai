@@ -42,7 +42,7 @@ __global__ void HybridSort_Stage1_FindPartitionsTopK(const float* __restrict__ s
       thread_values[i] = global_idx;
     } else {
       thread_keys[i] = -FLT_MAX;
-      thread_values[i] = -1;
+      thread_values[i] = INT_MAX;
     }
   }
 

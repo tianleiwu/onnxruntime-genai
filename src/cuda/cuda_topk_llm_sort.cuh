@@ -119,7 +119,7 @@ __global__ void LlmSortKernel(const float* __restrict__ input_scores,
         thread_values[i] = global_idx;
       } else {
         thread_keys[i] = -FLT_MAX;
-        thread_values[i] = -1;
+        thread_values[i] = INT_MAX;
       }
     }
     BlockRadixSort(smem.stage1_storage).SortDescendingBlockedToStriped(thread_keys, thread_values);
@@ -154,7 +154,8 @@ __global__ void LlmSortKernel(const float* __restrict__ input_scores,
         }
       }
       __syncthreads();
-      bitonic_sort::SharedMemBitonicSort_SoA<kBlockSize, kSortSize1>(smem.step1_storage.scores, smem.step1_storage.indices);
+      // bitonic_sort::SharedMemBitonicSort_SoA<kBlockSize, kSortSize1>(smem.step1_storage.scores, smem.step1_storage.indices);
+      bitonic_sort::SharedMemBitonicTopK<kBlockSize, kSortSize1, K_PADDED>(smem.step1_storage.scores, smem.step1_storage.indices);
       if (threadIdx.x < K_PADDED) {
         scores_out_batch[static_cast<size_t>(partition_idx) * K_PADDED + threadIdx.x] = smem.step1_storage.scores[threadIdx.x];
         indices_out_batch[static_cast<size_t>(partition_idx) * K_PADDED + threadIdx.x] = smem.step1_storage.indices[threadIdx.x];
@@ -186,7 +187,8 @@ __global__ void LlmSortKernel(const float* __restrict__ input_scores,
         }
       }
       __syncthreads();
-      bitonic_sort::SharedMemBitonicSort_SoA<kBlockSize, kSortSize2>(smem.step2_storage.scores, smem.step2_storage.indices);
+      // bitonic_sort::SharedMemBitonicSort_SoA<kBlockSize, kSortSize2>(smem.step2_storage.scores, smem.step2_storage.indices);
+      bitonic_sort::SharedMemBitonicTopK<kBlockSize, kSortSize2, K_PADDED>(smem.step2_storage.scores, smem.step2_storage.indices);
       if (threadIdx.x < K_PADDED) {
         scores_out_batch[static_cast<size_t>(partition_idx) * K_PADDED + threadIdx.x] = smem.step2_storage.scores[threadIdx.x];
         indices_out_batch[static_cast<size_t>(partition_idx) * K_PADDED + threadIdx.x] = smem.step2_storage.indices[threadIdx.x];
@@ -217,7 +219,8 @@ __global__ void LlmSortKernel(const float* __restrict__ input_scores,
         }
       }
       __syncthreads();
-      bitonic_sort::SharedMemBitonicSort_SoA<kBlockSize, kSortSize3>(smem.step3_storage.scores, smem.step3_storage.indices);
+      // bitonic_sort::SharedMemBitonicSort_SoA<kBlockSize, kSortSize3>(smem.step3_storage.scores, smem.step3_storage.indices);
+      bitonic_sort::SharedMemBitonicTopK<kBlockSize, kSortSize3, K_PADDED>(smem.step3_storage.scores, smem.step3_storage.indices);
       if (threadIdx.x < K_PADDED) {
         scores_out_batch[static_cast<size_t>(partition_idx) * K_PADDED + threadIdx.x] = smem.step3_storage.scores[threadIdx.x];
         indices_out_batch[static_cast<size_t>(partition_idx) * K_PADDED + threadIdx.x] = smem.step3_storage.indices[threadIdx.x];
@@ -311,15 +314,24 @@ void LaunchLlmSortKernel(TopkData* data, cudaStream_t stream, const float* score
 
   // This dispatch logic is verbose, but it ensures only the necessary kernel variants are instantiated,
   // balancing performance with build time.
-  if (factors.factor1 == 8 && factors.factor2 == 8) LaunchLlmSortKernelWithFactors<K_PADDED, 8, 8, 1>(data, stream, scores_in, vocab_size, batch_size);
-  else if (factors.factor1 == 8 && factors.factor2 == 4) LaunchLlmSortKernelWithFactors<K_PADDED, 8, 4, 1>(data, stream, scores_in, vocab_size, batch_size);
-  else if (factors.factor1 == 8) LaunchLlmSortKernelWithFactors<K_PADDED, 8, 1, 1>(data, stream, scores_in, vocab_size, batch_size);
-  else if (factors.factor1 == 4 && factors.factor2 == 4 && factors.factor3 == 4) LaunchLlmSortKernelWithFactors<K_PADDED, 4, 4, 4>(data, stream, scores_in, vocab_size, batch_size);
-  else if (factors.factor1 == 4 && factors.factor2 == 4 && factors.factor3 == 2) LaunchLlmSortKernelWithFactors<K_PADDED, 4, 4, 2>(data, stream, scores_in, vocab_size, batch_size);
-  else if (factors.factor1 == 4 && factors.factor2 == 4) LaunchLlmSortKernelWithFactors<K_PADDED, 4, 4, 1>(data, stream, scores_in, vocab_size, batch_size);
-  else if (factors.factor1 == 4) LaunchLlmSortKernelWithFactors<K_PADDED, 4, 1, 1>(data, stream, scores_in, vocab_size, batch_size);
-  else if (factors.factor1 == 2) LaunchLlmSortKernelWithFactors<K_PADDED, 2, 1, 1>(data, stream, scores_in, vocab_size, batch_size);
-  else LaunchLlmSortKernelWithFactors<K_PADDED, 1, 1, 1>(data, stream, scores_in, vocab_size, batch_size);
+  if (factors.factor1 == 8 && factors.factor2 == 8)
+    LaunchLlmSortKernelWithFactors<K_PADDED, 8, 8, 1>(data, stream, scores_in, vocab_size, batch_size);
+  else if (factors.factor1 == 8 && factors.factor2 == 4)
+    LaunchLlmSortKernelWithFactors<K_PADDED, 8, 4, 1>(data, stream, scores_in, vocab_size, batch_size);
+  else if (factors.factor1 == 8)
+    LaunchLlmSortKernelWithFactors<K_PADDED, 8, 1, 1>(data, stream, scores_in, vocab_size, batch_size);
+  else if (factors.factor1 == 4 && factors.factor2 == 4 && factors.factor3 == 4)
+    LaunchLlmSortKernelWithFactors<K_PADDED, 4, 4, 4>(data, stream, scores_in, vocab_size, batch_size);
+  else if (factors.factor1 == 4 && factors.factor2 == 4 && factors.factor3 == 2)
+    LaunchLlmSortKernelWithFactors<K_PADDED, 4, 4, 2>(data, stream, scores_in, vocab_size, batch_size);
+  else if (factors.factor1 == 4 && factors.factor2 == 4)
+    LaunchLlmSortKernelWithFactors<K_PADDED, 4, 4, 1>(data, stream, scores_in, vocab_size, batch_size);
+  else if (factors.factor1 == 4)
+    LaunchLlmSortKernelWithFactors<K_PADDED, 4, 1, 1>(data, stream, scores_in, vocab_size, batch_size);
+  else if (factors.factor1 == 2)
+    LaunchLlmSortKernelWithFactors<K_PADDED, 2, 1, 1>(data, stream, scores_in, vocab_size, batch_size);
+  else
+    LaunchLlmSortKernelWithFactors<K_PADDED, 1, 1, 1>(data, stream, scores_in, vocab_size, batch_size);
 }
 
 // --- Unified Host-Side Launcher ---
@@ -402,7 +414,7 @@ bool CheckLlmSortSupportWithFactors(int batch_size, int vocab_size, int partitio
       kernel = (void*)LlmSortKernel<K_PADDED, kBlockSize, kAllowedPartitionSizes[3], Factor1, Factor2, Factor3>;
       break;
     default:
-      return false; // Should be unreachable
+      return false;  // Should be unreachable
   }
 
   int device;
@@ -473,15 +485,14 @@ bool IsSupported(int batch_size, int vocab_size, int k) {
     return CheckLlmSortSupport<16>(batch_size, vocab_size, k, partition_size, num_partitions);
   if (k_padded_val == 32)
     return CheckLlmSortSupport<32>(batch_size, vocab_size, k, partition_size, num_partitions);
-  if (k_padded_val == 64)
-    return CheckLlmSortSupport<64>(batch_size, vocab_size, k, partition_size, num_partitions);
-  
   if constexpr (kLlmSortMaxK > 64) {
-    return CheckLlmSortSupport<kLlmSortMaxK>(batch_size, vocab_size, k, partition_size, num_partitions);
+    if (k_padded_val == 64)
+      return CheckLlmSortSupport<64>(batch_size, vocab_size, k, partition_size, num_partitions);
   }
+
+  return CheckLlmSortSupport<kLlmSortMaxK>(batch_size, vocab_size, k, partition_size, num_partitions);
 }
 
 }  // namespace llm_sort
 }  // namespace cuda
 }  // namespace Generators
-
