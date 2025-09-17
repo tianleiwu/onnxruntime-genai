@@ -45,16 +45,14 @@ __global__ void FlashSortKernel(const float* __restrict__ input_scores,
   const int batch_idx = blockIdx.y;
   const int num_partitions = gridDim.x;
 
-  constexpr int ItemsPerThread = kPartitionSize / kBlockSize;
-  using BlockRadixSortScore = cub::BlockRadixSort<float, kBlockSize, ItemsPerThread, int>;
-  using BlockRadixSortIndex = cub::BlockRadixSort<unsigned int, kBlockSize, ItemsPerThread, float>;
-
   // --- Shared Memory Union ---
   constexpr int kSortSize = K_PADDED * kReductionFactor;
 
+  using CompositeKey = uint64_t;
+  using BlockRadixSort = cub::BlockRadixSort<CompositeKey, kBlockSize, kPartitionSize / kBlockSize>;
+
   union SharedStorage {
-    typename BlockRadixSortScore::TempStorage stage1_storage_score;
-    typename BlockRadixSortIndex::TempStorage stage1_storage_index;
+    typename BlockRadixSort::TempStorage stage1_storage;
     struct {
       __align__(128) float scores[kSortSize];
       __align__(128) int indices[kSortSize];
@@ -64,7 +62,7 @@ __global__ void FlashSortKernel(const float* __restrict__ input_scores,
 
   // --- Stage 1: Find Top-K within each partition ---
   topk_common::FindPartitionTopK<kBlockSize, kPartitionSize, K_PADDED>(
-      input_scores, intermediate_indices_1, intermediate_scores_1, vocab_size, num_partitions, smem);
+      input_scores, intermediate_indices_1, intermediate_scores_1, vocab_size, num_partitions, smem.stage1_storage);
 
   grid.sync();
 
@@ -118,31 +116,11 @@ __global__ void FlashSortKernel(const float* __restrict__ input_scores,
 
 // --- Unified Host-Side Launcher ---
 void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vocab_size, int batch_size, int k) {
-  assert(IsSupported(batch_size, vocab_size, k)); // caller shall check IsSupported before calling this function.
+  assert(IsSupported(batch_size, vocab_size, k));  // caller shall check IsSupported before calling this function.
 
   constexpr int kBlockSize = 256;
   const int partition_size = data->flash_sort_partition_size;
   const int num_partitions = CeilDiv(vocab_size, partition_size);
-
-  // Determine the number of reduction loops to find the final output buffer
-  int num_reduction_loops = 0;
-  if (num_partitions > 1) {
-    int partitions = num_partitions;
-    while (partitions > 1) {
-      partitions = (partitions + kReductionFactor - 1) / kReductionFactor;
-      num_reduction_loops++;
-    }
-  }
-
-  // Stage 1 writes to buffer 1 (data->intermediate_..._1)
-  // After odd loops, result is in buffer 2. After even loops, result is in buffer 1.
-  if (num_reduction_loops % 2 == 1) {
-    data->topk_scores = data->intermediate_scores_2;
-    data->topk_indices = data->intermediate_indices_2;
-  } else {
-    data->topk_scores = data->intermediate_scores_1;
-    data->topk_indices = data->intermediate_indices_1;
-  }
 
   int k_padded_val = kFlashSortMaxK;
   if (k <= 4)
@@ -155,8 +133,6 @@ void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vo
     k_padded_val = 32;
   else if (k <= 64)
     k_padded_val = 64;
-
-  data->topk_stride = k_padded_val;
 
   void* kernel_args[6];
   kernel_args[0] = (void*)&scores_in;
@@ -202,6 +178,27 @@ void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vo
   }
 
   CUDA_CHECK_LAUNCH();
+
+  // Determine the number of reduction loops to find the final output buffer
+  int num_reduction_loops = 0;
+  int partitions_remaining = num_partitions;
+  if (partitions_remaining > 1) {
+    while (partitions_remaining > 1) {
+      partitions_remaining = (partitions_remaining + kReductionFactor - 1) / kReductionFactor;
+      num_reduction_loops++;
+    }
+  }
+
+  // Stage 1 writes to buffer 1 (data->intermediate_..._1)
+  // After odd loops, result is in buffer 2. After even loops, result is in buffer 1.
+  if (num_reduction_loops % 2 == 1) {
+    data->topk_scores = data->intermediate_scores_2;
+    data->topk_indices = data->intermediate_indices_2;
+  } else {
+    data->topk_scores = data->intermediate_scores_1;
+    data->topk_indices = data->intermediate_indices_1;
+  }
+  data->topk_stride = k_padded_val;
 }
 
 inline size_t GetIntermediateSize(int batch_size, int vocab_size, int partition_size) {
@@ -291,4 +288,3 @@ bool IsSupported(int batch_size, int vocab_size, int k) {
 }  // namespace flash_sort
 }  // namespace cuda
 }  // namespace Generators
-
