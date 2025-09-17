@@ -6,10 +6,12 @@
 #include <cuda_runtime.h>
 #include <cooperative_groups.h>
 #include <cub/block/block_radix_sort.cuh>
+#include <cub/block/block_radix_rank.cuh>
 #include <type_traits>  // For std::integral_constant
 #include "cuda_topk.h"
 #include "cuda_topk_bitonic_sort_helper.cuh"
 #include "cuda_topk_common.cuh"
+#include "cuda_topk_radix_sort.cuh"
 
 namespace Generators {
 namespace cuda {
@@ -47,12 +49,11 @@ __global__ void FlashSortKernel(const float* __restrict__ input_scores,
 
   // --- Shared Memory Union ---
   constexpr int kSortSize = K_PADDED * kReductionFactor;
-
-  using CompositeKey = uint64_t;
-  using BlockRadixSort = cub::BlockRadixSort<CompositeKey, kBlockSize, kPartitionSize / kBlockSize>;
+  constexpr int RadixBits = 4;
+  using BlockRadixRank = cub::BlockRadixRank<kBlockSize, RadixBits, true>; // true for descending
 
   union SharedStorage {
-    typename BlockRadixSort::TempStorage stage1_storage;
+    typename BlockRadixRank::TempStorage rank_storage;
     struct {
       __align__(128) float scores[kSortSize];
       __align__(128) int indices[kSortSize];
@@ -61,8 +62,8 @@ __global__ void FlashSortKernel(const float* __restrict__ input_scores,
   __shared__ SharedStorage smem;
 
   // --- Stage 1: Find Top-K within each partition ---
-  topk_common::FindPartitionTopK<kBlockSize, kPartitionSize, K_PADDED>(
-      input_scores, intermediate_indices_1, intermediate_scores_1, vocab_size, num_partitions, smem.stage1_storage);
+  topk_common::FindPartitionTopK_Rank<kBlockSize, kPartitionSize, K_PADDED>(
+      input_scores, intermediate_indices_1, intermediate_scores_1, vocab_size, num_partitions, smem);
 
   grid.sync();
 
@@ -116,68 +117,18 @@ __global__ void FlashSortKernel(const float* __restrict__ input_scores,
 
 // --- Unified Host-Side Launcher ---
 void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vocab_size, int batch_size, int k) {
-  assert(IsSupported(batch_size, vocab_size, k));  // caller shall check IsSupported before calling this function.
+  assert(IsSupported(batch_size, vocab_size, k)); // caller shall check IsSupported before calling this function.
 
   constexpr int kBlockSize = 256;
   const int partition_size = data->flash_sort_partition_size;
   const int num_partitions = CeilDiv(vocab_size, partition_size);
 
-  int k_padded_val = kFlashSortMaxK;
-  if (k <= 4)
-    k_padded_val = 4;
-  else if (k <= 8)
-    k_padded_val = 8;
-  else if (k <= 16)
-    k_padded_val = 16;
-  else if (k <= 32)
-    k_padded_val = 32;
-  else if (k <= 64)
-    k_padded_val = 64;
-
-  void* kernel_args[6];
-  kernel_args[0] = (void*)&scores_in;
-  kernel_args[1] = (void*)&data->intermediate_indices_1;
-  kernel_args[2] = (void*)&data->intermediate_scores_1;
-  kernel_args[3] = (void*)&data->intermediate_indices_2;
-  kernel_args[4] = (void*)&data->intermediate_scores_2;
-  kernel_args[5] = (void*)&vocab_size;
-
-  // This lambda handles selecting the kernel and launching it with the correct K_PADDED value.
-  auto launch_flash_sort = [&](auto k_padded) {
-    constexpr int K_PADDED = decltype(k_padded)::value;
-    dim3 block(kBlockSize);
-    dim3 grid(num_partitions, batch_size);
-    switch (partition_size) {
-      case 1024:
-        CUDA_CHECK(cudaLaunchCooperativeKernel((void*)FlashSortKernel<K_PADDED, kBlockSize, 1024>, grid, block, kernel_args, 0, stream));
-        break;
-      case 2048:
-        CUDA_CHECK(cudaLaunchCooperativeKernel((void*)FlashSortKernel<K_PADDED, kBlockSize, 2048>, grid, block, kernel_args, 0, stream));
-        break;
-      default:
-        CUDA_CHECK(cudaLaunchCooperativeKernel((void*)FlashSortKernel<K_PADDED, kBlockSize, 4096>, grid, block, kernel_args, 0, stream));
-        break;
-    }
-  };
-
-  // Select the padded K value at runtime and call the launch logic.
-  if (k <= 4) {
-    launch_flash_sort(std::integral_constant<int, 4>());
-  } else if (k <= 8) {
-    launch_flash_sort(std::integral_constant<int, 8>());
-  } else if (k <= 16) {
-    launch_flash_sort(std::integral_constant<int, 16>());
-  } else if (k <= 32) {
-    launch_flash_sort(std::integral_constant<int, 32>());
-  } else if (k <= 64) {
-    launch_flash_sort(std::integral_constant<int, 64>());
-  } else {
-    if constexpr (kFlashSortMaxK > 64) {
-      launch_flash_sort(std::integral_constant<int, kFlashSortMaxK>());
-    }
+  // For the single-partition case, a full radix sort is both simpler and guarantees
+  // the correct stable sort order.
+  if (num_partitions == 1) {
+    radix_sort::RunTopK(data, stream, scores_in, vocab_size, batch_size, k);
+    return;
   }
-
-  CUDA_CHECK_LAUNCH();
 
   // Determine the number of reduction loops to find the final output buffer
   int num_reduction_loops = 0;
@@ -198,7 +149,6 @@ void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vo
     data->topk_scores = data->intermediate_scores_1;
     data->topk_indices = data->intermediate_indices_1;
   }
-  data->topk_stride = k_padded_val;
 }
 
 inline size_t GetIntermediateSize(int batch_size, int vocab_size, int partition_size) {
@@ -288,3 +238,5 @@ bool IsSupported(int batch_size, int vocab_size, int k) {
 }  // namespace flash_sort
 }  // namespace cuda
 }  // namespace Generators
+
+

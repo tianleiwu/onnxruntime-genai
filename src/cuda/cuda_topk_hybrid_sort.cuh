@@ -4,10 +4,12 @@
 #pragma once
 
 #include <cub/block/block_radix_sort.cuh>
+#include <cub/block/block_radix_rank.cuh>
 #include <cuda_runtime.h>
 #include "cuda_topk.h"
 #include "cuda_topk_bitonic_sort_helper.cuh"
 #include "cuda_topk_common.cuh"
+#include "cuda_topk_radix_sort.cuh"
 
 namespace Generators {
 namespace cuda {
@@ -18,11 +20,11 @@ __global__ void HybridSort_Stage1_FindPartitionsTopK(const float* __restrict__ s
                                                      int* __restrict__ intermediate_indices,
                                                      float* __restrict__ intermediate_scores,
                                                      int vocab_size, int num_partitions) {
-  using CompositeKey = uint64_t;
-  using BlockRadixSort = cub::BlockRadixSort<CompositeKey, kBlockSize, kPartitionSize / kBlockSize>;
-  __shared__ typename BlockRadixSort::TempStorage smem;
+  constexpr int RadixBits = 4;
+  using BlockRadixRank = cub::BlockRadixRank<kBlockSize, RadixBits, true>; // true for descending
+  __shared__ typename BlockRadixRank::TempStorage smem;
 
-  topk_common::FindPartitionTopK<kBlockSize, kPartitionSize, K>(
+  topk_common::FindPartitionTopK_Rank<kBlockSize, kPartitionSize, K>(
       scores_in, intermediate_indices, intermediate_scores, vocab_size, num_partitions, smem);
 }
 
@@ -41,27 +43,8 @@ inline int GetPartitionsPerBlock(int num_partitions) {
 // Stage 2 of Hybrid Sort: Iteratively reduces partitions to find the final top-K.
 template <int K>
 void HybridSort_ReducePartitions(TopkData* data, cudaStream_t stream, int num_partitions, int batch_size, int k) {
-  if (num_partitions == 1) {
-    // Special case: Vocab fits in one partition. Stage 1 found the top K candidates,
-    // but they are not fully sorted. We must perform a final, single-block sort on
-    // these K candidates to get the true top k.
-    constexpr int block_size = 256;
-    dim3 grid(1, batch_size);
-    dim3 block(block_size);
-
-    topk_common::SinglePartitionBitonicSort<block_size, K><<<grid, block, 0, stream>>>(
-        data->intermediate_scores_1, data->intermediate_indices_1,
-        data->intermediate_scores_2, data->intermediate_indices_2,
-        k);
-    CUDA_CHECK(cudaGetLastError());
-
-    // The final sorted data is in buffer 2. The output is compact with size k.
-    data->topk_scores = data->intermediate_scores_2;
-    data->topk_indices = data->intermediate_indices_2;
-    data->topk_stride = k;
-    return;
-  }
-
+  // NOTE: The num_partitions == 1 case is now handled in the RunTopK host function.
+  // This function is only called when num_partitions > 1.
   int current_num_partitions = num_partitions;
   float* input_scores = data->intermediate_scores_1;
   float* output_scores = data->intermediate_scores_2;
@@ -105,10 +88,18 @@ void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vo
 
   const int partition_size = data->hybrid_sort_partition_size;
   const int num_partitions = CeilDiv(vocab_size, partition_size);
+
+  // For the single-partition case, a full radix sort is both simpler and guarantees
+  // the correct stable sort order.
+  if (num_partitions == 1) {
+    radix_sort::RunTopK(data, stream, scores_in, vocab_size, batch_size, k);
+    return;
+  }
+
   dim3 grid_stage1(num_partitions, batch_size);
   dim3 block_stage1(block_size);
 
-  auto launch_stage1_flash = [&](auto k_const) {
+  auto launch_stage1_and_reduce = [&](auto k_const) {
     constexpr int K = decltype(k_const)::value;
     switch (partition_size) {
       case 1024:
@@ -123,29 +114,42 @@ void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vo
         HybridSort_Stage1_FindPartitionsTopK<block_size, 4096, K><<<grid_stage1, block_stage1, 0, stream>>>(
             scores_in, data->intermediate_indices_1, data->intermediate_scores_1, vocab_size, num_partitions);
         break;
-        // default:
-        //   HybridSort_Stage1_FindPartitionsTopK<block_size, 8192, K><<<grid_stage1, block_stage1, 0, stream>>>(
-        //       scores_in, data->intermediate_indices_1, data->intermediate_scores_1, vocab_size, num_partitions);
-        //   break;
+      default:
+        HybridSort_Stage1_FindPartitionsTopK<block_size, 8192, K><<<grid_stage1, block_stage1, 0, stream>>>(
+            scores_in, data->intermediate_indices_1, data->intermediate_scores_1, vocab_size, num_partitions);
+        break;
     }
     CUDA_CHECK(cudaGetLastError());
     HybridSort_ReducePartitions<K>(data, stream, num_partitions, batch_size, k);
   };
 
+  const int partition_size = data->hybrid_sort_partition_size;
+  const int num_partitions = CeilDiv(vocab_size, partition_size);
+
+  // For the single-partition case, a full radix sort is both simpler and guarantees
+  // the correct stable sort order.
+  if (num_partitions == 1) {
+    radix_sort::RunTopK(data, stream, scores_in, vocab_size, batch_size, k);
+    return;
+  }
+
+  dim3 grid_stage1(num_partitions, batch_size);
+  dim3 block_stage1(block_size);
+
   // This kernel is optimized for large vocab_size and large k since flash sort or LLM sort is preferred for smaller vocab_size and smaller k.
   if (k <= 64) {
-    launch_stage1_flash(std::integral_constant<int, 64>());
+    launch_stage1_and_reduce(std::integral_constant<int, 64>());
     return;
   }
 
   if (k <= 128) {
-    launch_stage1_flash(std::integral_constant<int, 128>());
+    launch_stage1_and_reduce(std::integral_constant<int, 128>());
     return;
   }
 
   static_assert(kHybridSortMaxK == 128 || kHybridSortMaxK == 256);
   if constexpr (kHybridSortMaxK > 128) {
-    launch_stage1_flash(std::integral_constant<int, kHybridSortMaxK>());
+    launch_stage1_and_reduce(std::integral_constant<int, kHybridSortMaxK>());
   }
 }
 
@@ -155,13 +159,14 @@ void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vo
 inline int EstimateBestPartitionSize(int vocab_size) {
   if (vocab_size <= 1024) return 1024;
   if (vocab_size <= 2048) return 2048;
-  // if (vocab_size <= 4096) return 4096;
-  // // TODO: This is tuned when reduction factor is 2.
-  // // We need revisit it since we allow reduction factors 2, 4, 8 now.
-  // return 8192;
-  return 4096;
+  if (vocab_size <= 4096) return 4096;
+  // TODO: This is tuned when reduction factor is 2.
+  // We need revisit it since we allow reduction factors 2, 4, 8 now.
+  return 8192;
 }
 
 }  // namespace hybrid_sort
 }  // namespace cuda
 }  // namespace Generators
+
+

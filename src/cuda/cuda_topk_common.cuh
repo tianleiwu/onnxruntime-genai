@@ -4,6 +4,7 @@
 #pragma once
 
 #include <cub/block/block_radix_sort.cuh>
+#include <cub/block/block_radix_rank.cuh>
 #include <cuda_runtime.h>
 #include "cuda_topk.h"
 #include "cuda_topk_bitonic_sort_helper.cuh"
@@ -12,102 +13,83 @@ namespace Generators {
 namespace cuda {
 namespace topk_common {
 
-using CompositeKey = uint64_t;
 /**
- * @brief Reusable device function for Stage 1 of Top-K sorting algorithms.
+ * @brief Optimized device function for Stage 1 of Top-K sorting using a
+ * "rank-then-select" strategy.
  *
  * This function is called by a kernel to find the Top-K candidates within a
- * single partition of the input data. It uses a single, fast, non-stable
- * radix sort. The output candidates will have the correct Top-K scores, but
- * tie-breaking order is not guaranteed. The final stable sort must be handled
- * in subsequent reduction stages or a finalization kernel.
+ * single partition. It is highly performant because it avoids sorting the
+ * entire partition. It relies on the stability of `cub::BlockRadixRank` to
+ * handle tie-breaking correctly without expensive key-packing operations.
+ *
+ * How it works:
+ * 1.  **Key Creation**: For each element, the float score is converted to a
+ * sortable `unsigned int` representation.
+ * 2.  **Stable Ranking**: `cub::BlockRadixRank` is used to calculate the stable
+ * rank of each score. Because the input data is loaded in a blocked
+ * arrangement (i.e., in ascending index order), the stability of the rank
+ * operation automatically ensures that for identical scores, the element with
+ * the smaller original index gets a smaller rank. This correctly handles the
+ * tie-breaking rule.
+ * 3.  **Selective Scatter**: After ranking, each thread checks the ranks of its
+ * local items. If an item's rank is less than K, the thread writes that item's
+ * original score and index directly to the correct output slot in global memory.
  *
  * @tparam kBlockSize The number of threads in the thread block.
  * @tparam kPartitionSize The size of the data partition to sort.
  * @tparam K The number of top elements to find.
  * @tparam SharedStorage The type of the shared memory storage from the calling kernel.
- * @param scores_in Pointer to the input scores in global memory.
- * @param intermediate_indices Pointer to the intermediate buffer for indices.
- * @param intermediate_scores Pointer to the intermediate buffer for scores.
- * @param vocab_size The total vocabulary size.
- * @param num_partitions The total number of partitions.
- * @param smem A reference to the shared memory from the calling kernel.
  */
 template <int kBlockSize, int kPartitionSize, int K, typename SharedStorage>
-__device__ void FindPartitionTopK(const float* __restrict__ scores_in,
-                                  int* __restrict__ intermediate_indices,
-                                  float* __restrict__ intermediate_scores,
-                                  int vocab_size,
-                                  int num_partitions,
-                                  SharedStorage& smem) {
+__device__ void FindPartitionTopK_Rank(const float* __restrict__ scores_in,
+                                      int* __restrict__ intermediate_indices,
+                                      float* __restrict__ intermediate_scores,
+                                      int vocab_size,
+                                      int num_partitions,
+                                      SharedStorage& smem) {
   static_assert(kPartitionSize % kBlockSize == 0, "kPartitionSize must be a multiple of kBlockSize");
   constexpr int ItemsPerThread = kPartitionSize / kBlockSize;
-
-  // Use 64-bit composite key: upper 32 bits for score, lower 32 bits for inverted index
-  using BlockRadixSort = cub::BlockRadixSort<CompositeKey, kBlockSize, ItemsPerThread>;
+  constexpr int RadixBits = 4;
+  using BlockRadixRank = cub::BlockRadixRank<kBlockSize, RadixBits, true>; // true for descending
 
   const int batch_idx = blockIdx.y;
   const int partition_idx = blockIdx.x;
   const int partition_start = partition_idx * kPartitionSize;
   const float* batch_scores_in = scores_in + static_cast<size_t>(batch_idx) * vocab_size;
 
-  CompositeKey thread_keys[ItemsPerThread];
+  float thread_scores[ItemsPerThread];
+  int thread_indices[ItemsPerThread];
+  unsigned int sortable_scores[ItemsPerThread];
 
-  // Create composite keys
+  // Load data and create sortable unsigned int keys from float scores
   for (int i = 0; i < ItemsPerThread; ++i) {
     int global_idx = partition_start + threadIdx.x + i * kBlockSize;
-    float score;
-    int index;
-
     if (global_idx < vocab_size) {
-      score = batch_scores_in[global_idx];
-      index = global_idx;
+      thread_scores[i] = batch_scores_in[global_idx];
+      thread_indices[i] = global_idx;
     } else {
-      score = -FLT_MAX;
-      index = INT_MAX;
+      thread_scores[i] = -FLT_MAX;
+      thread_indices[i] = INT_MAX;
     }
 
-    // Create composite key: score (as uint32) in upper bits, inverted index in lower bits
-    uint32_t score_bits = __float_as_uint(score);
-    // Transform score_bits for correct descending sort as integer.
-    // For descending sort, positive floats need their sign bit flipped, and negative floats need all bits flipped.
-    if (score_bits & 0x80000000) {  // Negative float
-      score_bits = ~score_bits;
-    } else {  // Positive float
-      score_bits ^= 0x80000000;
-    }
-
-    uint32_t inverted_index = INT_MAX - index;
-    thread_keys[i] = (static_cast<uint64_t>(score_bits) << 32) | inverted_index;
+    unsigned int score_bits = __float_as_uint(thread_scores[i]);
+    sortable_scores[i] = (score_bits & 0x80000000) ? (~score_bits) : (score_bits | 0x80000000);
   }
 
-  // Single descending sort (produces a "blocked" data layout)
-  BlockRadixSort(reinterpret_cast<typename BlockRadixSort::TempStorage&>(smem))
-      .SortDescending(thread_keys);
+  // Rank the sortable score keys
+  int ranks[ItemsPerThread];
+  cub::BFEDigitExtractor<unsigned int> digit_extractor(0, sizeof(unsigned int) * 8);
+  BlockRadixRank(reinterpret_cast<typename BlockRadixRank::TempStorage&>(smem))
+      .RankKeys(sortable_scores, ranks, digit_extractor);
 
-  // Correctly extract the top K results from the "blocked" layout.
-  // Each thread checks if its items are part of the top K and writes them out.
-#pragma unroll
+  __syncthreads();
+
+  // Selective scatter: write out only the top K elements
   for (int i = 0; i < ItemsPerThread; ++i) {
-    int rank = threadIdx.x * ItemsPerThread + i;
-    if (rank < K) {
-      CompositeKey key = thread_keys[i];
-      uint32_t score_bits = static_cast<uint32_t>(key >> 32);
-      uint32_t inverted_index = static_cast<uint32_t>(key & 0xFFFFFFFF);
-
-      // FIX: Reverse the transformation to get the original float bits back.
-      if (score_bits & 0x80000000) {  // Was a positive float
-        score_bits ^= 0x80000000;
-      } else {
-        score_bits = ~score_bits;
-      }
-
-      float score = __uint_as_float(score_bits);
-      int index = INT_MAX - inverted_index;
-
-      size_t offset = (static_cast<size_t>(batch_idx) * num_partitions + partition_idx) * K + rank;
-      intermediate_scores[offset] = score;
-      intermediate_indices[offset] = index;
+    if (ranks[i] < K) {
+      size_t offset = (static_cast<size_t>(batch_idx) * num_partitions + partition_idx) * K + ranks[i];
+      intermediate_scores[offset] = thread_scores[i];
+      intermediate_indices[offset] = thread_indices[i];
     }
   }
 }
@@ -115,6 +97,10 @@ __device__ void FindPartitionTopK(const float* __restrict__ scores_in,
 /**
  * @brief Kernel to perform a final, stable sort on K candidates when there is
  * only one partition.
+ *
+ * This is used by sorting algorithms when the reduction phase is skipped
+ * (i.e., num_partitions == 1) to ensure the final output is correctly sorted
+ * with proper tie-breaking.
  *
  * @tparam kBlockSize The number of threads in the thread block.
  * @tparam K_padded The padded size of K, which must be a power of two for bitonic sort.
@@ -125,11 +111,8 @@ __device__ void FindPartitionTopK(const float* __restrict__ scores_in,
  * @param k_final The actual value of K (the number of elements to write).
  */
 template <int kBlockSize, int K_padded>
-__global__ void SinglePartitionBitonicSort(const float* __restrict__ scores_in,
-                                           const int* __restrict__ indices_in,
-                                           float* __restrict__ scores_out,
-                                           int* __restrict__ indices_out,
-                                           int k_final) {
+__global__ void FinalSort(const float* __restrict__ scores_in, const int* __restrict__ indices_in,
+                          float* __restrict__ scores_out, int* __restrict__ indices_out, int k_final) {
   __shared__ float smem_scores[K_padded];
   __shared__ int smem_indices[K_padded];
 
