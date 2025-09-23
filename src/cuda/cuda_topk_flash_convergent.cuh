@@ -105,8 +105,13 @@ __global__ void FlashSortSmallKernel(const float* __restrict__ scores_in,
     }
     __syncthreads();
 
-    // Use the efficient single-warp CUB merge sort for the final reduction.
-    bitonic_sort::WarpMergeSort<kSortSize>(smem.stage2_bitonic_storage.scores, smem.stage2_bitonic_storage.indices, &smem.cub_storage, num_elements_to_sort);
+    if constexpr (kSortSize <= 128) {
+      // Use the efficient single-warp CUB merge sort for the final reduction.
+      bitonic_sort::WarpMergeSort<kSortSize>(smem.stage2_bitonic_storage.scores, smem.stage2_bitonic_storage.indices, &smem.cub_storage, num_elements_to_sort);
+    } else {
+      // For larger sorts, use the full block bitonic sort for more parallelism.
+      bitonic_sort::SharedMemBitonicSort<kBlockSize, kSortSize>(smem.stage2_bitonic_storage.scores, smem.stage2_bitonic_storage.indices);
+    }
 
     // Synchronize the block to ensure all threads see the sorted results
     // written by the first warp before writing to global memory.

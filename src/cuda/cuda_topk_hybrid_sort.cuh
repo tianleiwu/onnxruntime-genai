@@ -50,7 +50,8 @@ namespace hybrid_sort {
 // The internal sorting algorithm to be used inside the reduction kernel, chosen by the host-side planner.
 enum class ReductionAlgorithm {
   WARP_BITONIC,     // For very small sorts (<= 32 items), uses a register-based warp sort.
-  WARP_MERGE_SORT,  // For small sorts ( 33 ~256 items), uses a CUB-based warp merge sort.
+  WARP_MERGE_SORT,  // For small sorts (33-128 items), uses a CUB-based warp merge sort.
+  BLOCK_BITONIC,    // For medium sorts (129-256 items), uses a shared memory bitonic sort.
   CUB_RADIX_SORT    // For larger sorts (> 256 items), uses the powerful CUB block-wide radix sort.
 };
 
@@ -142,8 +143,10 @@ inline ReductionPlan GetReductionPlan(int num_partitions, int k_padded) {
     int sort_size = k_padded * step.partitions_per_block;
     if (sort_size <= 32) {
       step.algorithm = ReductionAlgorithm::WARP_BITONIC;
-    } else if (sort_size <= 256) {
+    } else if (sort_size <= 128) {
       step.algorithm = ReductionAlgorithm::WARP_MERGE_SORT;
+    } else if (sort_size <= 256) {
+      step.algorithm = ReductionAlgorithm::BLOCK_BITONIC;
     } else {
       step.algorithm = ReductionAlgorithm::CUB_RADIX_SORT;
     }
@@ -239,7 +242,7 @@ __global__ void BlockReduceTopK(const float* __restrict__ scores_in, const int* 
     }
 #endif
   } else {  // This block handles both WARP_BITONIC and WARP_MERGE_SORT
-    constexpr int kSortSizePo2 = topk_common::NextPowerOfTwo(kSortSize > 1 ? kSortSize - 1 : 0);
+    constexpr int kSortSizePo2 = topk_common::NextPowerOfTwo(kSortSize);
 
     union SharedStorage {
       struct {
@@ -264,13 +267,15 @@ __global__ void BlockReduceTopK(const float* __restrict__ scores_in, const int* 
       }
     }
 
-    if constexpr (Algorithm == ReductionAlgorithm::WARP_BITONIC) {
+    if constexpr (Algorithm == ReductionAlgorithm::WARP_BITONIC || Algorithm == ReductionAlgorithm::BLOCK_BITONIC) {
       for (int i = kSortSize + threadIdx.x; i < kSortSizePo2; i += kBlockSize) {
         smem_sort.scores[i] = -FLT_MAX;
         smem_sort.indices[i] = INT_MAX;
       }
-      __syncthreads();
+    }
+    __syncthreads();
 
+    if constexpr (Algorithm == ReductionAlgorithm::WARP_BITONIC) {
       if (threadIdx.x < warpSize) {
         float my_score = (threadIdx.x < kSortSize) ? smem_sort.scores[threadIdx.x] : -FLT_MAX;
         int my_index = (threadIdx.x < kSortSize) ? smem_sort.indices[threadIdx.x] : INT_MAX;
@@ -281,8 +286,9 @@ __global__ void BlockReduceTopK(const float* __restrict__ scores_in, const int* 
         }
       }
     } else if constexpr (Algorithm == ReductionAlgorithm::WARP_MERGE_SORT) {
-      __syncthreads();
       bitonic_sort::WarpMergeSort<kSortSizePo2>(smem_sort.scores, smem_sort.indices, &smem_union.cub_warp_storage, num_elements_to_sort);
+    } else if constexpr (Algorithm == ReductionAlgorithm::BLOCK_BITONIC) {
+      bitonic_sort::SharedMemBitonicSort<kBlockSize, kSortSizePo2>(smem_sort.scores, smem_sort.indices);
     }
 
     __syncthreads();
@@ -320,9 +326,16 @@ void LaunchReductionStep(const ReductionStep& step, cudaStream_t stream,
         BlockReduceTopK<B_SIZE, K_PADDED, P_PER_BLOCK, ReductionAlgorithm::CUB_RADIX_SORT><<<grid, block, 0, stream>>>(
             scores_in, indices_in, scores_out, indices_out, num_partitions_in);
         break;
+      case ReductionAlgorithm::BLOCK_BITONIC:
+        if constexpr (kSortSize > 128 && kSortSize <= 256) {
+          BlockReduceTopK<B_SIZE, K_PADDED, P_PER_BLOCK, ReductionAlgorithm::BLOCK_BITONIC><<<grid, block, 0, stream>>>(
+              scores_in, indices_in, scores_out, indices_out, num_partitions_in);
+        }
+        break;
+
       case ReductionAlgorithm::WARP_MERGE_SORT:
         // This `if constexpr` ensures this kernel is only instantiated when kSortSize is valid for it.
-        if constexpr (kSortSize > 32 && kSortSize <= 256) {
+        if constexpr (kSortSize > 32 && kSortSize <= 128) {
           BlockReduceTopK<B_SIZE, K_PADDED, P_PER_BLOCK, ReductionAlgorithm::WARP_MERGE_SORT><<<grid, block, 0, stream>>>(
               scores_in, indices_in, scores_out, indices_out, num_partitions_in);
         }

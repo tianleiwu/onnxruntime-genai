@@ -177,7 +177,11 @@ __global__ void CascadedSortKernel(const float* __restrict__ input_scores,
       }
       __syncthreads();
 
-      bitonic_sort::WarpMergeSort<kSortSize1>(smem.stage2_storage.scores, smem.stage2_storage.indices, &smem.cub_storage, num_elements_to_sort);
+      if constexpr (kSortSize1 <= 128) {
+        bitonic_sort::WarpMergeSort<kSortSize1>(smem.stage2_storage.scores, smem.stage2_storage.indices, &smem.cub_storage, num_elements_to_sort);
+      } else {
+        bitonic_sort::SharedMemBitonicSort<kBlockSize, kSortSize1>(smem.stage2_storage.scores, smem.stage2_storage.indices);
+      }
       __syncthreads();
 
       if (threadIdx.x < K_PADDED) {
@@ -215,7 +219,11 @@ __global__ void CascadedSortKernel(const float* __restrict__ input_scores,
       }
       __syncthreads();
 
-      bitonic_sort::WarpMergeSort<kSortSize2>(smem.stage2_storage.scores, smem.stage2_storage.indices, &smem.cub_storage, num_elements_to_sort);
+      if constexpr (kSortSize2 <= 128) {
+        bitonic_sort::WarpMergeSort<kSortSize2>(smem.stage2_storage.scores, smem.stage2_storage.indices, &smem.cub_storage, num_elements_to_sort);
+      } else {
+        bitonic_sort::SharedMemBitonicSort<kBlockSize, kSortSize2>(smem.stage2_storage.scores, smem.stage2_storage.indices);
+      }
       __syncthreads();
 
       if (threadIdx.x < K_PADDED) {
@@ -251,7 +259,11 @@ __global__ void CascadedSortKernel(const float* __restrict__ input_scores,
       }
       __syncthreads();
 
-      bitonic_sort::WarpMergeSort<kSortSize3>(smem.stage2_storage.scores, smem.stage2_storage.indices, &smem.cub_storage, num_elements_to_sort);
+      if constexpr (kSortSize3 <= 128) {
+        bitonic_sort::WarpMergeSort<kSortSize3>(smem.stage2_storage.scores, smem.stage2_storage.indices, &smem.cub_storage, num_elements_to_sort);
+      } else {
+        bitonic_sort::SharedMemBitonicSort<kBlockSize, kSortSize3>(smem.stage2_storage.scores, smem.stage2_storage.indices);
+      }
       __syncthreads();
 
       if (threadIdx.x < K_PADDED) {

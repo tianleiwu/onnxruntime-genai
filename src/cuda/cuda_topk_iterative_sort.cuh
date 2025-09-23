@@ -151,8 +151,13 @@ __global__ void IterativeSortKernel(const float* __restrict__ input_scores,
           }
         }
       } else {
-        // For small to medium K, a single warp CUB sort is highly efficient.
-        bitonic_sort::WarpMergeSort<kSortSize>(smem.stage2_storage.scores, smem.stage2_storage.indices, &smem.cub_storage, num_elements_to_sort);
+        if constexpr (kSortSize <= 128) {
+          // For small to medium K, a single warp CUB sort is highly efficient.
+          bitonic_sort::WarpMergeSort<kSortSize>(smem.stage2_storage.scores, smem.stage2_storage.indices, &smem.cub_storage, num_elements_to_sort);
+        } else {
+          // For larger sorts, use the full block bitonic sort for more parallelism.
+          bitonic_sort::SharedMemBitonicSort<kBlockSize, kSortSize>(smem.stage2_storage.scores, smem.stage2_storage.indices);
+        }
       }
 
       __syncthreads();
