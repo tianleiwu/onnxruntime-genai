@@ -49,9 +49,8 @@ namespace hybrid_sort {
 
 // The internal sorting algorithm to be used inside the reduction kernel, chosen by the host-side planner.
 enum class ReductionAlgorithm {
-  WARP_BITONIC,   // For very small sorts (<= 32 items), uses a register-based warp sort.
-  BLOCK_BITONIC,  // For small sorts (33-256 items), uses a shared memory bitonic sort.
-  CUB_RADIX_SORT  // For larger sorts (> 256 items), uses the powerful CUB block-wide radix sort.
+  WARP_MERGE_SORT,  // For small sorts (<= 256 items), uses a CUB-based warp merge sort.
+  CUB_RADIX_SORT    // For larger sorts (> 256 items), uses the powerful CUB block-wide radix sort.
 };
 
 // Contains the parameters for a single reduction kernel launch.
@@ -140,10 +139,8 @@ inline ReductionPlan GetReductionPlan(int num_partitions, int k_padded) {
     step.block_size = (k_padded <= 16) ? 128 : 256;
 
     int sort_size = k_padded * step.partitions_per_block;
-    if (sort_size <= 32) {
-      step.algorithm = ReductionAlgorithm::WARP_BITONIC;
-    } else if (sort_size <= 256) {
-      step.algorithm = ReductionAlgorithm::BLOCK_BITONIC;
+    if (sort_size <= 256) {
+      step.algorithm = ReductionAlgorithm::WARP_MERGE_SORT;
     } else {
       step.algorithm = ReductionAlgorithm::CUB_RADIX_SORT;
     }
@@ -176,26 +173,50 @@ __global__ void AdvancedBlockReduceTopK(const float* __restrict__ scores_in, con
   const int batch_idx = blockIdx.y;
   const int block_start_partition = blockIdx.x * PartitionsPerBlock;
   const int num_partitions_to_process = min(PartitionsPerBlock, num_partitions_in - block_start_partition);
+  const int num_elements_to_sort = K_PADDED * num_partitions_to_process;
 
   const size_t in_base_offset = static_cast<size_t>(batch_idx) * num_partitions_in * K_PADDED;
   const size_t out_base_offset = (static_cast<size_t>(batch_idx) * gridDim.x + blockIdx.x) * K_PADDED;
 
   constexpr int kSortSize = K_PADDED * PartitionsPerBlock;
 
+#ifdef STABLE_TOPK
+  using SortKeyT = uint64_t;
+#else
+  using SortKeyT = float;
+  using SortValueT = int;
+#endif
+
+  // Union to overlay shared memory for the two sorting algorithms.
+  union SharedStorage {
+    // CUB storage for the Radix Sort path.
+    typename cub::BlockRadixSort<SortKeyT, kBlockSize, CeilDiv(kSortSize, kBlockSize)
+#ifndef STABLE_TOPK
+                                 , SortValueT
+#endif
+                                 >::TempStorage cub_radix_storage;
+
+    // Storage for the Warp Merge Sort path.
+    struct {
+      __align__(128) float scores[topk_common::NextPowerOfTwo(kSortSize > 1 ? kSortSize - 1 : 0)];
+      __align__(128) int indices[topk_common::NextPowerOfTwo(kSortSize > 1 ? kSortSize - 1 : 0)];
+    } smem_sort;
+
+    // CUB temporary storage for the Warp Merge Sort helper.
+    typename cub::WarpMergeSort<uint64_t, (topk_common::NextPowerOfTwo(kSortSize > 1 ? kSortSize - 1 : 0) + 31) / 32, 32>::TempStorage cub_warp_storage;
+  };
+  __shared__ SharedStorage smem_union;
+
   // --- Sorting Stage (Compile-Time Dispatch) ---
   if constexpr (Algorithm == ReductionAlgorithm::CUB_RADIX_SORT) {
     // --- CUB Radix Sort Path ---
-    // This path loads data directly from global memory to registers, using shared memory
-    // exclusively for CUB's internal temporary storage to avoid memory hazards.
     constexpr int kItemsPerThread = CeilDiv(kSortSize, kBlockSize);
 #ifdef STABLE_TOPK
-    using SortKeyT = uint64_t;
-    __shared__ typename cub::BlockRadixSort<SortKeyT, kBlockSize, kItemsPerThread>::TempStorage smem_cub;
     SortKeyT thread_keys[kItemsPerThread];
 
     for (int i = 0; i < kItemsPerThread; ++i) {
       int item_idx = threadIdx.x + i * kBlockSize;
-      if (item_idx < K_PADDED * num_partitions_to_process) {
+      if (item_idx < num_elements_to_sort) {
         int partition_idx = item_idx / K_PADDED;
         int element_idx = item_idx % K_PADDED;
         size_t offset = in_base_offset + static_cast<size_t>(block_start_partition + partition_idx) * K_PADDED + element_idx;
@@ -204,21 +225,18 @@ __global__ void AdvancedBlockReduceTopK(const float* __restrict__ scores_in, con
         thread_keys[i] = topk_common::PackStableSortKey(-FLT_MAX, INT_MAX);
       }
     }
-    cub::BlockRadixSort<SortKeyT, kBlockSize, kItemsPerThread>(smem_cub).SortDescendingBlockedToStriped(thread_keys);
+    cub::BlockRadixSort<SortKeyT, kBlockSize, kItemsPerThread>(smem_union.cub_radix_storage).SortDescendingBlockedToStriped(thread_keys);
     if (threadIdx.x < K_PADDED) {
       scores_out[out_base_offset + threadIdx.x] = topk_common::UnpackStableSortScore(thread_keys[0]);
       indices_out[out_base_offset + threadIdx.x] = topk_common::UnpackStableSortIndex(thread_keys[0]);
     }
 #else
-    using SortKeyT = float;
-    using SortValueT = int;
-    __shared__ typename cub::BlockRadixSort<SortKeyT, kBlockSize, kItemsPerThread, SortValueT>::TempStorage smem_cub;
     SortKeyT thread_keys[kItemsPerThread];
     SortValueT thread_values[kItemsPerThread];
 
     for (int i = 0; i < kItemsPerThread; ++i) {
       int item_idx = threadIdx.x + i * kBlockSize;
-      if (item_idx < K_PADDED * num_partitions_to_process) {
+      if (item_idx < num_elements_to_sort) {
         int partition_idx = item_idx / K_PADDED;
         int element_idx = item_idx % K_PADDED;
         size_t offset = in_base_offset + static_cast<size_t>(block_start_partition + partition_idx) * K_PADDED + element_idx;
@@ -229,64 +247,41 @@ __global__ void AdvancedBlockReduceTopK(const float* __restrict__ scores_in, con
         thread_values[i] = INT_MAX;
       }
     }
-    cub::BlockRadixSort<SortKeyT, kBlockSize, kItemsPerThread, SortValueT>(smem_cub).SortDescendingBlockedToStriped(thread_keys, thread_values);
+    cub::BlockRadixSort<SortKeyT, kBlockSize, kItemsPerThread, SortValueT>(smem_union.cub_radix_storage).SortDescendingBlockedToStriped(thread_keys, thread_values);
     if (threadIdx.x < K_PADDED) {
       scores_out[out_base_offset + threadIdx.x] = thread_keys[0];
       indices_out[out_base_offset + threadIdx.x] = thread_values[0];
     }
 #endif
   } else {
-    // --- Bitonic Sort Path (Warp or Block) ---
-    // This path loads data into shared memory first, then performs an in-place sort.
+    // --- CUB Warp Merge Sort Path (for sorts <= 256) ---
     constexpr int kSortSizePo2 = topk_common::NextPowerOfTwo(kSortSize > 1 ? kSortSize - 1 : 0);
-    __shared__ struct {
-      __align__(128) float scores[kSortSizePo2];
-      __align__(128) int indices[kSortSizePo2];
-    } smem_bitonic;
+    auto& smem_sort = smem_union.smem_sort;
 
+    // Load data into shared memory.
     for (int i = threadIdx.x; i < kSortSize; i += kBlockSize) {
-      if (i < K_PADDED * num_partitions_to_process) {
+      if (i < num_elements_to_sort) {
         int partition_idx = i / K_PADDED;
         int element_idx = i % K_PADDED;
         size_t global_offset = in_base_offset + static_cast<size_t>(block_start_partition + partition_idx) * K_PADDED + element_idx;
-        smem_bitonic.scores[i] = scores_in[global_offset];
-        smem_bitonic.indices[i] = indices_in[global_offset];
+        smem_sort.scores[i] = scores_in[global_offset];
+        smem_sort.indices[i] = indices_in[global_offset];
       } else {
-        smem_bitonic.scores[i] = -FLT_MAX;
-        smem_bitonic.indices[i] = INT_MAX;
+        smem_sort.scores[i] = -FLT_MAX;
+        smem_sort.indices[i] = INT_MAX;
       }
-    }
-    for (int i = kSortSize + threadIdx.x; i < kSortSizePo2; i += kBlockSize) {
-      smem_bitonic.scores[i] = -FLT_MAX;
-      smem_bitonic.indices[i] = INT_MAX;
     }
     __syncthreads();
 
-    if constexpr (Algorithm == ReductionAlgorithm::WARP_BITONIC) {
-      if (threadIdx.x < warpSize) {
-        float my_score = (threadIdx.x < kSortSize) ? smem_bitonic.scores[threadIdx.x] : -FLT_MAX;
-        int my_index = (threadIdx.x < kSortSize) ? smem_bitonic.indices[threadIdx.x] : INT_MAX;
-        bitonic_sort::WarpBitonicSort(my_score, my_index);
-        if (threadIdx.x < K_PADDED) {
-          smem_bitonic.scores[threadIdx.x] = my_score;
-          smem_bitonic.indices[threadIdx.x] = my_index;
-        }
-      }
-      __syncthreads();
-    } else if constexpr (Algorithm == ReductionAlgorithm::BLOCK_BITONIC) {
-      if constexpr (kSortSizePo2 <= 32)
-        bitonic_sort::SharedMemBitonicSort<kBlockSize, 32>(smem_bitonic.scores, smem_bitonic.indices);
-      else if constexpr (kSortSizePo2 <= 64)
-        bitonic_sort::SharedMemBitonicSort<kBlockSize, 64>(smem_bitonic.scores, smem_bitonic.indices);
-      else if constexpr (kSortSizePo2 <= 128)
-        bitonic_sort::SharedMemBitonicSort<kBlockSize, 128>(smem_bitonic.scores, smem_bitonic.indices);
-      else if constexpr (kSortSizePo2 <= 256)
-        bitonic_sort::SharedMemBitonicSort<kBlockSize, 256>(smem_bitonic.scores, smem_bitonic.indices);
-    }
+    // A single warp performs the sort on the shared data using CUB.
+    bitonic_sort::WarpMergeSort_cub<kSortSizePo2>(smem_sort.scores, smem_sort.indices, &smem_union.cub_warp_storage, num_elements_to_sort);
+
+    // Synchronize the block to ensure all threads see the sorted results.
+    __syncthreads();
 
     if (threadIdx.x < K_PADDED) {
-      indices_out[out_base_offset + threadIdx.x] = smem_bitonic.indices[threadIdx.x];
-      scores_out[out_base_offset + threadIdx.x] = smem_bitonic.scores[threadIdx.x];
+      indices_out[out_base_offset + threadIdx.x] = smem_sort.indices[threadIdx.x];
+      scores_out[out_base_offset + threadIdx.x] = smem_sort.scores[threadIdx.x];
     }
   }
 }
@@ -307,33 +302,29 @@ void LaunchReductionStep(const ReductionStep& step, cudaStream_t stream,
 
   auto dispatch_kernels = [&](auto block_size_const) {
     constexpr int B_SIZE = block_size_const.value;
-    // Dispatch to the correct kernel based on the partitions_per_block chosen by the planner.
+    // The planner now chooses between two algorithms. We just need to instantiate
+    // the kernel with the correct template arguments.
     switch (step.partitions_per_block) {
       case 16:
         if (step.algorithm == ReductionAlgorithm::CUB_RADIX_SORT)
           LAUNCH_KERNEL(B_SIZE, 16, ReductionAlgorithm::CUB_RADIX_SORT);
         else
-          LAUNCH_KERNEL(B_SIZE, 16, ReductionAlgorithm::BLOCK_BITONIC);
+          LAUNCH_KERNEL(B_SIZE, 16, ReductionAlgorithm::WARP_MERGE_SORT);
         break;
       case 8:
         if (step.algorithm == ReductionAlgorithm::CUB_RADIX_SORT)
           LAUNCH_KERNEL(B_SIZE, 8, ReductionAlgorithm::CUB_RADIX_SORT);
         else
-          LAUNCH_KERNEL(B_SIZE, 8, ReductionAlgorithm::BLOCK_BITONIC);
+          LAUNCH_KERNEL(B_SIZE, 8, ReductionAlgorithm::WARP_MERGE_SORT);
         break;
       case 4:
         if (step.algorithm == ReductionAlgorithm::CUB_RADIX_SORT)
           LAUNCH_KERNEL(B_SIZE, 4, ReductionAlgorithm::CUB_RADIX_SORT);
-        else if (step.algorithm == ReductionAlgorithm::BLOCK_BITONIC)
-          LAUNCH_KERNEL(B_SIZE, 4, ReductionAlgorithm::BLOCK_BITONIC);
         else
-          LAUNCH_KERNEL(B_SIZE, 4, ReductionAlgorithm::WARP_BITONIC);
+          LAUNCH_KERNEL(B_SIZE, 4, ReductionAlgorithm::WARP_MERGE_SORT);
         break;
       case 2:
-        if (step.algorithm == ReductionAlgorithm::BLOCK_BITONIC)
-          LAUNCH_KERNEL(B_SIZE, 2, ReductionAlgorithm::BLOCK_BITONIC);
-        else
-          LAUNCH_KERNEL(B_SIZE, 2, ReductionAlgorithm::WARP_BITONIC);
+        LAUNCH_KERNEL(B_SIZE, 2, ReductionAlgorithm::WARP_MERGE_SORT);
         break;
       default:
         // This case indicates a planning logic issue.

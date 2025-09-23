@@ -42,6 +42,17 @@ namespace cascaded_sort {
 
 namespace cg = cooperative_groups;
 
+// Helper to compute the max of three values at compile time.
+template <typename T>
+__host__ __device__ __forceinline__ constexpr T Max(T a, T b) {
+  return a > b ? a : b;
+}
+
+template <typename T>
+__host__ __device__ __forceinline__ constexpr T Max(T a, T b, T c) {
+  return Max(a, Max(b, c));
+}
+
 struct ReductionFactors {
   int factor1 = 1;
   int factor2 = 1;
@@ -105,23 +116,17 @@ __global__ void CascadedSortKernel(const float* __restrict__ input_scores,
   constexpr int kSortSize1 = K_PADDED * Factor1;
   constexpr int kSortSize2 = K_PADDED * Factor2;
   constexpr int kSortSize3 = K_PADDED * Factor3;
+  constexpr int kMaxSortSize = Max(kSortSize1, kSortSize2, kSortSize3);
 
   using Stage1TempStorageType = typename topk_common::Stage1TempStorage<kBlockSize, kPartitionSize>;
   union SharedStorage {
     Stage1TempStorageType stage1_storage;
-
     struct {
-      __align__(128) float scores[kSortSize1];
-      __align__(128) int indices[kSortSize1];
-    } step1_storage;
-    struct {
-      __align__(128) float scores[kSortSize2];
-      __align__(128) int indices[kSortSize2];
-    } step2_storage;
-    struct {
-      __align__(128) float scores[kSortSize3];
-      __align__(128) int indices[kSortSize3];
-    } step3_storage;
+      __align__(128) float scores[kMaxSortSize];
+      __align__(128) int indices[kMaxSortSize];
+    } sort_storage;
+    // Temporary storage for the CUB warp sort helper.
+    typename cub::WarpMergeSort<uint64_t, (kMaxSortSize + 31) / 32, 32>::TempStorage cub_storage;
   };
   __shared__ SharedStorage smem;
 
@@ -138,7 +143,6 @@ __global__ void CascadedSortKernel(const float* __restrict__ input_scores,
   if (Factor1 > 1) {
     partitions_after_step1 = CeilDiv(num_partitions, Factor1);
     if (partition_idx < partitions_after_step1) {
-      // Reads from buffer 1, writes to buffer 2
       const float* scores_in_batch = intermediate_scores_1 + static_cast<size_t>(batch_idx) * num_partitions * K_PADDED;
       const int* indices_in_batch = intermediate_indices_1 + static_cast<size_t>(batch_idx) * num_partitions * K_PADDED;
       float* scores_out_batch = intermediate_scores_2 + static_cast<size_t>(batch_idx) * partitions_after_step1 * K_PADDED;
@@ -146,34 +150,40 @@ __global__ void CascadedSortKernel(const float* __restrict__ input_scores,
 
       int first_child = partition_idx * Factor1;
       int num_to_process = min(Factor1, num_partitions - first_child);
+      const int num_elements_to_sort = K_PADDED * num_to_process;
+
       for (int i = threadIdx.x; i < kSortSize1; i += kBlockSize) {
-        if (i < K_PADDED * num_to_process) {
+        if (i < num_elements_to_sort) {
           size_t offset = (static_cast<size_t>(first_child) + i / K_PADDED) * K_PADDED + (i % K_PADDED);
-          smem.step1_storage.scores[i] = scores_in_batch[offset];
-          smem.step1_storage.indices[i] = indices_in_batch[offset];
+          smem.sort_storage.scores[i] = scores_in_batch[offset];
+          smem.sort_storage.indices[i] = indices_in_batch[offset];
         } else {
-          smem.step1_storage.scores[i] = -FLT_MAX;
-          smem.step1_storage.indices[i] = INT_MAX;
+          smem.sort_storage.scores[i] = -FLT_MAX;
+          smem.sort_storage.indices[i] = INT_MAX;
         }
       }
       __syncthreads();
-      bitonic_sort::SharedMemBitonicSort<kBlockSize, kSortSize1>(smem.step1_storage.scores, smem.step1_storage.indices);
+
+      if constexpr (kSortSize1 <= 256) {
+        bitonic_sort::WarpMergeSort_cub<kSortSize1>(smem.sort_storage.scores, smem.sort_storage.indices, &smem.cub_storage, num_elements_to_sort);
+      } else {
+        bitonic_sort::SharedMemBitonicSort<kBlockSize, kSortSize1>(smem.sort_storage.scores, smem.sort_storage.indices);
+      }
+      __syncthreads();
+
       if (threadIdx.x < K_PADDED) {
-        scores_out_batch[static_cast<size_t>(partition_idx) * K_PADDED + threadIdx.x] = smem.step1_storage.scores[threadIdx.x];
-        indices_out_batch[static_cast<size_t>(partition_idx) * K_PADDED + threadIdx.x] = smem.step1_storage.indices[threadIdx.x];
+        scores_out_batch[static_cast<size_t>(partition_idx) * K_PADDED + threadIdx.x] = smem.sort_storage.scores[threadIdx.x];
+        indices_out_batch[static_cast<size_t>(partition_idx) * K_PADDED + threadIdx.x] = smem.sort_storage.indices[threadIdx.x];
       }
     }
     grid.sync();
   }
 
   // --- Stage 2, Step 2: Second Reduction ---
-  // This block executes if the plan includes a second reduction step.
-  // It reads from buffer 2, merges `Factor2` partitions, and writes the result to buffer 1.
   int partitions_after_step2 = partitions_after_step1;
   if (Factor2 > 1) {
     partitions_after_step2 = CeilDiv(partitions_after_step1, Factor2);
     if (partition_idx < partitions_after_step2) {
-      // Reads from buffer 2, writes to buffer 1
       const float* scores_in_batch = intermediate_scores_2 + static_cast<size_t>(batch_idx) * partitions_after_step1 * K_PADDED;
       const int* indices_in_batch = intermediate_indices_2 + static_cast<size_t>(batch_idx) * partitions_after_step1 * K_PADDED;
       float* scores_out_batch = intermediate_scores_1 + static_cast<size_t>(batch_idx) * partitions_after_step2 * K_PADDED;
@@ -181,33 +191,39 @@ __global__ void CascadedSortKernel(const float* __restrict__ input_scores,
 
       int first_child = partition_idx * Factor2;
       int num_to_process = min(Factor2, partitions_after_step1 - first_child);
+      const int num_elements_to_sort = K_PADDED * num_to_process;
+
       for (int i = threadIdx.x; i < kSortSize2; i += kBlockSize) {
-        if (i < K_PADDED * num_to_process) {
+        if (i < num_elements_to_sort) {
           size_t offset = (static_cast<size_t>(first_child) + i / K_PADDED) * K_PADDED + (i % K_PADDED);
-          smem.step2_storage.scores[i] = scores_in_batch[offset];
-          smem.step2_storage.indices[i] = indices_in_batch[offset];
+          smem.sort_storage.scores[i] = scores_in_batch[offset];
+          smem.sort_storage.indices[i] = indices_in_batch[offset];
         } else {
-          smem.step2_storage.scores[i] = -FLT_MAX;
-          smem.step2_storage.indices[i] = INT_MAX;
+          smem.sort_storage.scores[i] = -FLT_MAX;
+          smem.sort_storage.indices[i] = INT_MAX;
         }
       }
       __syncthreads();
-      bitonic_sort::SharedMemBitonicSort<kBlockSize, kSortSize2>(smem.step2_storage.scores, smem.step2_storage.indices);
+
+      if constexpr (kSortSize2 <= 256) {
+        bitonic_sort::WarpMergeSort_cub<kSortSize2>(smem.sort_storage.scores, smem.sort_storage.indices, &smem.cub_storage, num_elements_to_sort);
+      } else {
+        bitonic_sort::SharedMemBitonicSort<kBlockSize, kSortSize2>(smem.sort_storage.scores, smem.sort_storage.indices);
+      }
+      __syncthreads();
+
       if (threadIdx.x < K_PADDED) {
-        scores_out_batch[static_cast<size_t>(partition_idx) * K_PADDED + threadIdx.x] = smem.step2_storage.scores[threadIdx.x];
-        indices_out_batch[static_cast<size_t>(partition_idx) * K_PADDED + threadIdx.x] = smem.step2_storage.indices[threadIdx.x];
+        scores_out_batch[static_cast<size_t>(partition_idx) * K_PADDED + threadIdx.x] = smem.sort_storage.scores[threadIdx.x];
+        indices_out_batch[static_cast<size_t>(partition_idx) * K_PADDED + threadIdx.x] = smem.sort_storage.indices[threadIdx.x];
       }
     }
     grid.sync();
   }
 
   // --- Stage 2, Step 3: Third Reduction ---
-  // This block executes if the plan includes a third reduction step.
-  // It reads from buffer 1, merges `Factor3` partitions, and writes the result to buffer 2.
   if (Factor3 > 1) {
     int partitions_after_step3 = CeilDiv(partitions_after_step2, Factor3);
     if (partition_idx < partitions_after_step3) {
-      // Reads from buffer 1, writes to buffer 2
       const float* scores_in_batch = intermediate_scores_1 + static_cast<size_t>(batch_idx) * partitions_after_step2 * K_PADDED;
       const int* indices_in_batch = intermediate_indices_1 + static_cast<size_t>(batch_idx) * partitions_after_step2 * K_PADDED;
       float* scores_out_batch = intermediate_scores_2 + static_cast<size_t>(batch_idx) * partitions_after_step3 * K_PADDED;
@@ -215,21 +231,29 @@ __global__ void CascadedSortKernel(const float* __restrict__ input_scores,
 
       int first_child = partition_idx * Factor3;
       int num_to_process = min(Factor3, partitions_after_step2 - first_child);
+      const int num_elements_to_sort = K_PADDED * num_to_process;
       for (int i = threadIdx.x; i < kSortSize3; i += kBlockSize) {
-        if (i < K_PADDED * num_to_process) {
+        if (i < num_elements_to_sort) {
           size_t offset = (static_cast<size_t>(first_child) + i / K_PADDED) * K_PADDED + (i % K_PADDED);
-          smem.step3_storage.scores[i] = scores_in_batch[offset];
-          smem.step3_storage.indices[i] = indices_in_batch[offset];
+          smem.sort_storage.scores[i] = scores_in_batch[offset];
+          smem.sort_storage.indices[i] = indices_in_batch[offset];
         } else {
-          smem.step3_storage.scores[i] = -FLT_MAX;
-          smem.step3_storage.indices[i] = INT_MAX;
+          smem.sort_storage.scores[i] = -FLT_MAX;
+          smem.sort_storage.indices[i] = INT_MAX;
         }
       }
       __syncthreads();
-      bitonic_sort::SharedMemBitonicSort<kBlockSize, kSortSize3>(smem.step3_storage.scores, smem.step3_storage.indices);
+
+      if constexpr (kSortSize3 <= 256) {
+        bitonic_sort::WarpMergeSort_cub<kSortSize3>(smem.sort_storage.scores, smem.sort_storage.indices, &smem.cub_storage, num_elements_to_sort);
+      } else {
+        bitonic_sort::SharedMemBitonicSort<kBlockSize, kSortSize3>(smem.sort_storage.scores, smem.sort_storage.indices);
+      }
+      __syncthreads();
+
       if (threadIdx.x < K_PADDED) {
-        scores_out_batch[static_cast<size_t>(partition_idx) * K_PADDED + threadIdx.x] = smem.step3_storage.scores[threadIdx.x];
-        indices_out_batch[static_cast<size_t>(partition_idx) * K_PADDED + threadIdx.x] = smem.step3_storage.indices[threadIdx.x];
+        scores_out_batch[static_cast<size_t>(partition_idx) * K_PADDED + threadIdx.x] = smem.sort_storage.scores[threadIdx.x];
+        indices_out_batch[static_cast<size_t>(partition_idx) * K_PADDED + threadIdx.x] = smem.sort_storage.indices[threadIdx.x];
       }
     }
   }
@@ -505,3 +529,4 @@ bool IsSupported(int batch_size, int vocab_size, int k) {
 }  // namespace cascaded_sort
 }  // namespace cuda
 }  // namespace Generators
+

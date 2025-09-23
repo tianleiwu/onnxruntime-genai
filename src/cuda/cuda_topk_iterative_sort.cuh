@@ -79,6 +79,8 @@ __global__ void IterativeSortKernel(const float* __restrict__ input_scores,
       __align__(128) float scores[kSortSize];
       __align__(128) int indices[kSortSize];
     } stage2_storage;
+    // Temporary storage for the CUB warp sort helper.
+    typename cub::WarpMergeSort<uint64_t, (kSortSize + 31) / 32, 32>::TempStorage cub_storage;
   };
   __shared__ SharedStorage smem;
 
@@ -110,9 +112,10 @@ __global__ void IterativeSortKernel(const float* __restrict__ input_scores,
       // Each active block loads candidates from `kReductionFactor` partitions into its shared memory.
       int first_child_partition = partition_idx * kReductionFactor;
       int num_partitions_to_process = min(kReductionFactor, partitions_remaining - first_child_partition);
+      const int num_elements_to_sort = K_PADDED * num_partitions_to_process;
 
       for (int i = threadIdx.x; i < kSortSize; i += kBlockSize) {
-        if (i < K_PADDED * num_partitions_to_process) {
+        if (i < num_elements_to_sort) {
           int part_idx = i / K_PADDED;
           int element_idx = i % K_PADDED;
           size_t local_offset = static_cast<size_t>(first_child_partition + part_idx) * K_PADDED + element_idx;
@@ -126,32 +129,10 @@ __global__ void IterativeSortKernel(const float* __restrict__ input_scores,
       }
       __syncthreads();
 
-      // --- Choose sorting strategy based on K ---
-      if constexpr (K_PADDED <= 8) {
-        // For small K, the total number of items to sort (kSortSize) is at most 32.
-        // A warp-level bitonic sort is extremely fast as it operates entirely in registers
-        // without needing shared memory for the sort itself.
-        if (threadIdx.x < warpSize) {
-          float my_score;
-          int my_index;
-          if (threadIdx.x < kSortSize) {
-            my_score = smem.stage2_storage.scores[threadIdx.x];
-            my_index = smem.stage2_storage.indices[threadIdx.x];
-          } else {
-            my_score = -FLT_MAX;
-            my_index = INT_MAX;
-          }
-          bitonic_sort::WarpBitonicSort(my_score, my_index);
-          if (threadIdx.x < K_PADDED) {
-            smem.stage2_storage.scores[threadIdx.x] = my_score;
-            smem.stage2_storage.indices[threadIdx.x] = my_index;
-          }
-        }
-        __syncthreads();
-      } else {
-        // For larger K, a shared-memory bitonic sort is a robust choice.
-        bitonic_sort::SharedMemBitonicSort<kBlockSize, kSortSize>(smem.stage2_storage.scores, smem.stage2_storage.indices);
-      }
+      // For small to medium K, a single warp CUB sort is highly efficient.
+      bitonic_sort::WarpMergeSort_cub<kSortSize>(smem.stage2_storage.scores, smem.stage2_storage.indices, &smem.cub_storage, num_elements_to_sort);
+
+      __syncthreads();
 
       // Write the top K results for this merged group to the output buffer.
       if (threadIdx.x < K_PADDED) {
@@ -346,3 +327,4 @@ bool IsSupported(int batch_size, int vocab_size, int k) {
 }  // namespace iterative_sort
 }  // namespace cuda
 }  // namespace Generators
+

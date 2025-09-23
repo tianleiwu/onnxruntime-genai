@@ -68,16 +68,18 @@ __global__ void FlashSortSmallKernel(const float* __restrict__ scores_in,
   cg::grid_group grid = cg::this_grid();
 
   constexpr int kSortSizeStage2 = K_PADDED * kMaxPartitionsForKernel;
-
   static_assert(kSortSizeStage2 <= kMaxSmallSortSize, "kSortSizeStage2 must be <= kMaxSmallSortSize");
 
   using Stage1TempStorageType = typename topk_common::Stage1TempStorage<kBlockSize, kPartitionSize>;
+  constexpr int kSortSize = topk_common::NextPowerOfTwo(kMaxPartitionsForKernel * K_PADDED);
   union SharedStorage {
     Stage1TempStorageType stage1_storage;
     struct {
-      float scores[kMaxSmallSortSize];
-      int indices[kMaxSmallSortSize];
+      float scores[kSortSize];
+      int indices[kSortSize];
     } stage2_bitonic_storage;
+    // Temporary storage for the CUB warp sort helper.
+    typename cub::WarpMergeSort<uint64_t, (kSortSize + 31) / 32, 32>::TempStorage cub_storage;
   };
   __shared__ SharedStorage smem;
 
@@ -91,7 +93,6 @@ __global__ void FlashSortSmallKernel(const float* __restrict__ scores_in,
   if (blockIdx.x == 0) {
     const int batch_idx = blockIdx.y;
     const int num_elements_to_sort = num_partitions * K_PADDED;
-    constexpr int kSortSize = topk_common::NextPowerOfTwo(kMaxPartitionsForKernel * K_PADDED);
 
     for (int i = threadIdx.x; i < kSortSize; i += kBlockSize) {
       if (i < num_elements_to_sort) {
@@ -104,7 +105,12 @@ __global__ void FlashSortSmallKernel(const float* __restrict__ scores_in,
     }
     __syncthreads();
 
-    bitonic_sort::SharedMemBitonicSort<kBlockSize, kSortSize>(smem.stage2_bitonic_storage.scores, smem.stage2_bitonic_storage.indices);
+    // Use the efficient single-warp CUB merge sort for the final reduction.
+    bitonic_sort::WarpMergeSort_cub<kSortSize>(smem.stage2_bitonic_storage.scores, smem.stage2_bitonic_storage.indices, &smem.cub_storage, num_elements_to_sort);
+
+    // Synchronize the block to ensure all threads see the sorted results
+    // written by the first warp before writing to global memory.
+    __syncthreads();
 
     // Write the final top-k results to global memory.
     if (threadIdx.x < k_actual) {
