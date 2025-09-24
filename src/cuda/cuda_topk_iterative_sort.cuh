@@ -6,6 +6,7 @@
 #include <cuda_runtime.h>
 #include <cooperative_groups.h>
 #include <cub/block/block_radix_sort.cuh>
+#include <cub/block/block_merge_sort.cuh>
 #include <type_traits>  // For std::integral_constant
 #include "cuda_topk.h"
 #include "cuda_topk_bitonic_sort_helper.cuh"
@@ -31,8 +32,8 @@ namespace iterative_sort {
  *
  * Performance Characteristics:
  * -   **Strengths**: By encapsulating all logic in a single kernel, it minimizes kernel launch overhead,
- * which is a significant advantage over multi-kernel approaches. It also has a specialized,
- * fast path for small `k` (<= 8) that uses a highly efficient warp-level bitonic sort for the reduction step.
+ * which is a significant advantage over multi-kernel approaches. It uses benchmark-driven logic
+ * to select the fastest internal sorting algorithm for its reduction step.
  * -   **Weaknesses**: Requires a GPU that supports `cudaLaunchCooperativeKernel`. The fixed reduction
  * factor is less adaptive than the strategies used in `cascaded_sort` or `hybrid_sort`.
  */
@@ -69,26 +70,29 @@ __global__ void IterativeSortKernel(const float* __restrict__ input_scores,
   const int num_partitions = gridDim.x;
 
   // --- Shared Memory Union ---
-  // A union is used to efficiently reuse shared memory across different stages of the kernel.
   constexpr int kSortSize = K_PADDED * kReductionFactor;
+  constexpr int kItemsPerThread = CeilDiv(kSortSize, kBlockSize);
 
   using Stage1TempStorageType = typename topk_common::Stage1TempStorage<kBlockSize, kPartitionSize>;
   union SharedStorage {
     Stage1TempStorageType stage1_storage;
+    typename cub::WarpMergeSort<uint64_t, (kSortSize + 31) / 32, 32>::TempStorage cub_warp_storage;
+#ifdef STABLE_TOPK
+    typename cub::BlockMergeSort<uint64_t, kBlockSize, kItemsPerThread, cub::NullType>::TempStorage cub_block_merge_storage;
+#else
+    typename cub::BlockMergeSort<float, kBlockSize, kItemsPerThread, int>::TempStorage cub_block_merge_storage;
+#endif
     struct {
       __align__(128) float scores[kSortSize];
       __align__(128) int indices[kSortSize];
     } stage2_storage;
-    // Temporary storage for the CUB warp sort helper.
-    typename cub::WarpMergeSort<uint64_t, (kSortSize + 31) / 32, 32>::TempStorage cub_storage;
   };
   __shared__ SharedStorage smem;
 
   // --- Stage 1: Find Top-K within each partition ---
-  topk_common::FindPartitionTopK<kBlockSize, kPartitionSize, K_PADDED, Stage1TempStorageType>(
+  topk_common::FindPartitionTopK<kBlockSize, kPartitionSize, K_PADDED>(
       input_scores, intermediate_indices_1, intermediate_scores_1, vocab_size, num_partitions, smem.stage1_storage);
 
-  // Grid-wide synchronization to ensure all partitions are processed before starting reduction.
   grid.sync();
 
   // --- Stage 2: Iterative Tree Reduction ---
@@ -99,8 +103,7 @@ __global__ void IterativeSortKernel(const float* __restrict__ input_scores,
 
   int partitions_remaining = num_partitions;
   while (partitions_remaining > 1) {
-    int num_active_blocks = (partitions_remaining + kReductionFactor - 1) / kReductionFactor;
-    // Only the first `num_active_blocks` are responsible for merging in this iteration.
+    int num_active_blocks = CeilDiv(partitions_remaining, kReductionFactor);
     if (partition_idx < num_active_blocks) {
       const size_t in_batch_offset = static_cast<size_t>(batch_idx) * partitions_remaining * K_PADDED;
       const size_t out_batch_offset = static_cast<size_t>(batch_idx) * num_active_blocks * K_PADDED;
@@ -109,68 +112,16 @@ __global__ void IterativeSortKernel(const float* __restrict__ input_scores,
       int* indices_out_batch = p_indices_out + out_batch_offset;
       float* scores_out_batch = p_scores_out + out_batch_offset;
 
-      // Each active block loads candidates from `kReductionFactor` partitions into its shared memory.
       int first_child_partition = partition_idx * kReductionFactor;
       int num_partitions_to_process = min(kReductionFactor, partitions_remaining - first_child_partition);
       const int num_elements_to_sort = K_PADDED * num_partitions_to_process;
 
-      for (int i = threadIdx.x; i < kSortSize; i += kBlockSize) {
-        if (i < num_elements_to_sort) {
-          int part_idx = i / K_PADDED;
-          int element_idx = i % K_PADDED;
-          size_t local_offset = static_cast<size_t>(first_child_partition + part_idx) * K_PADDED + element_idx;
-          smem.stage2_storage.scores[i] = scores_in_batch[local_offset];
-          smem.stage2_storage.indices[i] = indices_in_batch[local_offset];
-        } else {
-          // Pad with sentinel values for a clean sort.
-          smem.stage2_storage.scores[i] = -FLT_MAX;
-          smem.stage2_storage.indices[i] = INT_MAX;
-        }
-      }
-      __syncthreads();
-
-      // --- Choose sorting strategy based on K ---
-      if constexpr (K_PADDED <= 8) {
-        // For small K, the total number of items to sort (kSortSize) is at most 32.
-        // A warp-level bitonic sort is extremely fast as it operates entirely in registers
-        // without needing shared memory for the sort itself.
-        if (threadIdx.x < warpSize) {
-          float my_score;
-          int my_index;
-          if (threadIdx.x < kSortSize) {
-            my_score = smem.stage2_storage.scores[threadIdx.x];
-            my_index = smem.stage2_storage.indices[threadIdx.x];
-          } else {
-            my_score = -FLT_MAX;
-            my_index = INT_MAX;
-          }
-          bitonic_sort::WarpBitonicSort(my_score, my_index);
-          if (threadIdx.x < K_PADDED) {
-            smem.stage2_storage.scores[threadIdx.x] = my_score;
-            smem.stage2_storage.indices[threadIdx.x] = my_index;
-          }
-        }
-      } else {
-        if constexpr (kSortSize <= 128) {
-          // For small to medium K, a single warp CUB sort is highly efficient.
-          bitonic_sort::WarpMergeSort<kSortSize>(smem.stage2_storage.scores, smem.stage2_storage.indices, &smem.cub_storage, num_elements_to_sort);
-        } else {
-          // For larger sorts, use the full block bitonic sort for more parallelism.
-          bitonic_sort::SharedMemBitonicSort<kBlockSize, kSortSize>(smem.stage2_storage.scores, smem.stage2_storage.indices);
-        }
-      }
-
-      __syncthreads();
-
-      // Write the top K results for this merged group to the output buffer.
-      if (threadIdx.x < K_PADDED) {
-        size_t out_offset = static_cast<size_t>(partition_idx) * K_PADDED + threadIdx.x;
-        scores_out_batch[out_offset] = smem.stage2_storage.scores[threadIdx.x];
-        indices_out_batch[out_offset] = smem.stage2_storage.indices[threadIdx.x];
-      }
+      // Call the common reduction helper
+      topk_common::BlockReduceTopK<kBlockSize, kSortSize, K_PADDED>(
+          scores_in_batch, indices_in_batch, scores_out_batch, indices_out_batch,
+          num_elements_to_sort, first_child_partition, partition_idx, smem);
     }
     partitions_remaining = num_active_blocks;
-    // Swap input/output pointers for the next iteration (ping-pong).
     swap_ptr(p_scores_in, p_scores_out);
     swap_ptr(p_indices_in, p_indices_out);
     grid.sync();
@@ -185,8 +136,6 @@ void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vo
   const int partition_size = data->iterative_sort_partition_size;
   const int num_partitions = CeilDiv(vocab_size, partition_size);
 
-  // Pad `k` to the next power of two or a supported value. This is necessary because
-  // the templated kernels must have a compile-time constant for K.
   int k_padded_val = kIterativeSortMaxK;
   if (k == 1)
     k_padded_val = 1;
@@ -209,7 +158,6 @@ void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vo
   kernel_args[4] = (void*)&data->intermediate_scores_2;
   kernel_args[5] = (void*)&vocab_size;
 
-  // This lambda dispatches to the correct kernel based on the compile-time K_PADDED value.
   auto launch_iterative_sort = [&](auto k_padded) {
     constexpr int K_PADDED = decltype(k_padded)::value;
     dim3 block(kBlockSize);
@@ -227,7 +175,6 @@ void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vo
     }
   };
 
-  // Select the padded K value at runtime and call the launch logic.
   if (k == 1) {
     launch_iterative_sort(std::integral_constant<int, 1>());
   } else if (k <= 4) {
@@ -248,7 +195,6 @@ void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vo
 
   CUDA_CHECK_LAUNCH();
 
-  // Determine the final output buffer based on the number of reduction loops.
   int num_reduction_loops = 0;
   if (num_partitions > 1) {
     int partitions_remaining = num_partitions;
@@ -258,8 +204,6 @@ void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vo
     }
   }
 
-  // Stage 1 writes to buffer 1. After an odd number of loops, the result is in buffer 2.
-  // After an even number of loops, the result is back in buffer 1.
   if (num_reduction_loops % 2 == 1) {
     data->topk_scores = data->intermediate_scores_2;
     data->topk_indices = data->intermediate_indices_2;
@@ -286,7 +230,6 @@ bool IsSupported(int batch_size, int vocab_size, int k) {
     return false;
   }
 
-  // Check for cooperative launch support
   int cooperative_launch_support = 0;
   cudaDeviceGetAttribute(&cooperative_launch_support, cudaDevAttrCooperativeLaunch, 0);
   if (!cooperative_launch_support) {
@@ -298,7 +241,6 @@ bool IsSupported(int batch_size, int vocab_size, int k) {
   const int num_partitions = CeilDiv(vocab_size, partition_size);
   const int total_blocks = num_partitions * batch_size;
 
-  // Choose kernel using the same logic as in RunTopK.
   auto get_kernel = [&](auto k_padded) {
     constexpr int K_PADDED = decltype(k_padded)::value;
     switch (partition_size) {
@@ -332,17 +274,10 @@ bool IsSupported(int batch_size, int vocab_size, int k) {
 
   int device;
   CUDA_CHECK(cudaGetDevice(&device));
-
   int num_sm = 0;
   CUDA_CHECK(cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, device));
-
   int max_blocks_per_sm = 0;
-  CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-      &max_blocks_per_sm,
-      kernel,
-      kBlockSize,
-      0));  // Pass 0 for dynamic shared memory. This kernel uses only STATIC shared memory.
-
+  CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_sm, kernel, kBlockSize, 0));
   int max_active_blocks = num_sm * max_blocks_per_sm;
 
   if (total_blocks > max_active_blocks) {
@@ -355,3 +290,4 @@ bool IsSupported(int batch_size, int vocab_size, int k) {
 }  // namespace iterative_sort
 }  // namespace cuda
 }  // namespace Generators
+

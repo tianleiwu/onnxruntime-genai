@@ -6,6 +6,7 @@
 #include <cuda_runtime.h>
 #include <cooperative_groups.h>
 #include <cub/block/block_radix_sort.cuh>
+#include <cub/block/block_merge_sort.cuh>
 #include <type_traits>
 #include "cuda_topk.h"
 #include "cuda_topk_bitonic_sort_helper.cuh"
@@ -129,33 +130,35 @@ __global__ void CascadedSortKernel(const float* __restrict__ input_scores,
   constexpr int kSortSize2 = K_PADDED * Factor2;
   constexpr int kSortSize3 = K_PADDED * Factor3;
   constexpr int kMaxSortSize = Max(kSortSize1, kSortSize2, kSortSize3);
+  constexpr int kItemsPerThread = CeilDiv(kMaxSortSize, kBlockSize);
 
   using Stage1TempStorageType = typename topk_common::Stage1TempStorage<kBlockSize, kPartitionSize>;
   union SharedStorage {
     Stage1TempStorageType stage1_storage;
+    typename cub::WarpMergeSort<uint64_t, (kMaxSortSize + 31) / 32, 32>::TempStorage cub_warp_storage;
+#ifdef STABLE_TOPK
+    typename cub::BlockMergeSort<uint64_t, kBlockSize, kItemsPerThread, cub::NullType>::TempStorage cub_block_merge_storage;
+#else
+    typename cub::BlockMergeSort<float, kBlockSize, kItemsPerThread, int>::TempStorage cub_block_merge_storage;
+#endif
     struct {
       __align__(128) float scores[kMaxSortSize];
       __align__(128) int indices[kMaxSortSize];
     } stage2_storage;
-    // Temporary storage for the CUB warp sort helper.
-    typename cub::WarpMergeSort<uint64_t, (kMaxSortSize + 31) / 32, 32>::TempStorage cub_storage;
   };
   __shared__ SharedStorage smem;
 
   // --- Stage 1: Find Top-K within each partition ---
-  topk_common::FindPartitionTopK<kBlockSize, kPartitionSize, K_PADDED, Stage1TempStorageType>(
+  topk_common::FindPartitionTopK<kBlockSize, kPartitionSize, K_PADDED>(
       input_scores, intermediate_indices_1, intermediate_scores_1, vocab_size, num_partitions, smem.stage1_storage);
 
   grid.sync();
 
   // --- Stage 2, Step 1: First Reduction ---
-  // This block executes if the plan includes at least one reduction step.
-  // It reads from buffer 1, merges `Factor1` partitions, and writes the result to buffer 2.
   int partitions_after_step1 = num_partitions;
   if (Factor1 > 1) {
     partitions_after_step1 = CeilDiv(num_partitions, Factor1);
     if (partition_idx < partitions_after_step1) {
-      // Reads from buffer 1, writes to buffer 2
       const float* scores_in_batch = intermediate_scores_1 + static_cast<size_t>(batch_idx) * num_partitions * K_PADDED;
       const int* indices_in_batch = intermediate_indices_1 + static_cast<size_t>(batch_idx) * num_partitions * K_PADDED;
       float* scores_out_batch = intermediate_scores_2 + static_cast<size_t>(batch_idx) * partitions_after_step1 * K_PADDED;
@@ -165,29 +168,9 @@ __global__ void CascadedSortKernel(const float* __restrict__ input_scores,
       int num_to_process = min(Factor1, num_partitions - first_child);
       const int num_elements_to_sort = K_PADDED * num_to_process;
 
-      for (int i = threadIdx.x; i < kSortSize1; i += kBlockSize) {
-        if (i < num_elements_to_sort) {
-          size_t offset = (static_cast<size_t>(first_child) + i / K_PADDED) * K_PADDED + (i % K_PADDED);
-          smem.stage2_storage.scores[i] = scores_in_batch[offset];
-          smem.stage2_storage.indices[i] = indices_in_batch[offset];
-        } else {
-          smem.stage2_storage.scores[i] = -FLT_MAX;
-          smem.stage2_storage.indices[i] = INT_MAX;
-        }
-      }
-      __syncthreads();
-
-      if constexpr (kSortSize1 <= 128) {
-        bitonic_sort::WarpMergeSort<kSortSize1>(smem.stage2_storage.scores, smem.stage2_storage.indices, &smem.cub_storage, num_elements_to_sort);
-      } else {
-        bitonic_sort::SharedMemBitonicSort<kBlockSize, kSortSize1>(smem.stage2_storage.scores, smem.stage2_storage.indices);
-      }
-      __syncthreads();
-
-      if (threadIdx.x < K_PADDED) {
-        scores_out_batch[static_cast<size_t>(partition_idx) * K_PADDED + threadIdx.x] = smem.stage2_storage.scores[threadIdx.x];
-        indices_out_batch[static_cast<size_t>(partition_idx) * K_PADDED + threadIdx.x] = smem.stage2_storage.indices[threadIdx.x];
-      }
+      topk_common::BlockReduceTopK<kBlockSize, kSortSize1, K_PADDED>(
+          scores_in_batch, indices_in_batch, scores_out_batch, indices_out_batch,
+          num_elements_to_sort, first_child, partition_idx, smem);
     }
     grid.sync();
   }
@@ -197,7 +180,6 @@ __global__ void CascadedSortKernel(const float* __restrict__ input_scores,
   if (Factor2 > 1) {
     partitions_after_step2 = CeilDiv(partitions_after_step1, Factor2);
     if (partition_idx < partitions_after_step2) {
-      // Reads from buffer 2, writes to buffer 1
       const float* scores_in_batch = intermediate_scores_2 + static_cast<size_t>(batch_idx) * partitions_after_step1 * K_PADDED;
       const int* indices_in_batch = intermediate_indices_2 + static_cast<size_t>(batch_idx) * partitions_after_step1 * K_PADDED;
       float* scores_out_batch = intermediate_scores_1 + static_cast<size_t>(batch_idx) * partitions_after_step2 * K_PADDED;
@@ -207,29 +189,9 @@ __global__ void CascadedSortKernel(const float* __restrict__ input_scores,
       int num_to_process = min(Factor2, partitions_after_step1 - first_child);
       const int num_elements_to_sort = K_PADDED * num_to_process;
 
-      for (int i = threadIdx.x; i < kSortSize2; i += kBlockSize) {
-        if (i < num_elements_to_sort) {
-          size_t offset = (static_cast<size_t>(first_child) + i / K_PADDED) * K_PADDED + (i % K_PADDED);
-          smem.stage2_storage.scores[i] = scores_in_batch[offset];
-          smem.stage2_storage.indices[i] = indices_in_batch[offset];
-        } else {
-          smem.stage2_storage.scores[i] = -FLT_MAX;
-          smem.stage2_storage.indices[i] = INT_MAX;
-        }
-      }
-      __syncthreads();
-
-      if constexpr (kSortSize2 <= 128) {
-        bitonic_sort::WarpMergeSort<kSortSize2>(smem.stage2_storage.scores, smem.stage2_storage.indices, &smem.cub_storage, num_elements_to_sort);
-      } else {
-        bitonic_sort::SharedMemBitonicSort<kBlockSize, kSortSize2>(smem.stage2_storage.scores, smem.stage2_storage.indices);
-      }
-      __syncthreads();
-
-      if (threadIdx.x < K_PADDED) {
-        scores_out_batch[static_cast<size_t>(partition_idx) * K_PADDED + threadIdx.x] = smem.stage2_storage.scores[threadIdx.x];
-        indices_out_batch[static_cast<size_t>(partition_idx) * K_PADDED + threadIdx.x] = smem.stage2_storage.indices[threadIdx.x];
-      }
+      topk_common::BlockReduceTopK<kBlockSize, kSortSize2, K_PADDED>(
+          scores_in_batch, indices_in_batch, scores_out_batch, indices_out_batch,
+          num_elements_to_sort, first_child, partition_idx, smem);
     }
     grid.sync();
   }
@@ -238,7 +200,6 @@ __global__ void CascadedSortKernel(const float* __restrict__ input_scores,
   if (Factor3 > 1) {
     int partitions_after_step3 = CeilDiv(partitions_after_step2, Factor3);
     if (partition_idx < partitions_after_step3) {
-      // Reads from buffer 1, writes to buffer 2
       const float* scores_in_batch = intermediate_scores_1 + static_cast<size_t>(batch_idx) * partitions_after_step2 * K_PADDED;
       const int* indices_in_batch = intermediate_indices_1 + static_cast<size_t>(batch_idx) * partitions_after_step2 * K_PADDED;
       float* scores_out_batch = intermediate_scores_2 + static_cast<size_t>(batch_idx) * partitions_after_step3 * K_PADDED;
@@ -247,29 +208,10 @@ __global__ void CascadedSortKernel(const float* __restrict__ input_scores,
       int first_child = partition_idx * Factor3;
       int num_to_process = min(Factor3, partitions_after_step2 - first_child);
       const int num_elements_to_sort = K_PADDED * num_to_process;
-      for (int i = threadIdx.x; i < kSortSize3; i += kBlockSize) {
-        if (i < num_elements_to_sort) {
-          size_t offset = (static_cast<size_t>(first_child) + i / K_PADDED) * K_PADDED + (i % K_PADDED);
-          smem.stage2_storage.scores[i] = scores_in_batch[offset];
-          smem.stage2_storage.indices[i] = indices_in_batch[offset];
-        } else {
-          smem.stage2_storage.scores[i] = -FLT_MAX;
-          smem.stage2_storage.indices[i] = INT_MAX;
-        }
-      }
-      __syncthreads();
 
-      if constexpr (kSortSize3 <= 128) {
-        bitonic_sort::WarpMergeSort<kSortSize3>(smem.stage2_storage.scores, smem.stage2_storage.indices, &smem.cub_storage, num_elements_to_sort);
-      } else {
-        bitonic_sort::SharedMemBitonicSort<kBlockSize, kSortSize3>(smem.stage2_storage.scores, smem.stage2_storage.indices);
-      }
-      __syncthreads();
-
-      if (threadIdx.x < K_PADDED) {
-        scores_out_batch[static_cast<size_t>(partition_idx) * K_PADDED + threadIdx.x] = smem.stage2_storage.scores[threadIdx.x];
-        indices_out_batch[static_cast<size_t>(partition_idx) * K_PADDED + threadIdx.x] = smem.stage2_storage.indices[threadIdx.x];
-      }
+      topk_common::BlockReduceTopK<kBlockSize, kSortSize3, K_PADDED>(
+          scores_in_batch, indices_in_batch, scores_out_batch, indices_out_batch,
+          num_elements_to_sort, first_child, partition_idx, smem);
     }
   }
 }
@@ -352,7 +294,7 @@ void LaunchKernelWithFactors(TopkData* data, cudaStream_t stream, const float* s
       CUDA_CHECK(cudaLaunchCooperativeKernel((void*)CascadedSortKernel<K_PADDED, kBlockSize, kAllowedPartitionSizes[3], Factor1, Factor2, Factor3>, grid, block, kernel_args, 0, stream));
       break;
     default:
-      assert(false);  // Should be unreachable
+      assert(false);
       break;
   }
 }
@@ -368,19 +310,19 @@ void LaunchKernel(TopkData* data, cudaStream_t stream, const float* scores_in, i
   if constexpr (K_PADDED > 32) {
     // For large K, only factors <= 4 are valid according to GetReductionFactors.
     if (factors.factor1 == 4 && factors.factor2 == 4 && factors.factor3 == 4)
-      LaunchKernelWithFactors<K_PADDED, 4, 4, 4>(data, stream, scores_in, vocab_size, batch_size);
-    else if (factors.factor1 == 4 && factors.factor2 == 4 && factors.factor3 == 2)
-      LaunchKernelWithFactors<K_PADDED, 4, 4, 2>(data, stream, scores_in, vocab_size, batch_size);
-    else if (factors.factor1 == 4 && factors.factor2 == 4)
-      LaunchKernelWithFactors<K_PADDED, 4, 4, 1>(data, stream, scores_in, vocab_size, batch_size);
-    else if (factors.factor1 == 4 && factors.factor2 == 2)
-      LaunchKernelWithFactors<K_PADDED, 4, 2, 1>(data, stream, scores_in, vocab_size, batch_size);
-    else if (factors.factor1 == 4)
-      LaunchKernelWithFactors<K_PADDED, 4, 1, 1>(data, stream, scores_in, vocab_size, batch_size);
-    else if (factors.factor1 == 2)
-      LaunchKernelWithFactors<K_PADDED, 2, 1, 1>(data, stream, scores_in, vocab_size, batch_size);
-    else
-      LaunchKernelWithFactors<K_PADDED, 1, 1, 1>(data, stream, scores_in, vocab_size, batch_size);
+    LaunchKernelWithFactors<K_PADDED, 4, 4, 4>(data, stream, scores_in, vocab_size, batch_size);
+  else if (factors.factor1 == 4 && factors.factor2 == 4 && factors.factor3 == 2)
+    LaunchKernelWithFactors<K_PADDED, 4, 4, 2>(data, stream, scores_in, vocab_size, batch_size);
+  else if (factors.factor1 == 4 && factors.factor2 == 4)
+    LaunchKernelWithFactors<K_PADDED, 4, 4, 1>(data, stream, scores_in, vocab_size, batch_size);
+  else if (factors.factor1 == 4 && factors.factor2 == 2)
+    LaunchKernelWithFactors<K_PADDED, 4, 2, 1>(data, stream, scores_in, vocab_size, batch_size);
+  else if (factors.factor1 == 4)
+    LaunchKernelWithFactors<K_PADDED, 4, 1, 1>(data, stream, scores_in, vocab_size, batch_size);
+  else if (factors.factor1 == 2)
+    LaunchKernelWithFactors<K_PADDED, 2, 1, 1>(data, stream, scores_in, vocab_size, batch_size);
+  else
+    LaunchKernelWithFactors<K_PADDED, 1, 1, 1>(data, stream, scores_in, vocab_size, batch_size);
   } else {
     // For smaller K, factors up to 8 are valid.
     if (factors.factor1 == 8 && factors.factor2 == 8)
@@ -475,7 +417,7 @@ bool CheckSupportWithFactors(int batch_size, int partition_size, int num_partiti
       kernel = (void*)CascadedSortKernel<K_PADDED, kBlockSize, kAllowedPartitionSizes[3], Factor1, Factor2, Factor3>;
       break;
     default:
-      return false;  // Should be unreachable
+      return false;
   }
 
   int device;
@@ -497,13 +439,13 @@ bool CheckSupport(int batch_size, int vocab_size, int k, int partition_size, int
   // Use `if constexpr` to prevent instantiation of invalid template combinations.
   if constexpr (K_PADDED > 32) {
     // Only instantiate checks for factors that are valid for large K.
-    if (factors.factor1 == 4 && factors.factor2 == 4 && factors.factor3 == 4) return CheckSupportWithFactors<K_PADDED, 4, 4, 4>(batch_size, partition_size, num_partitions);
-    if (factors.factor1 == 4 && factors.factor2 == 4 && factors.factor3 == 2) return CheckSupportWithFactors<K_PADDED, 4, 4, 2>(batch_size, partition_size, num_partitions);
-    if (factors.factor1 == 4 && factors.factor2 == 4) return CheckSupportWithFactors<K_PADDED, 4, 4, 1>(batch_size, partition_size, num_partitions);
-    if (factors.factor1 == 4 && factors.factor2 == 2) return CheckSupportWithFactors<K_PADDED, 4, 2, 1>(batch_size, partition_size, num_partitions);
-    if (factors.factor1 == 4) return CheckSupportWithFactors<K_PADDED, 4, 1, 1>(batch_size, partition_size, num_partitions);
-    if (factors.factor1 == 2) return CheckSupportWithFactors<K_PADDED, 2, 1, 1>(batch_size, partition_size, num_partitions);
-    return CheckSupportWithFactors<K_PADDED, 1, 1, 1>(batch_size, partition_size, num_partitions);
+  if (factors.factor1 == 4 && factors.factor2 == 4 && factors.factor3 == 4) return CheckSupportWithFactors<K_PADDED, 4, 4, 4>(batch_size, partition_size, num_partitions);
+  if (factors.factor1 == 4 && factors.factor2 == 4 && factors.factor3 == 2) return CheckSupportWithFactors<K_PADDED, 4, 4, 2>(batch_size, partition_size, num_partitions);
+  if (factors.factor1 == 4 && factors.factor2 == 4) return CheckSupportWithFactors<K_PADDED, 4, 4, 1>(batch_size, partition_size, num_partitions);
+  if (factors.factor1 == 4 && factors.factor2 == 2) return CheckSupportWithFactors<K_PADDED, 4, 2, 1>(batch_size, partition_size, num_partitions);
+  if (factors.factor1 == 4) return CheckSupportWithFactors<K_PADDED, 4, 1, 1>(batch_size, partition_size, num_partitions);
+  if (factors.factor1 == 2) return CheckSupportWithFactors<K_PADDED, 2, 1, 1>(batch_size, partition_size, num_partitions);
+  return CheckSupportWithFactors<K_PADDED, 1, 1, 1>(batch_size, partition_size, num_partitions);
   } else {
     // Instantiate all factor combinations for smaller K.
     if (factors.factor1 == 8 && factors.factor2 == 8) return CheckSupportWithFactors<K_PADDED, 8, 8, 1>(batch_size, partition_size, num_partitions);
@@ -564,10 +506,11 @@ bool IsSupported(int batch_size, int vocab_size, int k) {
   if constexpr (kCascadedSortMaxK > 64) {
     return CheckSupport<kCascadedSortMaxK>(batch_size, vocab_size, k, partition_size, num_partitions);
   } else {
-    return false;  // Should be unreachable
+    return false;
   }
 }
 
 }  // namespace cascaded_sort
 }  // namespace cuda
 }  // namespace Generators
+

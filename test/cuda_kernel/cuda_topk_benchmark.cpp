@@ -23,7 +23,7 @@
 #include "../../src/cuda/cuda_topk.h"
 #include "../statistics_helper.h"
 
-#define TEST_FAST_ALGO_ONLY 0
+#define TEST_FAST_ALGO_ONLY 1
 
 namespace {
 
@@ -339,7 +339,7 @@ TEST(TopKBenchmarks, PerformanceTests) {
   constexpr bool is_build_pipeline = true;
   if constexpr (is_build_pipeline) {
     std::vector<int> batch_sizes = {1};
-    std::vector<int> vocab_sizes = {201088 /*, 262400, 152064, 128256, 32256*/};
+    std::vector<int> vocab_sizes = {201088, 262400, 152064, 128256, 32256};
     std::vector<int> ks = {1, 4, 5, 8, 16, 32, 50, 64, 100, 128, 256};
 
     std::vector<BenchmarkParams> test_cases;

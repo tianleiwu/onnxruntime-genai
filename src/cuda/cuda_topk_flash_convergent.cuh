@@ -4,6 +4,7 @@
 #pragma once
 
 #include <cub/block/block_radix_sort.cuh>
+#include <cub/block/block_merge_sort.cuh>
 #include <cuda_runtime.h>
 #include "cuda_topk.h"
 #include "cuda_topk_common.cuh"
@@ -35,9 +36,8 @@ namespace flash_convergent {
  * Performance Characteristics:
  * -   **Strengths**: By performing the final reduction in a single step, it avoids the overhead of
  * iterative loops and multiple grid-wide synchronizations found in other cooperative methods.
- * It intelligently switches its internal sorting method: for smaller total candidate sets
- * (`<= kMaxSmallSortSize`), it uses a fast shared-memory bitonic sort; for larger sets,
- * it uses the more powerful `cub::BlockRadixSort`.
+ * It intelligently switches its internal sorting method based on the total number of candidates,
+ * leveraging benchmark data to choose the fastest algorithm.
  * -   **Weaknesses**: Requires cooperative launch support. Its primary limitation is the total
  * number of partitions (`kMaxPartitions`), as a single block must be able to load and sort
  * all candidates. This makes it less scalable for extremely large vocabularies that would
@@ -45,41 +45,57 @@ namespace flash_convergent {
  */
 namespace cg = cooperative_groups;
 
+// A simple greater-than comparator for descending sort
+struct DescendingOp {
+    template <typename T>
+    __device__ __host__ bool operator()(const T& a, const T& b) const {
+        return a > b;
+    }
+};
+
 // The limit on partitions is due to cooperative group residency requirements and the
 // fact that a single block must sort all `k * num_partitions` candidates in Stage 2.
 constexpr int kMaxPartitions = 64;
 
-// Threshold for switching between bitonic sort and CUB radix sort in Stage 2.
-constexpr int kMaxSmallSortSize = 256;
-
 // This partition sizes select as {11, 13, 16, 19} * 256.
 constexpr std::array<int, 4> kSupportedPartitionSizes = {2816, 3328, 4096, 4864};
 
-// --- Kernel for small Stage 2 sort size (using Bitonic Sort) ---
-template <int kBlockSize, int kPartitionSize, int K_PADDED, int kMaxPartitionsForKernel>
-__global__ void FlashSortSmallKernel(const float* __restrict__ scores_in,
-                                     float* __restrict__ intermediate_scores,
-                                     int* __restrict__ intermediate_indices,
-                                     float* __restrict__ scores_out,
-                                     int* __restrict__ indices_out,
-                                     int vocab_size,
-                                     int num_partitions,
-                                     int k_actual) {  // Pass the real k
-  cg::grid_group grid = cg::this_grid();
+// The internal sorting algorithm to be used inside the reduction stage, chosen by the host-side launcher.
+enum class ReductionAlgorithm {
+  WARP_MERGE_SORT,
+  CUB_BLOCK_MERGE,
+  CUB_RADIX_SORT
+};
 
-  constexpr int kSortSizeStage2 = K_PADDED * kMaxPartitionsForKernel;
-  static_assert(kSortSizeStage2 <= kMaxSmallSortSize, "kSortSizeStage2 must be <= kMaxSmallSortSize");
+// --- Unified Convergent Kernel ---
+template <int kBlockSize, int kPartitionSize, int K_PADDED, int kMaxPartitionsForKernel, ReductionAlgorithm Algorithm>
+__global__ void FlashConvergentKernel(const float* __restrict__ scores_in,
+                                      float* __restrict__ intermediate_scores,
+                                      int* __restrict__ intermediate_indices,
+                                      float* __restrict__ scores_out,
+                                      int* __restrict__ indices_out,
+                                      int vocab_size,
+                                      int num_partitions,
+                                      int k_actual) {
+  cg::grid_group grid = cg::this_grid();
+  constexpr int kSortSize = K_PADDED * kMaxPartitionsForKernel;
+  constexpr int kItemsPerThread = CeilDiv(kSortSize, kBlockSize);
 
   using Stage1TempStorageType = typename topk_common::Stage1TempStorage<kBlockSize, kPartitionSize>;
-  constexpr int kSortSize = topk_common::NextPowerOfTwo(kMaxPartitionsForKernel * K_PADDED);
   union SharedStorage {
     Stage1TempStorageType stage1_storage;
+#ifdef STABLE_TOPK
+    typename cub::BlockRadixSort<uint64_t, kBlockSize, kItemsPerThread>::TempStorage radix_storage;
+    typename cub::BlockMergeSort<uint64_t, kBlockSize, kItemsPerThread, cub::NullType>::TempStorage merge_storage;
+#else
+    typename cub::BlockRadixSort<float, kBlockSize, kItemsPerThread, int>::TempStorage radix_storage;
+    typename cub::BlockMergeSort<float, kBlockSize, kItemsPerThread, int>::TempStorage merge_storage;
+#endif
     struct {
-      float scores[kSortSize];
-      int indices[kSortSize];
-    } stage2_bitonic_storage;
-    // Temporary storage for the CUB warp sort helper.
-    typename cub::WarpMergeSort<uint64_t, (kSortSize + 31) / 32, 32>::TempStorage cub_storage;
+        float scores[topk_common::NextPowerOfTwo(kSortSize)];
+        int indices[topk_common::NextPowerOfTwo(kSortSize)];
+    } warp_sort_storage;
+    typename cub::WarpMergeSort<uint64_t, (topk_common::NextPowerOfTwo(kSortSize) + 31) / 32, 32>::TempStorage cub_warp_storage;
   };
   __shared__ SharedStorage smem;
 
@@ -94,113 +110,88 @@ __global__ void FlashSortSmallKernel(const float* __restrict__ scores_in,
     const int batch_idx = blockIdx.y;
     const int num_elements_to_sort = num_partitions * K_PADDED;
 
-    for (int i = threadIdx.x; i < kSortSize; i += kBlockSize) {
-      if (i < num_elements_to_sort) {
-        smem.stage2_bitonic_storage.scores[i] = intermediate_scores[(size_t)batch_idx * num_elements_to_sort + i];
-        smem.stage2_bitonic_storage.indices[i] = intermediate_indices[(size_t)batch_idx * num_elements_to_sort + i];
-      } else {
-        smem.stage2_bitonic_storage.scores[i] = -FLT_MAX;
-        smem.stage2_bitonic_storage.indices[i] = INT_MAX;
+    if constexpr (Algorithm == ReductionAlgorithm::WARP_MERGE_SORT) {
+      constexpr int kSortSizePo2 = topk_common::NextPowerOfTwo(kSortSize);
+      for (int i = threadIdx.x; i < kSortSizePo2; i += kBlockSize) {
+        if (i < num_elements_to_sort) {
+          smem.warp_sort_storage.scores[i] = intermediate_scores[(size_t)batch_idx * num_elements_to_sort + i];
+          smem.warp_sort_storage.indices[i] = intermediate_indices[(size_t)batch_idx * num_elements_to_sort + i];
+        } else {
+          smem.warp_sort_storage.scores[i] = -FLT_MAX;
+          smem.warp_sort_storage.indices[i] = INT_MAX;
+        }
       }
-    }
-    __syncthreads();
+      __syncthreads();
 
-    if constexpr (kSortSize <= 128) {
-      // Use the efficient single-warp CUB merge sort for the final reduction.
-      bitonic_sort::WarpMergeSort<kSortSize>(smem.stage2_bitonic_storage.scores, smem.stage2_bitonic_storage.indices, &smem.cub_storage, num_elements_to_sort);
-    } else {
-      // For larger sorts, use the full block bitonic sort for more parallelism.
-      bitonic_sort::SharedMemBitonicSort<kBlockSize, kSortSize>(smem.stage2_bitonic_storage.scores, smem.stage2_bitonic_storage.indices);
-    }
+      bitonic_sort::WarpMergeSort<kSortSizePo2>(smem.warp_sort_storage.scores, smem.warp_sort_storage.indices, &smem.cub_warp_storage, num_elements_to_sort);
+      __syncthreads();
 
-    // Synchronize the block to ensure all threads see the sorted results
-    // written by the first warp before writing to global memory.
-    __syncthreads();
-
-    // Write the final top-k results to global memory.
-    if (threadIdx.x < k_actual) {
-      size_t out_offset = static_cast<size_t>(batch_idx) * k_actual + threadIdx.x;
-      scores_out[out_offset] = smem.stage2_bitonic_storage.scores[threadIdx.x];
-      indices_out[out_offset] = smem.stage2_bitonic_storage.indices[threadIdx.x];
-    }
-  }
-}
-
-// --- Kernel for large Stage 2 sort size (using CUB Radix Sort) ---
-template <int kBlockSize, int kPartitionSize, int K_PADDED, int kMaxPartitionsForKernel>
-__global__ void FlashSortLargeKernel(const float* __restrict__ scores_in,
-                                     float* __restrict__ intermediate_scores,
-                                     int* __restrict__ intermediate_indices,
-                                     float* __restrict__ scores_out,
-                                     int* __restrict__ indices_out,
-                                     int vocab_size,
-                                     int num_partitions,
-                                     int k_actual) {  // Pass the real k
-  cg::grid_group grid = cg::this_grid();
-
-  constexpr int kSortSizeStage2 = K_PADDED * kMaxPartitionsForKernel;
-  constexpr int kItemsPerThreadStage2 = CeilDiv(kSortSizeStage2, kBlockSize);
-
-  using Stage1TempStorageType = typename topk_common::Stage1TempStorage<kBlockSize, kPartitionSize>;
-  union SharedStorage {
-    Stage1TempStorageType stage1_storage;
+      if (threadIdx.x < k_actual) {
+        size_t out_offset = static_cast<size_t>(batch_idx) * k_actual + threadIdx.x;
+        scores_out[out_offset] = smem.warp_sort_storage.scores[threadIdx.x];
+        indices_out[out_offset] = smem.warp_sort_storage.indices[threadIdx.x];
+      }
+    } else { // Handle CUB Block-level Sorts
 #ifdef STABLE_TOPK
-    typename cub::BlockRadixSort<uint64_t, kBlockSize, kItemsPerThreadStage2>::TempStorage stage2_radix_storage;
+        using SortKeyT = uint64_t;
+        SortKeyT thread_keys[kItemsPerThread];
+        for (int i = 0; i < kItemsPerThread; ++i) {
+            int load_idx = threadIdx.x + i * kBlockSize;
+            if (load_idx < num_elements_to_sort) {
+                size_t offset = (size_t)batch_idx * num_elements_to_sort + load_idx;
+                thread_keys[i] = topk_common::PackStableSortKey(intermediate_scores[offset], intermediate_indices[offset]);
+            } else {
+                thread_keys[i] = topk_common::PackStableSortKey(-FLT_MAX, INT_MAX);
+            }
+        }
+        if constexpr (Algorithm == ReductionAlgorithm::CUB_RADIX_SORT) {
+            cub::BlockRadixSort<SortKeyT, kBlockSize, kItemsPerThread>(smem.radix_storage).SortDescendingBlockedToStriped(thread_keys);
+            if (threadIdx.x < k_actual) {
+                size_t out_offset = static_cast<size_t>(batch_idx) * k_actual + threadIdx.x;
+                scores_out[out_offset] = topk_common::UnpackStableSortScore(thread_keys[0]);
+                indices_out[out_offset] = topk_common::UnpackStableSortIndex(thread_keys[0]);
+            }
+        } else { // CUB_BLOCK_MERGE
+            cub::BlockMergeSort<SortKeyT, kBlockSize, kItemsPerThread, cub::NullType>(smem.merge_storage).Sort(thread_keys, DescendingOp());
+            float thread_scores_out[kItemsPerThread];
+            int thread_indices_out[kItemsPerThread];
+            for (int i = 0; i < kItemsPerThread; ++i) {
+                thread_scores_out[i] = topk_common::UnpackStableSortScore(thread_keys[i]);
+                thread_indices_out[i] = topk_common::UnpackStableSortIndex(thread_keys[i]);
+            }
+            cub::StoreDirectBlocked(threadIdx.x, scores_out + (size_t)batch_idx * k_actual, thread_scores_out, k_actual);
+            cub::StoreDirectBlocked(threadIdx.x, indices_out + (size_t)batch_idx * k_actual, thread_indices_out, k_actual);
+        }
 #else
-    typename cub::BlockRadixSort<float, kBlockSize, kItemsPerThreadStage2, int>::TempStorage stage2_radix_storage;
+        using SortKeyT = float;
+        using SortValueT = int;
+        SortKeyT thread_keys[kItemsPerThread];
+        SortValueT thread_values[kItemsPerThread];
+        for (int i = 0; i < kItemsPerThread; ++i) {
+            int load_idx = threadIdx.x + i * kBlockSize;
+            if (load_idx < num_elements_to_sort) {
+                size_t offset = (size_t)batch_idx * num_elements_to_sort + load_idx;
+                thread_keys[i] = intermediate_scores[offset];
+                thread_values[i] = intermediate_indices[offset];
+            } else {
+                thread_keys[i] = -FLT_MAX;
+                thread_values[i] = INT_MAX;
+            }
+        }
+        if constexpr (Algorithm == ReductionAlgorithm::CUB_RADIX_SORT) {
+            cub::BlockRadixSort<SortKeyT, kBlockSize, kItemsPerThread, SortValueT>(smem.radix_storage).SortDescendingBlockedToStriped(thread_keys, thread_values);
+            if (threadIdx.x < k_actual) {
+                size_t out_offset = static_cast<size_t>(batch_idx) * k_actual + threadIdx.x;
+                scores_out[out_offset] = thread_keys[0];
+                indices_out[out_offset] = thread_values[0];
+            }
+        } else { // CUB_BLOCK_MERGE
+            cub::BlockMergeSort<SortKeyT, kBlockSize, kItemsPerThread, SortValueT>(smem.merge_storage).Sort(thread_keys, thread_values, DescendingOp());
+            cub::StoreDirectBlocked(threadIdx.x, scores_out + (size_t)batch_idx * k_actual, thread_keys, k_actual);
+            cub::StoreDirectBlocked(threadIdx.x, indices_out + (size_t)batch_idx * k_actual, thread_values, k_actual);
+        }
 #endif
-  };
-  __shared__ SharedStorage smem;
-
-  // --- Stage 1: Parallel Partition Sort ---
-  topk_common::FindPartitionTopK<kBlockSize, kPartitionSize, K_PADDED, Stage1TempStorageType>(
-      scores_in, intermediate_indices, intermediate_scores, vocab_size, num_partitions, smem.stage1_storage);
-
-  grid.sync();
-
-  // --- Stage 2: One block performs the final merge ---
-  if (blockIdx.x == 0) {
-    const int batch_idx = blockIdx.y;
-    const int num_elements_to_sort = num_partitions * K_PADDED;
-
-#ifdef STABLE_TOPK
-    uint64_t thread_keys[kItemsPerThreadStage2];
-    for (int i = 0; i < kItemsPerThreadStage2; ++i) {
-      int load_idx = threadIdx.x * kItemsPerThreadStage2 + i;
-      if (load_idx < num_elements_to_sort) {
-        size_t offset = (size_t)batch_idx * num_elements_to_sort + load_idx;
-        thread_keys[i] = topk_common::PackStableSortKey(intermediate_scores[offset], intermediate_indices[offset]);
-      } else {
-        thread_keys[i] = topk_common::PackStableSortKey(-FLT_MAX, INT_MAX);
-      }
     }
-    cub::BlockRadixSort<uint64_t, kBlockSize, kItemsPerThreadStage2>(smem.stage2_radix_storage).SortDescendingBlockedToStriped(thread_keys);
-    if (threadIdx.x < k_actual) {
-      size_t out_offset = static_cast<size_t>(batch_idx) * k_actual + threadIdx.x;
-      scores_out[out_offset] = topk_common::UnpackStableSortScore(thread_keys[0]);
-      indices_out[out_offset] = topk_common::UnpackStableSortIndex(thread_keys[0]);
-    }
-#else
-    float thread_scores[kItemsPerThreadStage2];
-    int thread_indices[kItemsPerThreadStage2];
-    for (int i = 0; i < kItemsPerThreadStage2; ++i) {
-      int load_idx = threadIdx.x * kItemsPerThreadStage2 + i;
-      if (load_idx < num_elements_to_sort) {
-        size_t offset = (size_t)batch_idx * num_elements_to_sort + load_idx;
-        thread_scores[i] = intermediate_scores[offset];
-        thread_indices[i] = intermediate_indices[offset];
-      } else {
-        thread_scores[i] = -FLT_MAX;
-        thread_indices[i] = INT_MAX;
-      }
-    }
-    cub::BlockRadixSort<float, kBlockSize, kItemsPerThreadStage2, int>(smem.stage2_radix_storage).SortDescendingBlockedToStriped(thread_scores, thread_indices);
-    if (threadIdx.x < k_actual) {
-      size_t out_offset = static_cast<size_t>(batch_idx) * k_actual + threadIdx.x;
-      scores_out[out_offset] = thread_scores[0];
-      indices_out[out_offset] = thread_indices[0];
-    }
-#endif
   }
 }
 
@@ -249,28 +240,28 @@ inline size_t GetIntermediateSize(int batch_size, int vocab_size, int partition_
 }
 
 template <int kBlockSize, int kPartitionSize, int K_PADDED, int kMaxPartitionsForKernel>
-void* ChooseKernel() {
-  void* kernel;
-  if constexpr (K_PADDED * kMaxPartitionsForKernel <= kMaxSmallSortSize)
-    kernel = (void*)FlashSortSmallKernel<kBlockSize, kPartitionSize, K_PADDED, kMaxPartitionsForKernel>;
-  else
-    kernel = (void*)FlashSortLargeKernel<kBlockSize, kPartitionSize, K_PADDED, kMaxPartitionsForKernel>;
-  return kernel;
+void* GetKernel() {
+  constexpr int sort_size = K_PADDED * kMaxPartitionsForKernel;
+  if constexpr (sort_size <= 128) {
+      return (void*)FlashConvergentKernel<kBlockSize, kPartitionSize, K_PADDED, kMaxPartitionsForKernel, ReductionAlgorithm::WARP_MERGE_SORT>;
+  } else if constexpr (sort_size < 4096) {
+      return (void*)FlashConvergentKernel<kBlockSize, kPartitionSize, K_PADDED, kMaxPartitionsForKernel, ReductionAlgorithm::CUB_BLOCK_MERGE>;
+  } else {
+      return (void*)FlashConvergentKernel<kBlockSize, kPartitionSize, K_PADDED, kMaxPartitionsForKernel, ReductionAlgorithm::CUB_RADIX_SORT>;
+  }
 }
 
 template <int kBlockSize, int kPartitionSize, int K_PADDED>
-void* GetKernel(int num_partitions) {
-  void* kernel;
+void* GetKernelForNumPartitions(int num_partitions) {
   if (num_partitions <= 8) {
-    kernel = ChooseKernel<kBlockSize, kPartitionSize, K_PADDED, 8>();
+    return GetKernel<kBlockSize, kPartitionSize, K_PADDED, 8>();
   } else if (num_partitions <= 16) {
-    kernel = ChooseKernel<kBlockSize, kPartitionSize, K_PADDED, 16>();
+    return GetKernel<kBlockSize, kPartitionSize, K_PADDED, 16>();
   } else if (num_partitions <= 32) {
-    kernel = ChooseKernel<kBlockSize, kPartitionSize, K_PADDED, 32>();
+    return GetKernel<kBlockSize, kPartitionSize, K_PADDED, 32>();
   } else {
-    kernel = ChooseKernel<kBlockSize, kPartitionSize, K_PADDED, 64>();
+    return GetKernel<kBlockSize, kPartitionSize, K_PADDED, 64>();
   }
-  return kernel;
 }
 
 template <int P_SIZE, int K_PADDED>
@@ -281,7 +272,7 @@ void LaunchKernel(TopkData* data, cudaStream_t stream, const float* scores_in, i
   dim3 grid(num_partitions, batch_size);
   dim3 block(kBlockSize);
 
-  void* kernel = GetKernel<kBlockSize, P_SIZE, K_PADDED>(num_partitions);
+  void* kernel = GetKernelForNumPartitions<kBlockSize, P_SIZE, K_PADDED>(num_partitions);
   void* kernel_args[] = {(void*)&scores_in, (void*)&data->intermediate_scores_1, (void*)&data->intermediate_indices_1,
                          (void*)&data->intermediate_scores_2, (void*)&data->intermediate_indices_2,
                          (void*)&vocab_size, (void*)&num_partitions, (void*)&k};
@@ -330,13 +321,13 @@ bool CheckSupport(int batch_size, int num_partitions, int partition_size) {
   const int total_blocks = num_partitions * batch_size;
   void* kernel;
   if (partition_size == kSupportedPartitionSizes[0])
-    kernel = ChooseKernel<kBlockSize, kSupportedPartitionSizes[0], K_PADDED, kMaxPartitionsForKernel>();
+    kernel = GetKernel<kBlockSize, kSupportedPartitionSizes[0], K_PADDED, kMaxPartitionsForKernel>();
   else if (partition_size == kSupportedPartitionSizes[1])
-    kernel = ChooseKernel<kBlockSize, kSupportedPartitionSizes[1], K_PADDED, kMaxPartitionsForKernel>();
+    kernel = GetKernel<kBlockSize, kSupportedPartitionSizes[1], K_PADDED, kMaxPartitionsForKernel>();
   else if (partition_size == kSupportedPartitionSizes[2])
-    kernel = ChooseKernel<kBlockSize, kSupportedPartitionSizes[2], K_PADDED, kMaxPartitionsForKernel>();
+    kernel = GetKernel<kBlockSize, kSupportedPartitionSizes[2], K_PADDED, kMaxPartitionsForKernel>();
   else
-    kernel = ChooseKernel<kBlockSize, kSupportedPartitionSizes[3], K_PADDED, kMaxPartitionsForKernel>();
+    kernel = GetKernel<kBlockSize, kSupportedPartitionSizes[3], K_PADDED, kMaxPartitionsForKernel>();
 
   int device, num_sm, max_blocks_per_sm;
   CUDA_CHECK(cudaGetDevice(&device));

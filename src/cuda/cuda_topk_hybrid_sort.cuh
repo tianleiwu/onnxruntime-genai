@@ -143,7 +143,7 @@ inline ReductionPlan GetReductionPlan(int num_partitions, int k_padded) {
     step.block_size = (k_padded <= 16) ? 128 : 256;
 
     int sort_size = k_padded * step.partitions_per_block;
-    
+
     // --- UPDATED ALGORITHM SELECTION LOGIC ---
     // This logic is now based on the empirical benchmark results.
     if (sort_size <= 32) {
@@ -258,8 +258,7 @@ __global__ void BlockReduceTopK(const float* __restrict__ scores_in, const int* 
   } else if constexpr (Algorithm == ReductionAlgorithm::CUB_BLOCK_MERGE) {
       // --- NEW KERNEL PATH FOR CUB BLOCK MERGE SORT ---
       #ifdef STABLE_TOPK
-          // CUB BlockMergeSort doesn't support keys-only sort, so we use key-value sort for both cases.
-          // This is generally fine as the performance difference is minimal.
+          // For stable sort, we sort packed 64-bit keys. cub::BlockMergeSort supports keys-only sort via cub::NullType.
           using SortKeyT = uint64_t;
           using SortValueT = cub::NullType;
           using CubTempStorage = typename cub::BlockMergeSort<SortKeyT, kBlockSize, CeilDiv(kSortSize, kBlockSize), SortValueT>::TempStorage;
@@ -280,15 +279,16 @@ __global__ void BlockReduceTopK(const float* __restrict__ scores_in, const int* 
               }
           }
           cub::BlockMergeSort<SortKeyT, kBlockSize, kItemsPerThread, SortValueT>(cub_merge_storage).Sort(thread_keys, DescendingOp());
-          
-          // Store top K results back to global memory.
+
+          // Unpack and store top K results back to global memory.
+          float thread_scores_out[kItemsPerThread];
+          int thread_indices_out[kItemsPerThread];
           for (int i = 0; i < kItemsPerThread; ++i) {
-              int item_idx = threadIdx.x + i * kBlockSize;
-              if (item_idx < K_PADDED) {
-                  scores_out[out_base_offset + item_idx] = topk_common::UnpackStableSortScore(thread_keys[i]);
-                  indices_out[out_base_offset + item_idx] = topk_common::UnpackStableSortIndex(thread_keys[i]);
-              }
+            thread_scores_out[i] = topk_common::UnpackStableSortScore(thread_keys[i]);
+            thread_indices_out[i] = topk_common::UnpackStableSortIndex(thread_keys[i]);
           }
+          cub::StoreDirectBlocked(threadIdx.x, scores_out + out_base_offset, thread_scores_out, K_PADDED);
+          cub::StoreDirectBlocked(threadIdx.x, indices_out + out_base_offset, thread_indices_out, K_PADDED);
       #else
           using SortKeyT = float;
           using SortValueT = int;
@@ -583,3 +583,4 @@ bool IsSupported(int /*batch_size*/, int vocab_size, int k) {
 }  // namespace hybrid_sort
 }  // namespace cuda
 }  // namespace Generators
+
