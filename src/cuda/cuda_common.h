@@ -10,7 +10,7 @@
 #include <cassert>
 
 #include <cuda_runtime.h>
-#include "span.h"
+#include "../span.h"
 
 namespace Generators {
 

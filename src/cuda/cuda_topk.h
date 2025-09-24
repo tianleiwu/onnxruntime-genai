@@ -8,7 +8,6 @@
 #include <algorithm>
 
 #include "cuda_common.h"
-#include "../smartptrs.h"
 
 namespace Generators {
 namespace cuda {

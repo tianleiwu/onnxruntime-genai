@@ -4,6 +4,7 @@
 #pragma once
 
 #include <cub/block/block_radix_sort.cuh>
+#include <cub/block/block_merge_sort.cuh>
 #include <cuda_runtime.h>
 #include <vector>
 #include <numeric>
@@ -52,6 +53,7 @@ enum class ReductionAlgorithm {
   WARP_BITONIC,     // For very small sorts (<= 32 items), uses a register-based warp sort.
   WARP_MERGE_SORT,  // For small sorts (33-128 items), uses a CUB-based warp merge sort.
   BLOCK_BITONIC,    // For medium sorts (129-256 items), uses a shared memory bitonic sort.
+  CUB_BLOCK_MERGE,  // For medium-large sorts, uses CUB block-wide merge sort.
   CUB_RADIX_SORT    // For larger sorts (> 256 items), uses the powerful CUB block-wide radix sort.
 };
 
@@ -141,15 +143,19 @@ inline ReductionPlan GetReductionPlan(int num_partitions, int k_padded) {
     step.block_size = (k_padded <= 16) ? 128 : 256;
 
     int sort_size = k_padded * step.partitions_per_block;
+    
+    // --- UPDATED ALGORITHM SELECTION LOGIC ---
+    // This logic is now based on the empirical benchmark results.
     if (sort_size <= 32) {
       step.algorithm = ReductionAlgorithm::WARP_BITONIC;
     } else if (sort_size <= 128) {
       step.algorithm = ReductionAlgorithm::WARP_MERGE_SORT;
-    } else if (sort_size <= 256) {
-      step.algorithm = ReductionAlgorithm::BLOCK_BITONIC;
-    } else {
+    } else if (sort_size < 4096) { // CUB Block Merge is faster in the mid-range
+      step.algorithm = ReductionAlgorithm::CUB_BLOCK_MERGE;
+    } else { // CUB Block Radix is faster for very large sorts
       step.algorithm = ReductionAlgorithm::CUB_RADIX_SORT;
     }
+
     plan.push_back(step);
     current_partitions = CeilDiv(current_partitions, step.partitions_per_block);
   }
@@ -168,6 +174,14 @@ __global__ void Stage1_FindPartitionsTopK(const float* __restrict__ scores_in,
   __shared__ Stage1TempStorageType smem;
   topk_common::FindPartitionTopK<kBlockSize, kPartitionSize, K, Stage1TempStorageType>(scores_in, intermediate_indices, intermediate_scores, vocab_size, num_partitions, smem);
 }
+
+// A simple greater-than comparator for descending sort
+struct DescendingOp {
+    template <typename T>
+    __device__ __host__ bool operator()(const T& a, const T& b) const {
+        return a > b;
+    }
+};
 
 /**
  * @brief The unified reduction kernel. This single kernel can perform any of the reduction
@@ -241,6 +255,66 @@ __global__ void BlockReduceTopK(const float* __restrict__ scores_in, const int* 
       indices_out[out_base_offset + threadIdx.x] = thread_values[0];
     }
 #endif
+  } else if constexpr (Algorithm == ReductionAlgorithm::CUB_BLOCK_MERGE) {
+      // --- NEW KERNEL PATH FOR CUB BLOCK MERGE SORT ---
+      #ifdef STABLE_TOPK
+          // CUB BlockMergeSort doesn't support keys-only sort, so we use key-value sort for both cases.
+          // This is generally fine as the performance difference is minimal.
+          using SortKeyT = uint64_t;
+          using SortValueT = cub::NullType;
+          using CubTempStorage = typename cub::BlockMergeSort<SortKeyT, kBlockSize, CeilDiv(kSortSize, kBlockSize), SortValueT>::TempStorage;
+          __shared__ CubTempStorage cub_merge_storage;
+          constexpr int kItemsPerThread = CeilDiv(kSortSize, kBlockSize);
+          SortKeyT thread_keys[kItemsPerThread];
+
+          // Load and pack data into registers
+          for (int i = 0; i < kItemsPerThread; i++) {
+              int item_idx = threadIdx.x + i * kBlockSize;
+              if (item_idx < num_elements_to_sort) {
+                  int partition_idx = item_idx / K_PADDED;
+                  int element_idx = item_idx % K_PADDED;
+                  size_t offset = in_base_offset + static_cast<size_t>(block_start_partition + partition_idx) * K_PADDED + element_idx;
+                  thread_keys[i] = topk_common::PackStableSortKey(scores_in[offset], indices_in[offset]);
+              } else {
+                  thread_keys[i] = topk_common::PackStableSortKey(-FLT_MAX, INT_MAX);
+              }
+          }
+          cub::BlockMergeSort<SortKeyT, kBlockSize, kItemsPerThread, SortValueT>(cub_merge_storage).Sort(thread_keys, DescendingOp());
+          
+          // Store top K results back to global memory.
+          for (int i = 0; i < kItemsPerThread; ++i) {
+              int item_idx = threadIdx.x + i * kBlockSize;
+              if (item_idx < K_PADDED) {
+                  scores_out[out_base_offset + item_idx] = topk_common::UnpackStableSortScore(thread_keys[i]);
+                  indices_out[out_base_offset + item_idx] = topk_common::UnpackStableSortIndex(thread_keys[i]);
+              }
+          }
+      #else
+          using SortKeyT = float;
+          using SortValueT = int;
+          using CubTempStorage = typename cub::BlockMergeSort<SortKeyT, kBlockSize, CeilDiv(kSortSize, kBlockSize), SortValueT>::TempStorage;
+          __shared__ CubTempStorage cub_merge_storage;
+          constexpr int kItemsPerThread = CeilDiv(kSortSize, kBlockSize);
+          SortKeyT thread_keys[kItemsPerThread];
+          SortValueT thread_values[kItemsPerThread];
+
+          for (int i = 0; i < kItemsPerThread; ++i) {
+              int item_idx = threadIdx.x + i * kBlockSize;
+              if (item_idx < num_elements_to_sort) {
+                  int partition_idx = item_idx / K_PADDED;
+                  int element_idx = item_idx % K_PADDED;
+                  size_t offset = in_base_offset + static_cast<size_t>(block_start_partition + partition_idx) * K_PADDED + element_idx;
+                  thread_keys[i] = scores_in[offset];
+                  thread_values[i] = indices_in[offset];
+              } else {
+                  thread_keys[i] = -FLT_MAX;
+                  thread_values[i] = INT_MAX;
+              }
+          }
+          cub::BlockMergeSort<SortKeyT, kBlockSize, kItemsPerThread, SortValueT>(cub_merge_storage).Sort(thread_keys, thread_values, DescendingOp());
+          cub::StoreDirectBlocked(threadIdx.x, scores_out + out_base_offset, thread_keys, K_PADDED);
+          cub::StoreDirectBlocked(threadIdx.x, indices_out + out_base_offset, thread_values, K_PADDED);
+      #endif
   } else {  // This block handles both WARP_BITONIC and WARP_MERGE_SORT
     constexpr int kSortSizePo2 = topk_common::NextPowerOfTwo(kSortSize);
 
@@ -322,8 +396,11 @@ void LaunchReductionStep(const ReductionStep& step, cudaStream_t stream,
     // The runtime `switch` selects which compile-time path to take.
     switch (step.algorithm) {
       case ReductionAlgorithm::CUB_RADIX_SORT:
-        // No constexpr check needed here as Radix sort handles all sizes > 256.
         BlockReduceTopK<B_SIZE, K_PADDED, P_PER_BLOCK, ReductionAlgorithm::CUB_RADIX_SORT><<<grid, block, 0, stream>>>(
+            scores_in, indices_in, scores_out, indices_out, num_partitions_in);
+        break;
+      case ReductionAlgorithm::CUB_BLOCK_MERGE:
+        BlockReduceTopK<B_SIZE, K_PADDED, P_PER_BLOCK, ReductionAlgorithm::CUB_BLOCK_MERGE><<<grid, block, 0, stream>>>(
             scores_in, indices_in, scores_out, indices_out, num_partitions_in);
         break;
       case ReductionAlgorithm::BLOCK_BITONIC:
