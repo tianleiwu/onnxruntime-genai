@@ -25,7 +25,7 @@ struct DescendingOp {
 
 // Based on benchmark results, cub::BlockMergeSort is faster for smaller partition sizes,
 // while cub::BlockRadixSort is faster for very large ones. This threshold defines the crossover point.
-constexpr int kMaxBlockMergeSortSize = 4096;
+constexpr int kMaxBlockMergeSortSize = 3072;
 
 /**
  * @brief Finds the Top-K candidates within a single data partition.
@@ -230,7 +230,7 @@ __device__ void FindPartitionTopK(const float* __restrict__ scores_in,
                                   int vocab_size,
                                   int num_partitions,
                                   TempStorage& temp_storage) {
-  if constexpr (kPartitionSize < kMaxBlockMergeSortSize) {
+  if constexpr (kPartitionSize <= kMaxBlockMergeSortSize) {
     if constexpr (kStableTopK) {
       FindPartitionTopK_StableSort_Merge<kBlockSize, kPartitionSize, K>(scores_in, intermediate_indices, intermediate_scores, vocab_size, num_partitions, temp_storage);
     } else {

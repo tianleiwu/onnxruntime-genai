@@ -45,20 +45,12 @@ namespace flash_convergent {
  */
 namespace cg = cooperative_groups;
 
-// A simple greater-than comparator for descending sort
-struct DescendingOp {
-    template <typename T>
-    __device__ __host__ bool operator()(const T& a, const T& b) const {
-        return a > b;
-    }
-};
-
 // The limit on partitions is due to cooperative group residency requirements and the
 // fact that a single block must sort all `k * num_partitions` candidates in Stage 2.
-constexpr int kMaxPartitions = 64;
+constexpr int kMaxPartitions = 99;
 
 // This partition sizes select as {11, 13, 16, 19} * 256.
-constexpr std::array<int, 4> kSupportedPartitionSizes = {2816, 3328, 4096, 4864};
+constexpr std::array<int, 5> kSupportedPartitionSizes = {2032, 2816, 3328, 4096, 4864};
 
 // The internal sorting algorithm to be used inside the reduction stage, chosen by the host-side launcher.
 enum class ReductionAlgorithm {
@@ -66,6 +58,60 @@ enum class ReductionAlgorithm {
   CUB_BLOCK_MERGE,
   CUB_RADIX_SORT
 };
+
+// --- Metaprogramming to select the correct SharedStorage type ---
+template <int kBlockSize, int kPartitionSize, int K_PADDED, int kMaxPartitionsForKernel, ReductionAlgorithm Algorithm>
+struct SharedStorageSelector;
+
+// Specialization for WARP_MERGE_SORT
+template <int kBlockSize, int kPartitionSize, int K_PADDED, int kMaxPartitionsForKernel>
+struct SharedStorageSelector<kBlockSize, kPartitionSize, K_PADDED, kMaxPartitionsForKernel, ReductionAlgorithm::WARP_MERGE_SORT> {
+  using Stage1TempStorageType = typename topk_common::Stage1TempStorage<kBlockSize, kPartitionSize>;
+  static constexpr int kSortSize = K_PADDED * kMaxPartitionsForKernel;
+  static constexpr int kSortSizePo2 = topk_common::NextPowerOfTwo(kSortSize);
+
+  union type {
+    Stage1TempStorageType stage1_storage;
+    struct {
+        float scores[kSortSizePo2];
+        int indices[kSortSizePo2];
+    } warp_sort_storage;
+    typename cub::WarpMergeSort<uint64_t, (kSortSizePo2 + 31) / 32, 32>::TempStorage cub_warp_storage;
+  };
+};
+
+// Specialization for CUB_BLOCK_MERGE
+template <int kBlockSize, int kPartitionSize, int K_PADDED, int kMaxPartitionsForKernel>
+struct SharedStorageSelector<kBlockSize, kPartitionSize, K_PADDED, kMaxPartitionsForKernel, ReductionAlgorithm::CUB_BLOCK_MERGE> {
+    using Stage1TempStorageType = typename topk_common::Stage1TempStorage<kBlockSize, kPartitionSize>;
+    static constexpr int kSortSize = K_PADDED * kMaxPartitionsForKernel;
+    static constexpr int kItemsPerThread = CeilDiv(kSortSize, kBlockSize);
+    union type {
+        Stage1TempStorageType stage1_storage;
+#ifdef STABLE_TOPK
+        typename cub::BlockMergeSort<uint64_t, kBlockSize, kItemsPerThread, cub::NullType>::TempStorage merge_storage;
+#else
+        typename cub::BlockMergeSort<float, kBlockSize, kItemsPerThread, int>::TempStorage merge_storage;
+#endif
+    };
+};
+
+// Specialization for CUB_RADIX_SORT
+template <int kBlockSize, int kPartitionSize, int K_PADDED, int kMaxPartitionsForKernel>
+struct SharedStorageSelector<kBlockSize, kPartitionSize, K_PADDED, kMaxPartitionsForKernel, ReductionAlgorithm::CUB_RADIX_SORT> {
+    using Stage1TempStorageType = typename topk_common::Stage1TempStorage<kBlockSize, kPartitionSize>;
+    static constexpr int kSortSize = K_PADDED * kMaxPartitionsForKernel;
+    static constexpr int kItemsPerThread = CeilDiv(kSortSize, kBlockSize);
+    union type {
+        Stage1TempStorageType stage1_storage;
+#ifdef STABLE_TOPK
+        typename cub::BlockRadixSort<uint64_t, kBlockSize, kItemsPerThread>::TempStorage radix_storage;
+#else
+        typename cub::BlockRadixSort<float, kBlockSize, kItemsPerThread, int>::TempStorage radix_storage;
+#endif
+    };
+};
+
 
 // --- Unified Convergent Kernel ---
 template <int kBlockSize, int kPartitionSize, int K_PADDED, int kMaxPartitionsForKernel, ReductionAlgorithm Algorithm>
@@ -81,26 +127,11 @@ __global__ void FlashConvergentKernel(const float* __restrict__ scores_in,
   constexpr int kSortSize = K_PADDED * kMaxPartitionsForKernel;
   constexpr int kItemsPerThread = CeilDiv(kSortSize, kBlockSize);
 
-  using Stage1TempStorageType = typename topk_common::Stage1TempStorage<kBlockSize, kPartitionSize>;
-  union SharedStorage {
-    Stage1TempStorageType stage1_storage;
-#ifdef STABLE_TOPK
-    typename cub::BlockRadixSort<uint64_t, kBlockSize, kItemsPerThread>::TempStorage radix_storage;
-    typename cub::BlockMergeSort<uint64_t, kBlockSize, kItemsPerThread, cub::NullType>::TempStorage merge_storage;
-#else
-    typename cub::BlockRadixSort<float, kBlockSize, kItemsPerThread, int>::TempStorage radix_storage;
-    typename cub::BlockMergeSort<float, kBlockSize, kItemsPerThread, int>::TempStorage merge_storage;
-#endif
-    struct {
-        float scores[topk_common::NextPowerOfTwo(kSortSize)];
-        int indices[topk_common::NextPowerOfTwo(kSortSize)];
-    } warp_sort_storage;
-    typename cub::WarpMergeSort<uint64_t, (topk_common::NextPowerOfTwo(kSortSize) + 31) / 32, 32>::TempStorage cub_warp_storage;
-  };
+  using SharedStorage = typename SharedStorageSelector<kBlockSize, kPartitionSize, K_PADDED, kMaxPartitionsForKernel, Algorithm>::type;
   __shared__ SharedStorage smem;
 
   // --- Stage 1: Parallel Partition Sort ---
-  topk_common::FindPartitionTopK<kBlockSize, kPartitionSize, K_PADDED, Stage1TempStorageType>(
+  topk_common::FindPartitionTopK<kBlockSize, kPartitionSize, K_PADDED>(
       scores_in, intermediate_indices, intermediate_scores, vocab_size, num_partitions, smem.stage1_storage);
 
   grid.sync();
@@ -136,7 +167,7 @@ __global__ void FlashConvergentKernel(const float* __restrict__ scores_in,
         using SortKeyT = uint64_t;
         SortKeyT thread_keys[kItemsPerThread];
         for (int i = 0; i < kItemsPerThread; ++i) {
-            int load_idx = threadIdx.x + i * kBlockSize;
+            int load_idx = threadIdx.x * kItemsPerThread + i; // Blocked load
             if (load_idx < num_elements_to_sort) {
                 size_t offset = (size_t)batch_idx * num_elements_to_sort + load_idx;
                 thread_keys[i] = topk_common::PackStableSortKey(intermediate_scores[offset], intermediate_indices[offset]);
@@ -152,7 +183,7 @@ __global__ void FlashConvergentKernel(const float* __restrict__ scores_in,
                 indices_out[out_offset] = topk_common::UnpackStableSortIndex(thread_keys[0]);
             }
         } else { // CUB_BLOCK_MERGE
-            cub::BlockMergeSort<SortKeyT, kBlockSize, kItemsPerThread, cub::NullType>(smem.merge_storage).Sort(thread_keys, DescendingOp());
+            cub::BlockMergeSort<SortKeyT, kBlockSize, kItemsPerThread, cub::NullType>(smem.merge_storage).Sort(thread_keys, topk_common::DescendingOp());
             float thread_scores_out[kItemsPerThread];
             int thread_indices_out[kItemsPerThread];
             for (int i = 0; i < kItemsPerThread; ++i) {
@@ -168,7 +199,7 @@ __global__ void FlashConvergentKernel(const float* __restrict__ scores_in,
         SortKeyT thread_keys[kItemsPerThread];
         SortValueT thread_values[kItemsPerThread];
         for (int i = 0; i < kItemsPerThread; ++i) {
-            int load_idx = threadIdx.x + i * kBlockSize;
+            int load_idx = threadIdx.x * kItemsPerThread + i; // Blocked load
             if (load_idx < num_elements_to_sort) {
                 size_t offset = (size_t)batch_idx * num_elements_to_sort + load_idx;
                 thread_keys[i] = intermediate_scores[offset];
@@ -186,7 +217,7 @@ __global__ void FlashConvergentKernel(const float* __restrict__ scores_in,
                 indices_out[out_offset] = thread_values[0];
             }
         } else { // CUB_BLOCK_MERGE
-            cub::BlockMergeSort<SortKeyT, kBlockSize, kItemsPerThread, SortValueT>(smem.merge_storage).Sort(thread_keys, thread_values, DescendingOp());
+            cub::BlockMergeSort<SortKeyT, kBlockSize, kItemsPerThread, SortValueT>(smem.merge_storage).Sort(thread_keys, thread_values, topk_common::DescendingOp());
             cub::StoreDirectBlocked(threadIdx.x, scores_out + (size_t)batch_idx * k_actual, thread_keys, k_actual);
             cub::StoreDirectBlocked(threadIdx.x, indices_out + (size_t)batch_idx * k_actual, thread_values, k_actual);
         }
@@ -197,11 +228,14 @@ __global__ void FlashConvergentKernel(const float* __restrict__ scores_in,
 
 // --- Host-side Launcher ---
 
-inline int EstimateBestPartitionSize(int vocab_size) {
+inline int EstimateBestPartitionSize(int vocab_size, int k=50) {
+  // --- SPECIALIZED OPTIMIZATION for vocab_size=201088, k=50 ---
+  if (vocab_size == 201088 && k == 50) {
+    return 2032;
+  }
+
   constexpr std::array<int, 4> kPartitionTargets = {8, 16, 32, 64};
   int best_partition_size = 0;
-  // Use a large initial cost. Cost is a measure of how far away the number of partitions is
-  // from an ideal target (16, 32, 64), plus a penalty for a less balanced workload.
   double min_cost = std::numeric_limits<double>::max();
 
   for (int p_size : kSupportedPartitionSizes) {
@@ -210,15 +244,10 @@ inline int EstimateBestPartitionSize(int vocab_size) {
       continue;
     }
 
-    // Find the smallest target that is >= num_partitions
     auto it = std::lower_bound(kPartitionTargets.begin(), kPartitionTargets.end(), num_partitions);
     if (it != kPartitionTargets.end()) {
       int target_partitions = *it;
-      // Cost is the distance to the target. A perfect match has a cost of 0.
       double cost = target_partitions - num_partitions;
-
-      // TODO: Run experiment to add a small penalty for larger partition sizes to favor more balanced workloads
-
       if (cost < min_cost) {
         min_cost = cost;
         best_partition_size = p_size;
@@ -227,7 +256,6 @@ inline int EstimateBestPartitionSize(int vocab_size) {
   }
 
   if (best_partition_size == 0) {
-    // This vocab_size is too large. Returns a dummy value here. Note that IsSupported will reject it later.
     best_partition_size = kSupportedPartitionSizes[0];
   }
 
@@ -253,15 +281,11 @@ void* GetKernel() {
 
 template <int kBlockSize, int kPartitionSize, int K_PADDED>
 void* GetKernelForNumPartitions(int num_partitions) {
-  if (num_partitions <= 8) {
-    return GetKernel<kBlockSize, kPartitionSize, K_PADDED, 8>();
-  } else if (num_partitions <= 16) {
-    return GetKernel<kBlockSize, kPartitionSize, K_PADDED, 16>();
-  } else if (num_partitions <= 32) {
-    return GetKernel<kBlockSize, kPartitionSize, K_PADDED, 32>();
-  } else {
-    return GetKernel<kBlockSize, kPartitionSize, K_PADDED, 64>();
-  }
+  if (num_partitions <= 8) return GetKernel<kBlockSize, kPartitionSize, K_PADDED, 8>();
+  if (num_partitions <= 16) return GetKernel<kBlockSize, kPartitionSize, K_PADDED, 16>();
+  if (num_partitions <= 32) return GetKernel<kBlockSize, kPartitionSize, K_PADDED, 32>();
+  if (num_partitions <= 64) return GetKernel<kBlockSize, kPartitionSize, K_PADDED, 64>();
+  return GetKernel<kBlockSize, kPartitionSize, K_PADDED, 99>(); // For specialized case
 }
 
 template <int P_SIZE, int K_PADDED>
@@ -281,32 +305,23 @@ void LaunchKernel(TopkData* data, cudaStream_t stream, const float* scores_in, i
 
 template <int K_PADDED>
 void LaunchKernelByPartitionSize(TopkData* data, cudaStream_t stream, const float* scores_in, int vocab_size, int batch_size, int k, int partition_size) {
-  if (partition_size == kSupportedPartitionSizes[0])
-    LaunchKernel<kSupportedPartitionSizes[0], K_PADDED>(data, stream, scores_in, vocab_size, batch_size, k);
-  else if (partition_size == kSupportedPartitionSizes[1])
-    LaunchKernel<kSupportedPartitionSizes[1], K_PADDED>(data, stream, scores_in, vocab_size, batch_size, k);
-  else if (partition_size == kSupportedPartitionSizes[2])
-    LaunchKernel<kSupportedPartitionSizes[2], K_PADDED>(data, stream, scores_in, vocab_size, batch_size, k);
-  else
-    LaunchKernel<kSupportedPartitionSizes[3], K_PADDED>(data, stream, scores_in, vocab_size, batch_size, k);
+  if (partition_size == kSupportedPartitionSizes[0]) LaunchKernel<kSupportedPartitionSizes[0], K_PADDED>(data, stream, scores_in, vocab_size, batch_size, k);
+  else if (partition_size == kSupportedPartitionSizes[1]) LaunchKernel<kSupportedPartitionSizes[1], K_PADDED>(data, stream, scores_in, vocab_size, batch_size, k);
+  else if (partition_size == kSupportedPartitionSizes[2]) LaunchKernel<kSupportedPartitionSizes[2], K_PADDED>(data, stream, scores_in, vocab_size, batch_size, k);
+  else if (partition_size == kSupportedPartitionSizes[3]) LaunchKernel<kSupportedPartitionSizes[3], K_PADDED>(data, stream, scores_in, vocab_size, batch_size, k);
+  else LaunchKernel<kSupportedPartitionSizes[4], K_PADDED>(data, stream, scores_in, vocab_size, batch_size, k);
 }
 
 void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vocab_size, int batch_size, int k) {
   assert(IsSupported(batch_size, vocab_size, k));
 
   const int partition_size = data->flash_convergent_partition_size;
-  if (k <= 4)
-    LaunchKernelByPartitionSize<4>(data, stream, scores_in, vocab_size, batch_size, k, partition_size);
-  else if (k <= 8)
-    LaunchKernelByPartitionSize<8>(data, stream, scores_in, vocab_size, batch_size, k, partition_size);
-  else if (k <= 16)
-    LaunchKernelByPartitionSize<16>(data, stream, scores_in, vocab_size, batch_size, k, partition_size);
-  else if (k <= 32)
-    LaunchKernelByPartitionSize<32>(data, stream, scores_in, vocab_size, batch_size, k, partition_size);
-  else if (k <= 52)
-    LaunchKernelByPartitionSize<52>(data, stream, scores_in, vocab_size, batch_size, k, partition_size);
-  else
-    LaunchKernelByPartitionSize<64>(data, stream, scores_in, vocab_size, batch_size, k, partition_size);
+  if (k <= 4) LaunchKernelByPartitionSize<4>(data, stream, scores_in, vocab_size, batch_size, k, partition_size);
+  else if (k <= 8) LaunchKernelByPartitionSize<8>(data, stream, scores_in, vocab_size, batch_size, k, partition_size);
+  else if (k <= 16) LaunchKernelByPartitionSize<16>(data, stream, scores_in, vocab_size, batch_size, k, partition_size);
+  else if (k <= 32) LaunchKernelByPartitionSize<32>(data, stream, scores_in, vocab_size, batch_size, k, partition_size);
+  else if (k <= 52) LaunchKernelByPartitionSize<52>(data, stream, scores_in, vocab_size, batch_size, k, partition_size);
+  else LaunchKernelByPartitionSize<64>(data, stream, scores_in, vocab_size, batch_size, k, partition_size);
   CUDA_CHECK_LAUNCH();
 
   data->topk_scores = data->intermediate_scores_2;
@@ -320,14 +335,11 @@ bool CheckSupport(int batch_size, int num_partitions, int partition_size) {
   constexpr int kBlockSize = 256;
   const int total_blocks = num_partitions * batch_size;
   void* kernel;
-  if (partition_size == kSupportedPartitionSizes[0])
-    kernel = GetKernel<kBlockSize, kSupportedPartitionSizes[0], K_PADDED, kMaxPartitionsForKernel>();
-  else if (partition_size == kSupportedPartitionSizes[1])
-    kernel = GetKernel<kBlockSize, kSupportedPartitionSizes[1], K_PADDED, kMaxPartitionsForKernel>();
-  else if (partition_size == kSupportedPartitionSizes[2])
-    kernel = GetKernel<kBlockSize, kSupportedPartitionSizes[2], K_PADDED, kMaxPartitionsForKernel>();
-  else
-    kernel = GetKernel<kBlockSize, kSupportedPartitionSizes[3], K_PADDED, kMaxPartitionsForKernel>();
+  if (partition_size == kSupportedPartitionSizes[0]) kernel = GetKernel<kBlockSize, kSupportedPartitionSizes[0], K_PADDED, kMaxPartitionsForKernel>();
+  else if (partition_size == kSupportedPartitionSizes[1]) kernel = GetKernel<kBlockSize, kSupportedPartitionSizes[1], K_PADDED, kMaxPartitionsForKernel>();
+  else if (partition_size == kSupportedPartitionSizes[2]) kernel = GetKernel<kBlockSize, kSupportedPartitionSizes[2], K_PADDED, kMaxPartitionsForKernel>();
+  else if (partition_size == kSupportedPartitionSizes[3]) kernel = GetKernel<kBlockSize, kSupportedPartitionSizes[3], K_PADDED, kMaxPartitionsForKernel>();
+  else kernel = GetKernel<kBlockSize, kSupportedPartitionSizes[4], K_PADDED, kMaxPartitionsForKernel>();
 
   int device, num_sm, max_blocks_per_sm;
   CUDA_CHECK(cudaGetDevice(&device));
@@ -338,14 +350,11 @@ bool CheckSupport(int batch_size, int num_partitions, int partition_size) {
 
 template <int K_PADDED>
 bool IsSupportedDispatch(int batch_size, int partition_size, int num_partitions) {
-  if (num_partitions <= 8) {
-    return CheckSupport<K_PADDED, 8>(batch_size, num_partitions, partition_size);
-  } else if (num_partitions <= 16) {
-    return CheckSupport<K_PADDED, 16>(batch_size, num_partitions, partition_size);
-  } else if (num_partitions <= 32) {
-    return CheckSupport<K_PADDED, 32>(batch_size, num_partitions, partition_size);
-  }
-  return CheckSupport<K_PADDED, 64>(batch_size, num_partitions, partition_size);
+  if (num_partitions <= 8) return CheckSupport<K_PADDED, 8>(batch_size, num_partitions, partition_size);
+  if (num_partitions <= 16) return CheckSupport<K_PADDED, 16>(batch_size, num_partitions, partition_size);
+  if (num_partitions <= 32) return CheckSupport<K_PADDED, 32>(batch_size, num_partitions, partition_size);
+  if (num_partitions <= 64) return CheckSupport<K_PADDED, 64>(batch_size, num_partitions, partition_size);
+  return CheckSupport<K_PADDED, 99>(batch_size, num_partitions, partition_size);
 }
 
 bool IsSupported(int batch_size, int vocab_size, int k) {
@@ -355,7 +364,7 @@ bool IsSupported(int batch_size, int vocab_size, int k) {
   cudaDeviceGetAttribute(&coop_support, cudaDevAttrCooperativeLaunch, 0);
   if (!coop_support) return false;
 
-  const int partition_size = EstimateBestPartitionSize(vocab_size);
+  const int partition_size = EstimateBestPartitionSize(vocab_size, k);
   if (partition_size == 0) return false;
   const int num_partitions = CeilDiv(vocab_size, partition_size);
   if (num_partitions > kMaxPartitions) return false;
@@ -371,3 +380,4 @@ bool IsSupported(int batch_size, int vocab_size, int k) {
 }  // namespace flash_convergent
 }  // namespace cuda
 }  // namespace Generators
+
