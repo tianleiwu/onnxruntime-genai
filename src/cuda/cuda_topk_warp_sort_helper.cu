@@ -11,7 +11,7 @@
 
 namespace Generators {
 namespace cuda {
-namespace bitonic_sort {
+namespace topk_common {
 
 /**
  * @brief Performs an in-place, warp-wide bitonic sort on data held entirely in registers.
@@ -152,6 +152,6 @@ __device__ void WarpMergeSort(float* smem_scores, int* smem_indices, void* temp_
 #endif
 }
 
-}  // namespace bitonic_sort
+}  // namespace topk_common
 }  // namespace cuda
 }  // namespace Generators

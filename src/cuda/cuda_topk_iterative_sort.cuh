@@ -9,7 +9,7 @@
 #include <cub/block/block_merge_sort.cuh>
 #include <type_traits>  // For std::integral_constant
 #include "cuda_topk.h"
-#include "cuda_topk_bitonic_sort_helper.cuh"
+#include "cuda_topk_warp_sort_helper.cuh"
 #include "cuda_topk_common.cuh"
 #include "cuda_topk_sort_benchmark_cache.h"
 

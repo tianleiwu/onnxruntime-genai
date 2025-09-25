@@ -8,7 +8,7 @@
 #include <cuda_runtime.h>
 #include "cuda_topk.h"
 #include "cuda_topk_common.cuh"
-#include "cuda_topk_bitonic_sort_helper.cuh"
+#include "cuda_topk_warp_sort_helper.cuh"
 #include <cooperative_groups.h>
 #include "cuda_topk_sort_benchmark_cache.h"
 
@@ -154,7 +154,7 @@ __global__ void FlashConvergentKernel(const float* __restrict__ scores_in,
       }
       __syncthreads();
 
-      bitonic_sort::WarpMergeSort<kSortSizePo2>(smem.warp_sort_storage.scores, smem.warp_sort_storage.indices, &smem.cub_warp_storage, num_elements_to_sort);
+      topk_common::WarpMergeSort<kSortSizePo2>(smem.warp_sort_storage.scores, smem.warp_sort_storage.indices, &smem.cub_warp_storage, num_elements_to_sort);
       __syncthreads();
 
       if (threadIdx.x < k_actual) {

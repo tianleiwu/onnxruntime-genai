@@ -11,7 +11,7 @@
 #include <iomanip>
 
 #include "cuda_topk.h"
-#include "cuda_topk_bitonic_sort_helper.cuh"
+#include "cuda_topk_warp_sort_helper.cuh"
 
 namespace Generators {
 namespace cuda {
@@ -98,6 +98,37 @@ struct SortBenchmarkResults {
   }
 };
 
+/**
+ * @brief Measures the average execution time of a CUDA kernel over several runs.
+ * This is a lightweight version for online benchmarking, using fewer iterations
+ * than an offline profiler to minimize runtime overhead.
+ * @param stream The CUDA stream to run the kernel on.
+ * @param kernel_func A lambda function that launches the kernel.
+ * @return The average execution time in milliseconds.
+ */
+float TimeKernel(cudaStream_t stream, std::function<void()> kernel_func, int warm_up_runs = 2, int total_runs = 5) {
+  cuda_event_holder start_event, stop_event;
+
+  // Warm-up runs to handle any one-time kernel loading costs or JIT compilation.
+  for (int i = 0; i < warm_up_runs; ++i) {
+    kernel_func();
+  }
+  CUDA_CHECK(cudaStreamSynchronize(stream));
+
+  // Timed runs.
+  CUDA_CHECK(cudaEventRecord(start_event, stream));
+  for (int i = 0; i < total_runs; ++i) {
+    kernel_func();
+  }
+  CUDA_CHECK(cudaEventRecord(stop_event, stream));
+  CUDA_CHECK(cudaEventSynchronize(stop_event));
+
+  float ms = 0.0f;
+  CUDA_CHECK(cudaEventElapsedTime(&ms, start_event, stop_event));
+
+  return ms / total_runs;
+}
+
 // --- Singleton Cache Manager ---
 namespace {  // Anonymous namespace for internal benchmark kernels
 #ifdef ENABLE_SORT_BENCHMARK
@@ -105,7 +136,7 @@ __global__ void warpBitonicSortKernel_b(const float* scores_in, float* scores_ou
   if (threadIdx.x >= 32) return;
   float my_score = scores_in[threadIdx.x];
   int my_index = threadIdx.x;  // Index doesn't matter for latency benchmark
-  Generators::cuda::bitonic_sort::WarpBitonicSort(my_score, my_index);
+  Generators::cuda::topk_common::WarpBitonicSort(my_score, my_index);
   if (threadIdx.x < k) {
     scores_out[threadIdx.x] = my_score;
   }
@@ -133,7 +164,7 @@ __global__ void cubWarpMergeSortKernel_b(const float* scores_in, float* scores_o
   }
   __syncthreads();
 
-  Generators::cuda::bitonic_sort::WarpMergeSort<SORT_SIZE_PO2>(
+  Generators::cuda::topk_common::WarpMergeSort<SORT_SIZE_PO2>(
       smem.sort_data.scores, smem.sort_data.indices, &smem.cub_storage, SORT_SIZE);
   __syncthreads();
 
@@ -353,37 +384,6 @@ static const char* SortAlgoToString(SortAlgo algo) {
     default:
       return "Unknown";
   }
-}
-
-/**
- * @brief Measures the average execution time of a CUDA kernel over several runs.
- * This is a lightweight version for online benchmarking, using fewer iterations
- * than an offline profiler to minimize runtime overhead.
- * @param stream The CUDA stream to run the kernel on.
- * @param kernel_func A lambda function that launches the kernel.
- * @return The average execution time in milliseconds.
- */
-float TimeKernel(cudaStream_t stream, std::function<void()> kernel_func, int warm_up_runs = 2, int total_runs = 5) {
-  cuda_event_holder start_event, stop_event;
-
-  // Warm-up runs to handle any one-time kernel loading costs or JIT compilation.
-  for (int i = 0; i < warm_up_runs; ++i) {
-    kernel_func();
-  }
-  CUDA_CHECK(cudaStreamSynchronize(stream));
-
-  // Timed runs.
-  CUDA_CHECK(cudaEventRecord(start_event, stream));
-  for (int i = 0; i < total_runs; ++i) {
-    kernel_func();
-  }
-  CUDA_CHECK(cudaEventRecord(stop_event, stream));
-  CUDA_CHECK(cudaEventSynchronize(stop_event));
-
-  float ms = 0.0f;
-  CUDA_CHECK(cudaEventElapsedTime(&ms, start_event, stop_event));
-
-  return ms / total_runs;
 }
 }  // namespace
 

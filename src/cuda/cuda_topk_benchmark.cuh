@@ -14,7 +14,7 @@
 #include <cub/cub.cuh>
 
 #include "cuda_topk.h"
-#include "cuda_topk_bitonic_sort_helper.cuh"
+#include "cuda_topk_warp_sort_helper.cuh"
 #include "cuda_topk_common.cuh"
 #include "cuda_topk_sort_benchmark_cache.h"
 #include "cuda_topk_benchmark_cache.h"

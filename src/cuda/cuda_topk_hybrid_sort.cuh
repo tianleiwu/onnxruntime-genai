@@ -10,7 +10,7 @@
 #include <numeric>
 #include <algorithm>
 #include "cuda_topk.h"
-#include "cuda_topk_bitonic_sort_helper.cuh"
+#include "cuda_topk_warp_sort_helper.cuh"
 #include "cuda_topk_common.cuh"
 #include "cuda_topk_sort_benchmark_cache.h"
 
@@ -359,14 +359,14 @@ __global__ void BlockReduceTopK(const float* __restrict__ scores_in, const int* 
       if (threadIdx.x < warpSize) {
         float my_score = (threadIdx.x < kSortSize) ? smem_sort.scores[threadIdx.x] : -FLT_MAX;
         int my_index = (threadIdx.x < kSortSize) ? smem_sort.indices[threadIdx.x] : INT_MAX;
-        bitonic_sort::WarpBitonicSort(my_score, my_index);
+        topk_common::WarpBitonicSort(my_score, my_index);
         if (threadIdx.x < K_PADDED) {
           smem_sort.scores[threadIdx.x] = my_score;
           smem_sort.indices[threadIdx.x] = my_index;
         }
       }
     } else if constexpr (Algorithm == ReductionAlgorithm::WARP_MERGE_SORT) {
-      bitonic_sort::WarpMergeSort<kSortSizePo2>(smem_sort.scores, smem_sort.indices, &smem_union.cub_warp_storage, num_elements_to_sort);
+      topk_common::WarpMergeSort<kSortSizePo2>(smem_sort.scores, smem_sort.indices, &smem_union.cub_warp_storage, num_elements_to_sort);
     }
 
     __syncthreads();

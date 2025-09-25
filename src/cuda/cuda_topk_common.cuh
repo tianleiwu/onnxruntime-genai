@@ -305,7 +305,7 @@ __device__ void BlockReduceTopK(const float* scores_in_batch,
     if (threadIdx.x < warpSize) {
       float my_score = (threadIdx.x < num_elements_to_sort) ? smem.stage2_storage.scores[threadIdx.x] : -FLT_MAX;
       int my_index = (threadIdx.x < num_elements_to_sort) ? smem.stage2_storage.indices[threadIdx.x] : INT_MAX;
-      bitonic_sort::WarpBitonicSort(my_score, my_index);
+      topk_common::WarpBitonicSort(my_score, my_index);
       if (threadIdx.x < K_PADDED) {
         smem.stage2_storage.scores[threadIdx.x] = my_score;
         smem.stage2_storage.indices[threadIdx.x] = my_index;
@@ -328,7 +328,7 @@ __device__ void BlockReduceTopK(const float* scores_in_batch,
       }
     }
     __syncthreads();
-    bitonic_sort::WarpMergeSort<kSortSizePo2>(smem.stage2_storage.scores, smem.stage2_storage.indices, &smem.cub_warp_storage, num_elements_to_sort);
+    topk_common::WarpMergeSort<kSortSizePo2>(smem.stage2_storage.scores, smem.stage2_storage.indices, &smem.cub_warp_storage, num_elements_to_sort);
   } else {
     // --- 3. CUB Block Merge Sort (for kSortSize > 128) ---
 #ifdef STABLE_TOPK
