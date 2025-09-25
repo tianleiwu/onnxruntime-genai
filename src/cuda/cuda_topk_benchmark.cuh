@@ -8,46 +8,19 @@
 #include <memory>
 #include <array>
 #include <iostream>
+#include <vector>
+#include <numeric>
+#include <iomanip>
+#include <cub/cub.cuh>
 
 #include "cuda_topk.h"
+#include "cuda_topk_bitonic_sort_helper.cuh"
+#include "cuda_topk_common.cuh"
+#include "cuda_topk_sort_benchmark_cache.h"
 #include "cuda_topk_benchmark_cache.h"
 
 namespace Generators {
 namespace cuda {
-
-/**
- * @brief Measures the average execution time of a CUDA kernel over several runs.
- * This is a lightweight version for online benchmarking, using fewer iterations
- * than an offline profiler to minimize runtime overhead.
- * @param stream The CUDA stream to run the kernel on.
- * @param kernel_func A lambda function that launches the kernel.
- * @return The average execution time in milliseconds.
- */
-static float TimeKernel(cudaStream_t stream, std::function<void()> kernel_func) {
-  const int warm_up_runs = 2;
-  const int total_runs = 5;
-
-  cuda_event_holder start_event, stop_event;
-
-  // Warm-up runs to handle any one-time kernel loading costs or JIT compilation.
-  for (int i = 0; i < warm_up_runs; ++i) {
-    kernel_func();
-  }
-  CUDA_CHECK(cudaStreamSynchronize(stream));
-
-  // Timed runs.
-  CUDA_CHECK(cudaEventRecord(start_event, stream));
-  for (int i = 0; i < total_runs; ++i) {
-    kernel_func();
-  }
-  CUDA_CHECK(cudaEventRecord(stop_event, stream));
-  CUDA_CHECK(cudaEventSynchronize(stop_event));
-
-  float ms = 0.0f;
-  CUDA_CHECK(cudaEventElapsedTime(&ms, start_event, stop_event));
-
-  return ms / total_runs;
-}
 
 // Helper to convert TopkAlgo enum to its string representation for printing.
 static const char* TopkAlgoToString(TopkAlgo algo) {
@@ -104,6 +77,9 @@ static TopkAlgo BenchmarkAndSelectBestAlgo(TopkData* topk_data,
                                            int vocab_size,
                                            int batch_size,
                                            int k) {
+  // Ensure the low-level sort benchmark has been run once for this device.
+  GetOrRunSortBenchmark(stream);
+
   float min_latency = std::numeric_limits<float>::max();
   TopkAlgo best_algo = TopkAlgo::UNKNOWN;
 
@@ -153,7 +129,7 @@ static TopkAlgo BenchmarkAndSelectBestAlgo(TopkData* topk_data,
   // Candidate: Hybrid Sort. This is a robust fallback. We benchmark it if either the cooperative
   // kernels are not supported, or if the vocab size is small, where hybrid can sometimes be faster.
   if (!use_iterative_sort && !use_cascaded_sort && !use_flash_convergent || vocab_size <= 4096) {
-    if (k <= kHybridSortMaxK) {
+    if (hybrid_sort::IsSupported(batch_size, vocab_size, k)) {
       BENCHMARK_KERNEL(TopkAlgo::HYBRID, [&]() {
         hybrid_sort::RunTopK(topk_data, stream, scores_in, vocab_size, batch_size, k);
       });
@@ -183,3 +159,4 @@ static TopkAlgo BenchmarkAndSelectBestAlgo(TopkData* topk_data,
 
 }  // namespace cuda
 }  // namespace Generators
+

@@ -12,6 +12,7 @@
 #include "cuda_topk.h"
 #include "cuda_topk_bitonic_sort_helper.cuh"
 #include "cuda_topk_common.cuh"
+#include "cuda_topk_sort_benchmark_cache.h"
 
 namespace Generators {
 namespace cuda {
@@ -27,34 +28,30 @@ namespace hybrid_sort {
  * 1.  **Host-Side Planning (`GetReductionPlan`)**: Before launching any kernels, the host
  * determines an optimal multi-step reduction plan. It greedily decides how many partitions
  * to merge in each step, aiming to minimize the number of kernel launches. It also selects
- * the best internal sorting algorithm for each step based on the number of items to sort.
+ * the best internal sorting algorithm for each step based on cached benchmark data.
  *
  * 2.  **Stage 1 (Partition Top-K)**: A standard kernel (`Stage1_FindPartitionsTopK`) is launched to
- * find the top `K_PADDED` candidates from each vocabulary partition, similar to other algorithms.
+ * find the top `K_PADDED` candidates from each vocabulary partition. The internal sorting
+ * algorithm is chosen based on cached benchmark data.
  *
  * 3.  **Stage 2 (Planned Reduction)**: A series of reduction kernels (`BlockReduceTopK`)
- * are launched according to the plan from step 1. Each launch merges a group of candidate
- * sets from the previous stage.
+ * are launched according to the plan from step 1.
  *
  * Performance Characteristics:
  * -   **Strengths**: Its main advantage is portability, as it runs on GPUs that do not support
  * cooperative kernels. The host-side planner can make intelligent decisions to create an
- * efficient reduction strategy.
- * -   **"Hybrid" Nature**: The `BlockReduceTopK` kernel is a "hybrid" because it uses
- * a compile-time dispatch (`ReductionAlgorithm` enum) to select the most efficient internal
- * sorting method (Warp Bitonic, Warp Merge Sort, or CUB Radix Sort) based on the number of
- * elements being sorted in that specific reduction step. This provides fine-grained optimization.
+ * efficient reduction strategy based on live benchmark data.
  * -   **Weaknesses**: The use of multiple kernel launches can introduce higher overhead compared to
- * single-kernel cooperative approaches like `iterative_sort` or `casaded_sort`.
+ * single-kernel cooperative approaches like `iterative_sort` or `cascaded_sort`.
  */
 
 // The internal sorting algorithm to be used inside the reduction kernel, chosen by the host-side planner.
 enum class ReductionAlgorithm {
-  WARP_BITONIC,     // For very small sorts (<= 32 items), uses a register-based warp sort.
-  WARP_MERGE_SORT,  // For small sorts (33-128 items), uses a CUB-based warp merge sort.
-  BLOCK_BITONIC,    // For medium sorts (129-256 items), uses a shared memory bitonic sort.
-  CUB_BLOCK_MERGE,  // For medium-large sorts, uses CUB block-wide merge sort.
-  CUB_RADIX_SORT    // For larger sorts (> 256 items), uses the powerful CUB block-wide radix sort.
+  WARP_BITONIC,
+  WARP_MERGE_SORT,
+  BLOCK_BITONIC,
+  CUB_BLOCK_MERGE,
+  CUB_RADIX_SORT
 };
 
 // Contains the parameters for a single reduction kernel launch.
@@ -113,11 +110,13 @@ inline int EstimateBestPartitionSize(int vocab_size) {
 /**
  * @brief Creates a deterministic, multi-step reduction plan.
  * This function determines how many partitions to merge in each step to minimize
- * kernel launches, and which internal sort algorithm is best for each step.
+ * kernel launches, and which internal sort algorithm is best for each step based on benchmark data.
  */
-inline ReductionPlan GetReductionPlan(int num_partitions, int k_padded) {
+inline ReductionPlan GetReductionPlan(int num_partitions, int k_padded, cudaStream_t stream) {
   ReductionPlan plan;
   int current_partitions = num_partitions;
+
+  const auto& benchmarks = GetOrRunSortBenchmark(stream);
 
   while (current_partitions > 1) {
     // Determine the max number of partitions we can merge in one block based on shared memory budget.
@@ -144,16 +143,28 @@ inline ReductionPlan GetReductionPlan(int num_partitions, int k_padded) {
 
     int sort_size = k_padded * step.partitions_per_block;
 
-    // --- UPDATED ALGORITHM SELECTION LOGIC ---
-    // This logic is now based on the empirical benchmark results.
-    if (sort_size <= 32) {
-      step.algorithm = ReductionAlgorithm::WARP_BITONIC;
-    } else if (sort_size <= 128) {
-      step.algorithm = ReductionAlgorithm::WARP_MERGE_SORT;
-    } else if (sort_size < 4096) { // CUB Block Merge is faster in the mid-range
-      step.algorithm = ReductionAlgorithm::CUB_BLOCK_MERGE;
-    } else { // CUB Block Radix is faster for very large sorts
-      step.algorithm = ReductionAlgorithm::CUB_RADIX_SORT;
+    // Use benchmark results to pick the fastest algorithm for this sort size.
+    SortAlgo best_algo = benchmarks.GetBestAlgo(sort_size);
+    switch (best_algo) {
+      case SortAlgo::WARP_BITONIC:
+        step.algorithm = ReductionAlgorithm::WARP_BITONIC;
+        break;
+      case SortAlgo::CUB_WARP_MERGE:
+        step.algorithm = ReductionAlgorithm::WARP_MERGE_SORT;
+        break;
+      case SortAlgo::SMEM_BITONIC:
+        step.algorithm = ReductionAlgorithm::BLOCK_BITONIC;
+        break;
+      case SortAlgo::CUB_BLOCK_MERGE:
+        step.algorithm = ReductionAlgorithm::CUB_BLOCK_MERGE;
+        break;
+      case SortAlgo::CUB_BLOCK_RADIX:
+        step.algorithm = ReductionAlgorithm::CUB_RADIX_SORT;
+        break;
+      default:
+        // Fallback to a robust choice
+        step.algorithm = ReductionAlgorithm::CUB_BLOCK_MERGE;
+        break;
     }
 
     plan.push_back(step);
@@ -165,22 +176,22 @@ inline ReductionPlan GetReductionPlan(int num_partitions, int k_padded) {
 
 // --- Stage 1 Kernel ---
 // Finds the Top-K within each partition of the vocabulary.
-template <int kBlockSize, int kPartitionSize, int K>
+template <int kBlockSize, int kPartitionSize, int K, bool UseMergeSort>
 __global__ void Stage1_FindPartitionsTopK(const float* __restrict__ scores_in,
                                           int* __restrict__ intermediate_indices,
                                           float* __restrict__ intermediate_scores,
                                           int vocab_size, int num_partitions) {
   using Stage1TempStorageType = typename topk_common::Stage1TempStorage<kBlockSize, kPartitionSize>;
   __shared__ Stage1TempStorageType smem;
-  topk_common::FindPartitionTopK<kBlockSize, kPartitionSize, K, Stage1TempStorageType>(scores_in, intermediate_indices, intermediate_scores, vocab_size, num_partitions, smem);
+  topk_common::FindPartitionTopK<kBlockSize, kPartitionSize, K, UseMergeSort>(scores_in, intermediate_indices, intermediate_scores, vocab_size, num_partitions, smem);
 }
 
 // A simple greater-than comparator for descending sort
 struct DescendingOp {
-    template <typename T>
-    __device__ __host__ bool operator()(const T& a, const T& b) const {
-        return a > b;
-    }
+  template <typename T>
+  __device__ __host__ bool operator()(const T& a, const T& b) const {
+    return a > b;
+  }
 };
 
 /**
@@ -193,6 +204,9 @@ __global__ void BlockReduceTopK(const float* __restrict__ scores_in, const int* 
                                 float* __restrict__ scores_out, int* __restrict__ indices_out, int num_partitions_in) {
   const int batch_idx = blockIdx.y;
   const int block_start_partition = blockIdx.x * PartitionsPerBlock;
+  if (block_start_partition >= num_partitions_in) {
+      return;
+  }
   const int num_partitions_to_process = min(PartitionsPerBlock, num_partitions_in - block_start_partition);
   const int num_elements_to_sort = K_PADDED * num_partitions_to_process;
 
@@ -256,66 +270,62 @@ __global__ void BlockReduceTopK(const float* __restrict__ scores_in, const int* 
     }
 #endif
   } else if constexpr (Algorithm == ReductionAlgorithm::CUB_BLOCK_MERGE) {
-      // --- NEW KERNEL PATH FOR CUB BLOCK MERGE SORT ---
-      #ifdef STABLE_TOPK
-          // For stable sort, we sort packed 64-bit keys. cub::BlockMergeSort supports keys-only sort via cub::NullType.
-          using SortKeyT = uint64_t;
-          using SortValueT = cub::NullType;
-          using CubTempStorage = typename cub::BlockMergeSort<SortKeyT, kBlockSize, CeilDiv(kSortSize, kBlockSize), SortValueT>::TempStorage;
-          __shared__ CubTempStorage cub_merge_storage;
-          constexpr int kItemsPerThread = CeilDiv(kSortSize, kBlockSize);
-          SortKeyT thread_keys[kItemsPerThread];
+#ifdef STABLE_TOPK
+    using SortKeyT = uint64_t;
+    using SortValueT = cub::NullType;
+    using CubTempStorage = typename cub::BlockMergeSort<SortKeyT, kBlockSize, CeilDiv(kSortSize, kBlockSize), SortValueT>::TempStorage;
+    __shared__ CubTempStorage cub_merge_storage;
+    constexpr int kItemsPerThread = CeilDiv(kSortSize, kBlockSize);
+    SortKeyT thread_keys[kItemsPerThread];
 
-          // Load and pack data into registers
-          for (int i = 0; i < kItemsPerThread; i++) {
-              int item_idx = threadIdx.x + i * kBlockSize;
-              if (item_idx < num_elements_to_sort) {
-                  int partition_idx = item_idx / K_PADDED;
-                  int element_idx = item_idx % K_PADDED;
-                  size_t offset = in_base_offset + static_cast<size_t>(block_start_partition + partition_idx) * K_PADDED + element_idx;
-                  thread_keys[i] = topk_common::PackStableSortKey(scores_in[offset], indices_in[offset]);
-              } else {
-                  thread_keys[i] = topk_common::PackStableSortKey(-FLT_MAX, INT_MAX);
-              }
-          }
-          cub::BlockMergeSort<SortKeyT, kBlockSize, kItemsPerThread, SortValueT>(cub_merge_storage).Sort(thread_keys, DescendingOp());
+    for (int i = 0; i < kItemsPerThread; i++) {
+      int item_idx = threadIdx.x + i * kBlockSize;
+      if (item_idx < num_elements_to_sort) {
+        int partition_idx = item_idx / K_PADDED;
+        int element_idx = item_idx % K_PADDED;
+        size_t offset = in_base_offset + static_cast<size_t>(block_start_partition + partition_idx) * K_PADDED + element_idx;
+        thread_keys[i] = topk_common::PackStableSortKey(scores_in[offset], indices_in[offset]);
+      } else {
+        thread_keys[i] = topk_common::PackStableSortKey(-FLT_MAX, INT_MAX);
+      }
+    }
+    cub::BlockMergeSort<SortKeyT, kBlockSize, kItemsPerThread, SortValueT>(cub_merge_storage).Sort(thread_keys, DescendingOp());
 
-          // Unpack and store top K results back to global memory.
-          float thread_scores_out[kItemsPerThread];
-          int thread_indices_out[kItemsPerThread];
-          for (int i = 0; i < kItemsPerThread; ++i) {
-            thread_scores_out[i] = topk_common::UnpackStableSortScore(thread_keys[i]);
-            thread_indices_out[i] = topk_common::UnpackStableSortIndex(thread_keys[i]);
-          }
-          cub::StoreDirectBlocked(threadIdx.x, scores_out + out_base_offset, thread_scores_out, K_PADDED);
-          cub::StoreDirectBlocked(threadIdx.x, indices_out + out_base_offset, thread_indices_out, K_PADDED);
-      #else
-          using SortKeyT = float;
-          using SortValueT = int;
-          using CubTempStorage = typename cub::BlockMergeSort<SortKeyT, kBlockSize, CeilDiv(kSortSize, kBlockSize), SortValueT>::TempStorage;
-          __shared__ CubTempStorage cub_merge_storage;
-          constexpr int kItemsPerThread = CeilDiv(kSortSize, kBlockSize);
-          SortKeyT thread_keys[kItemsPerThread];
-          SortValueT thread_values[kItemsPerThread];
+    float thread_scores_out[kItemsPerThread];
+    int thread_indices_out[kItemsPerThread];
+    for (int i = 0; i < kItemsPerThread; ++i) {
+      thread_scores_out[i] = topk_common::UnpackStableSortScore(thread_keys[i]);
+      thread_indices_out[i] = topk_common::UnpackStableSortIndex(thread_keys[i]);
+    }
+    cub::StoreDirectBlocked(threadIdx.x, scores_out + out_base_offset, thread_scores_out, K_PADDED);
+    cub::StoreDirectBlocked(threadIdx.x, indices_out + out_base_offset, thread_indices_out, K_PADDED);
+#else
+    using SortKeyT = float;
+    using SortValueT = int;
+    using CubTempStorage = typename cub::BlockMergeSort<SortKeyT, kBlockSize, CeilDiv(kSortSize, kBlockSize), SortValueT>::TempStorage;
+    __shared__ CubTempStorage cub_merge_storage;
+    constexpr int kItemsPerThread = CeilDiv(kSortSize, kBlockSize);
+    SortKeyT thread_keys[kItemsPerThread];
+    SortValueT thread_values[kItemsPerThread];
 
-          for (int i = 0; i < kItemsPerThread; ++i) {
-              int item_idx = threadIdx.x + i * kBlockSize;
-              if (item_idx < num_elements_to_sort) {
-                  int partition_idx = item_idx / K_PADDED;
-                  int element_idx = item_idx % K_PADDED;
-                  size_t offset = in_base_offset + static_cast<size_t>(block_start_partition + partition_idx) * K_PADDED + element_idx;
-                  thread_keys[i] = scores_in[offset];
-                  thread_values[i] = indices_in[offset];
-              } else {
-                  thread_keys[i] = -FLT_MAX;
-                  thread_values[i] = INT_MAX;
-              }
-          }
-          cub::BlockMergeSort<SortKeyT, kBlockSize, kItemsPerThread, SortValueT>(cub_merge_storage).Sort(thread_keys, thread_values, DescendingOp());
-          cub::StoreDirectBlocked(threadIdx.x, scores_out + out_base_offset, thread_keys, K_PADDED);
-          cub::StoreDirectBlocked(threadIdx.x, indices_out + out_base_offset, thread_values, K_PADDED);
-      #endif
-  } else {  // This block handles both WARP_BITONIC and WARP_MERGE_SORT
+    for (int i = 0; i < kItemsPerThread; ++i) {
+      int item_idx = threadIdx.x + i * kBlockSize;
+      if (item_idx < num_elements_to_sort) {
+        int partition_idx = item_idx / K_PADDED;
+        int element_idx = item_idx % K_PADDED;
+        size_t offset = in_base_offset + static_cast<size_t>(block_start_partition + partition_idx) * K_PADDED + element_idx;
+        thread_keys[i] = scores_in[offset];
+        thread_values[i] = indices_in[offset];
+      } else {
+        thread_keys[i] = -FLT_MAX;
+        thread_values[i] = INT_MAX;
+      }
+    }
+    cub::BlockMergeSort<SortKeyT, kBlockSize, kItemsPerThread, SortValueT>(cub_merge_storage).Sort(thread_keys, thread_values, DescendingOp());
+    cub::StoreDirectBlocked(threadIdx.x, scores_out + out_base_offset, thread_keys, K_PADDED);
+    cub::StoreDirectBlocked(threadIdx.x, indices_out + out_base_offset, thread_values, K_PADDED);
+#endif
+  } else {
     constexpr int kSortSizePo2 = topk_common::NextPowerOfTwo(kSortSize);
 
     union SharedStorage {
@@ -384,16 +394,11 @@ void LaunchReductionStep(const ReductionStep& step, cudaStream_t stream,
   dim3 grid(CeilDiv(num_partitions_in, step.partitions_per_block), batch_size);
   dim3 block(step.block_size);
 
-  // This nested lambda structure uses `if constexpr` to ensure that kernel launch templates
-  // are only instantiated if the compile-time constants (like sort size) are valid
-  // for that specific kernel. This prevents the compiler from generating code for invalid
-  // template combinations that would otherwise fail a static_assert.
   auto dispatch_and_launch = [&](auto block_size_const, auto p_per_block_const) {
     constexpr int B_SIZE = block_size_const.value;
     constexpr int P_PER_BLOCK = p_per_block_const.value;
     constexpr int kSortSize = K_PADDED * P_PER_BLOCK;
 
-    // The runtime `switch` selects which compile-time path to take.
     switch (step.algorithm) {
       case ReductionAlgorithm::CUB_RADIX_SORT:
         BlockReduceTopK<B_SIZE, K_PADDED, P_PER_BLOCK, ReductionAlgorithm::CUB_RADIX_SORT><<<grid, block, 0, stream>>>(
@@ -411,14 +416,12 @@ void LaunchReductionStep(const ReductionStep& step, cudaStream_t stream,
         break;
 
       case ReductionAlgorithm::WARP_MERGE_SORT:
-        // This `if constexpr` ensures this kernel is only instantiated when kSortSize is valid for it.
         if constexpr (kSortSize > 32 && kSortSize <= 128) {
           BlockReduceTopK<B_SIZE, K_PADDED, P_PER_BLOCK, ReductionAlgorithm::WARP_MERGE_SORT><<<grid, block, 0, stream>>>(
               scores_in, indices_in, scores_out, indices_out, num_partitions_in);
         }
         break;
       case ReductionAlgorithm::WARP_BITONIC:
-        // This `if constexpr` ensures this kernel is only instantiated when kSortSize is valid for it.
         if constexpr (kSortSize <= 32) {
           BlockReduceTopK<B_SIZE, K_PADDED, P_PER_BLOCK, ReductionAlgorithm::WARP_BITONIC><<<grid, block, 0, stream>>>(
               scores_in, indices_in, scores_out, indices_out, num_partitions_in);
@@ -428,8 +431,6 @@ void LaunchReductionStep(const ReductionStep& step, cudaStream_t stream,
   };
 
   auto dispatch_partitions = [&](auto block_size_const) {
-    // This runtime `switch` converts the runtime `partitions_per_block` into a compile-time constant
-    // that can be used in the `dispatch_and_launch` lambda.
     switch (step.partitions_per_block) {
       case 16:
         dispatch_and_launch(block_size_const, std::integral_constant<int, 16>());
@@ -448,7 +449,6 @@ void LaunchReductionStep(const ReductionStep& step, cudaStream_t stream,
     }
   };
 
-  // The runtime `if` converts the runtime `block_size` into a compile-time constant.
   if (step.block_size == 128) {
     dispatch_partitions(std::integral_constant<int, 128>());
   } else {
@@ -463,26 +463,30 @@ void LaunchStage1(cudaStream_t stream, int partition_size, int num_partitions, i
   dim3 grid_stage1(num_partitions, batch_size);
   dim3 block_stage1(256);
 
-#define LAUNCH_STAGE1_KERNEL(P_SIZE)                                                            \
-  Stage1_FindPartitionsTopK<256, P_SIZE, K_TEMPLATE><<<grid_stage1, block_stage1, 0, stream>>>( \
+  const auto& benchmarks = GetSortBenchmarkResults();
+  bool use_merge_sort = benchmarks.GetBestAlgo(partition_size) == SortAlgo::CUB_BLOCK_MERGE;
+
+#define LAUNCH_STAGE1_KERNEL(P_SIZE, USE_MERGE)                                                                   \
+  Stage1_FindPartitionsTopK<256, P_SIZE, K_TEMPLATE, USE_MERGE><<<grid_stage1, block_stage1, 0, stream>>>(        \
       scores_in, data->intermediate_indices_1, data->intermediate_scores_1, vocab_size, num_partitions)
 
-  switch (partition_size) {
-    case kCandidatePartitionSizes[0]:
-      LAUNCH_STAGE1_KERNEL(kCandidatePartitionSizes[0]);
-      break;
-    case kCandidatePartitionSizes[1]:
-      LAUNCH_STAGE1_KERNEL(kCandidatePartitionSizes[1]);
-      break;
-    case kCandidatePartitionSizes[2]:
-      LAUNCH_STAGE1_KERNEL(kCandidatePartitionSizes[2]);
-      break;
-    case kCandidatePartitionSizes[3]:
-      LAUNCH_STAGE1_KERNEL(kCandidatePartitionSizes[3]);
-      break;
-    default:
-      break;  // Should not happen with current planner
+  if (partition_size == kCandidatePartitionSizes[0]) {
+    if (use_merge_sort) LAUNCH_STAGE1_KERNEL(kCandidatePartitionSizes[0], true);
+    else LAUNCH_STAGE1_KERNEL(kCandidatePartitionSizes[0], false);
+  } else if (partition_size == kCandidatePartitionSizes[1]) {
+    if (use_merge_sort) LAUNCH_STAGE1_KERNEL(kCandidatePartitionSizes[1], true);
+    else LAUNCH_STAGE1_KERNEL(kCandidatePartitionSizes[1], false);
+  } else if (partition_size == kCandidatePartitionSizes[2]) {
+    if (use_merge_sort) LAUNCH_STAGE1_KERNEL(kCandidatePartitionSizes[2], true);
+    else LAUNCH_STAGE1_KERNEL(kCandidatePartitionSizes[2], false);
+  } else if (partition_size == kCandidatePartitionSizes[3]) {
+    if (use_merge_sort) LAUNCH_STAGE1_KERNEL(kCandidatePartitionSizes[3], true);
+    else LAUNCH_STAGE1_KERNEL(kCandidatePartitionSizes[3], false);
+  } else {
+    // This path should not be taken due to the checks in IsSupported.
+    assert(false);
   }
+
 #undef LAUNCH_STAGE1_KERNEL
 }
 
@@ -490,6 +494,9 @@ void LaunchStage1(cudaStream_t stream, int partition_size, int num_partitions, i
 
 void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vocab_size, int batch_size, int k) {
   assert(IsSupported(batch_size, vocab_size, k));  // caller shall check IsSupported before calling this function.
+  if (data->hybrid_sort_partition_size  == 0) {
+    data->hybrid_sort_partition_size = EstimateBestPartitionSize(vocab_size);
+  }
 
   // --- Stage 0: Planning ---
   const int partition_size = data->hybrid_sort_partition_size;
@@ -497,23 +504,16 @@ void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vo
 
   // Pad k to a supported value for template instantiation.
   int k_padded;
-  if (k <= 4)
-    k_padded = 4;
-  else if (k <= 8)
-    k_padded = 8;
-  else if (k <= 16)
-    k_padded = 16;
-  else if (k <= 32)
-    k_padded = 32;
-  else if (k <= 64)
-    k_padded = 64;
-  else if (k <= 128)
-    k_padded = 128;
-  else
-    k_padded = 256;
+  if (k <= 4) k_padded = 4;
+  else if (k <= 8) k_padded = 8;
+  else if (k <= 16) k_padded = 16;
+  else if (k <= 32) k_padded = 32;
+  else if (k <= 64) k_padded = 64;
+  else if (k <= 128) k_padded = 128;
+  else k_padded = 256;
 
   // Create the reduction plan based on the padded k value.
-  const ReductionPlan plan = GetReductionPlan(num_partitions, k_padded);
+  const ReductionPlan plan = GetReductionPlan(num_partitions, k_padded, stream);
 
   // This lambda captures the launch logic to be called by the k-dispatch below.
   auto launch_kernels = [&](auto k_padded_const) {
@@ -550,20 +550,13 @@ void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vo
     data->topk_stride = K_PADDED;
   };
 
-  if (k_padded == 4)
-    launch_kernels(std::integral_constant<int, 4>());
-  else if (k_padded == 8)
-    launch_kernels(std::integral_constant<int, 8>());
-  else if (k_padded == 16)
-    launch_kernels(std::integral_constant<int, 16>());
-  else if (k_padded == 32)
-    launch_kernels(std::integral_constant<int, 32>());
-  else if (k_padded == 64)
-    launch_kernels(std::integral_constant<int, 64>());
-  else if (k_padded == 128)
-    launch_kernels(std::integral_constant<int, 128>());
-  else if (k_padded == 256)
-    launch_kernels(std::integral_constant<int, 256>());
+  if (k_padded == 4) launch_kernels(std::integral_constant<int, 4>());
+  else if (k_padded == 8) launch_kernels(std::integral_constant<int, 8>());
+  else if (k_padded == 16) launch_kernels(std::integral_constant<int, 16>());
+  else if (k_padded == 32) launch_kernels(std::integral_constant<int, 32>());
+  else if (k_padded == 64) launch_kernels(std::integral_constant<int, 64>());
+  else if (k_padded == 128) launch_kernels(std::integral_constant<int, 128>());
+  else if (k_padded == 256) launch_kernels(std::integral_constant<int, 256>());
 }
 
 bool IsSupported(int /*batch_size*/, int vocab_size, int k) {
@@ -572,6 +565,19 @@ bool IsSupported(int /*batch_size*/, int vocab_size, int k) {
   }
 
   const int partition_size = EstimateBestPartitionSize(vocab_size);
+  // Ensure the estimated partition size is one of the valid, non-zero candidates
+  // before proceeding. This prevents invalid template instantiations.
+  bool is_valid_psize = false;
+  for (int p_size : kCandidatePartitionSizes) {
+    if (partition_size == p_size) {
+      is_valid_psize = true;
+      break;
+    }
+  }
+  if (!is_valid_psize) {
+    return false;
+  }
+
   const int num_partitions = CeilDiv(vocab_size, partition_size);
   if (num_partitions > kMaxPartitions) {
     return false;

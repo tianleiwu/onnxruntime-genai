@@ -72,6 +72,7 @@ struct TopkDataDetail {
   int iterative_sort_partition_size = 0;
   int cascaded_sort_partition_size = 0;
   int flash_convergent_partition_size = 0;
+  int flash_convergent_partition_size_k = 0; // The k value used in estimating the partition size for flash_convergent.
 
   // The number of elements required for intermediate buffers, sized to accommodate the worst-case scenario.
   size_t intermediate_buffer_elements = 0;
@@ -205,6 +206,7 @@ void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vo
 namespace flash_convergent {
 constexpr const char* kAlgorithmName = "Flash_Convergent_Sort";
 bool IsSupported(int batch_size, int vocab_size, int k);
+int EstimateBestPartitionSize(int vocab_size, int k);
 void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vocab_size, int batch_size, int k);
 }  // namespace flash_convergent
 
@@ -218,6 +220,7 @@ void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vo
 namespace hybrid_sort {
 constexpr const char* kAlgorithmName = "Multi_Kernel_Hybrid_Sort";
 bool IsSupported(int batch_size, int vocab_size, int k);
+int EstimateBestPartitionSize(int vocab_size);
 void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vocab_size, int batch_size, int k);
 }  // namespace hybrid_sort
 
@@ -227,8 +230,9 @@ void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vo
  * It is optimized for small `k` using a fast warp-level bitonic sort for reduction.
  */
 namespace iterative_sort {
-constexpr const char* kAlgorithmName = "Iterative_Reduce_Sort";
+constexpr const char* kAlgorithmName = "Iterative_Merge_Sort";
 bool IsSupported(int batch_size, int vocab_size, int k);
+int EstimateBestPartitionSize(int vocab_size);
 void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vocab_size, int batch_size, int k);
 }  // namespace iterative_sort
 
@@ -238,8 +242,9 @@ void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vo
  * wider range of `k` values and partition counts than `iterative_sort`.
  */
 namespace cascaded_sort {
-constexpr const char* kAlgorithmName = "Cascaded_Reduce_Sort";
+constexpr const char* kAlgorithmName = "Cascaded_Merge_Sort";
 bool IsSupported(int batch_size, int vocab_size, int k);
+int EstimateBestPartitionSize(int vocab_size);
 void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vocab_size, int batch_size, int k);
 }  // namespace cascaded_sort
 

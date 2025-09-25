@@ -11,6 +11,7 @@
 #include "cuda_topk.h"
 #include "cuda_topk_bitonic_sort_helper.cuh"
 #include "cuda_topk_common.cuh"
+#include "cuda_topk_sort_benchmark_cache.h"
 
 namespace Generators {
 namespace cuda {
@@ -113,7 +114,7 @@ constexpr ReductionFactors GetReductionFactors(int num_partitions, int k) {
  * @brief The main kernel for Cascaded Sort. It performs the initial partition sort
  * followed by up to three cascaded reduction steps, all within a single launch.
  */
-template <int K_PADDED, int kBlockSize, int kPartitionSize, int Factor1, int Factor2, int Factor3>
+template <int K_PADDED, int kBlockSize, int kPartitionSize, int Factor1, int Factor2, int Factor3, bool UseMergeS1>
 __global__ void CascadedSortKernel(const float* __restrict__ input_scores,
                                    int* __restrict__ intermediate_indices_1,
                                    float* __restrict__ intermediate_scores_1,
@@ -149,7 +150,7 @@ __global__ void CascadedSortKernel(const float* __restrict__ input_scores,
   __shared__ SharedStorage smem;
 
   // --- Stage 1: Find Top-K within each partition ---
-  topk_common::FindPartitionTopK<kBlockSize, kPartitionSize, K_PADDED>(
+  topk_common::FindPartitionTopK<kBlockSize, kPartitionSize, K_PADDED, UseMergeS1>(
       input_scores, intermediate_indices_1, intermediate_scores_1, vocab_size, num_partitions, smem.stage1_storage);
 
   grid.sync();
@@ -262,7 +263,7 @@ constexpr int GetOptimalBlockSize() {
 }
 
 // Templated helper to launch the kernel with a constexpr block size and reduction factors.
-template <int K_PADDED, int Factor1, int Factor2, int Factor3>
+template <int K_PADDED, int Factor1, int Factor2, int Factor3, bool UseMergeS1>
 void LaunchKernelWithFactors(TopkData* data, cudaStream_t stream, const float* scores_in, int vocab_size, int batch_size) {
   constexpr int kBlockSize = GetOptimalBlockSize<K_PADDED>();
 
@@ -282,16 +283,16 @@ void LaunchKernelWithFactors(TopkData* data, cudaStream_t stream, const float* s
 
   switch (partition_size) {
     case kAllowedPartitionSizes[0]:
-      CUDA_CHECK(cudaLaunchCooperativeKernel((void*)CascadedSortKernel<K_PADDED, kBlockSize, kAllowedPartitionSizes[0], Factor1, Factor2, Factor3>, grid, block, kernel_args, 0, stream));
+      CUDA_CHECK(cudaLaunchCooperativeKernel((void*)CascadedSortKernel<K_PADDED, kBlockSize, kAllowedPartitionSizes[0], Factor1, Factor2, Factor3, UseMergeS1>, grid, block, kernel_args, 0, stream));
       break;
     case kAllowedPartitionSizes[1]:
-      CUDA_CHECK(cudaLaunchCooperativeKernel((void*)CascadedSortKernel<K_PADDED, kBlockSize, kAllowedPartitionSizes[1], Factor1, Factor2, Factor3>, grid, block, kernel_args, 0, stream));
+      CUDA_CHECK(cudaLaunchCooperativeKernel((void*)CascadedSortKernel<K_PADDED, kBlockSize, kAllowedPartitionSizes[1], Factor1, Factor2, Factor3, UseMergeS1>, grid, block, kernel_args, 0, stream));
       break;
     case kAllowedPartitionSizes[2]:
-      CUDA_CHECK(cudaLaunchCooperativeKernel((void*)CascadedSortKernel<K_PADDED, kBlockSize, kAllowedPartitionSizes[2], Factor1, Factor2, Factor3>, grid, block, kernel_args, 0, stream));
+      CUDA_CHECK(cudaLaunchCooperativeKernel((void*)CascadedSortKernel<K_PADDED, kBlockSize, kAllowedPartitionSizes[2], Factor1, Factor2, Factor3, UseMergeS1>, grid, block, kernel_args, 0, stream));
       break;
     case kAllowedPartitionSizes[3]:
-      CUDA_CHECK(cudaLaunchCooperativeKernel((void*)CascadedSortKernel<K_PADDED, kBlockSize, kAllowedPartitionSizes[3], Factor1, Factor2, Factor3>, grid, block, kernel_args, 0, stream));
+      CUDA_CHECK(cudaLaunchCooperativeKernel((void*)CascadedSortKernel<K_PADDED, kBlockSize, kAllowedPartitionSizes[3], Factor1, Factor2, Factor3, UseMergeS1>, grid, block, kernel_args, 0, stream));
       break;
     default:
       assert(false);
@@ -304,47 +305,40 @@ template <int K_PADDED>
 void LaunchKernel(TopkData* data, cudaStream_t stream, const float* scores_in, int vocab_size, int batch_size, int k) {
   const int num_partitions = CeilDiv(vocab_size, data->cascaded_sort_partition_size);
   const auto factors = GetReductionFactors(num_partitions, k);
+  const auto& benchmarks = GetSortBenchmarkResults();
+  bool use_merge_s1 = benchmarks.GetBestAlgo(data->cascaded_sort_partition_size) == SortAlgo::CUB_BLOCK_MERGE;
 
-  // Use `if constexpr` to ensure that combinations of K_PADDED and reduction factors that would
-  // violate the `static_assert(kSortSize <= 256)` are never instantiated by the compiler.
+#define LAUNCH_WITH_FACTORS(F1, F2, F3) \
+    if (use_merge_s1) LaunchKernelWithFactors<K_PADDED, F1, F2, F3, true>(data, stream, scores_in, vocab_size, batch_size); \
+    else LaunchKernelWithFactors<K_PADDED, F1, F2, F3, false>(data, stream, scores_in, vocab_size, batch_size)
+
   if constexpr (K_PADDED > 32) {
-    // For large K, only factors <= 4 are valid according to GetReductionFactors.
-    if (factors.factor1 == 4 && factors.factor2 == 4 && factors.factor3 == 4)
-    LaunchKernelWithFactors<K_PADDED, 4, 4, 4>(data, stream, scores_in, vocab_size, batch_size);
-  else if (factors.factor1 == 4 && factors.factor2 == 4 && factors.factor3 == 2)
-    LaunchKernelWithFactors<K_PADDED, 4, 4, 2>(data, stream, scores_in, vocab_size, batch_size);
-  else if (factors.factor1 == 4 && factors.factor2 == 4)
-    LaunchKernelWithFactors<K_PADDED, 4, 4, 1>(data, stream, scores_in, vocab_size, batch_size);
-  else if (factors.factor1 == 4 && factors.factor2 == 2)
-    LaunchKernelWithFactors<K_PADDED, 4, 2, 1>(data, stream, scores_in, vocab_size, batch_size);
-  else if (factors.factor1 == 4)
-    LaunchKernelWithFactors<K_PADDED, 4, 1, 1>(data, stream, scores_in, vocab_size, batch_size);
-  else if (factors.factor1 == 2)
-    LaunchKernelWithFactors<K_PADDED, 2, 1, 1>(data, stream, scores_in, vocab_size, batch_size);
-  else
-    LaunchKernelWithFactors<K_PADDED, 1, 1, 1>(data, stream, scores_in, vocab_size, batch_size);
+    if (factors.factor1 == 4 && factors.factor2 == 4 && factors.factor3 == 4) LAUNCH_WITH_FACTORS(4, 4, 4);
+    else if (factors.factor1 == 4 && factors.factor2 == 4 && factors.factor3 == 2) LAUNCH_WITH_FACTORS(4, 4, 2);
+    else if (factors.factor1 == 4 && factors.factor2 == 4) LAUNCH_WITH_FACTORS(4, 4, 1);
+    else if (factors.factor1 == 4 && factors.factor2 == 2) LAUNCH_WITH_FACTORS(4, 2, 1);
+    else if (factors.factor1 == 4) LAUNCH_WITH_FACTORS(4, 1, 1);
+    else if (factors.factor1 == 2) LAUNCH_WITH_FACTORS(2, 1, 1);
+    else LAUNCH_WITH_FACTORS(1, 1, 1);
   } else {
-    // For smaller K, factors up to 8 are valid.
-    if (factors.factor1 == 8 && factors.factor2 == 8)
-      LaunchKernelWithFactors<K_PADDED, 8, 8, 1>(data, stream, scores_in, vocab_size, batch_size);
-    else if (factors.factor1 == 8 && factors.factor2 == 4)
-      LaunchKernelWithFactors<K_PADDED, 8, 4, 1>(data, stream, scores_in, vocab_size, batch_size);
-    else if (factors.factor1 == 8)
-      LaunchKernelWithFactors<K_PADDED, 8, 1, 1>(data, stream, scores_in, vocab_size, batch_size);
-    else if (factors.factor1 == 4 && factors.factor2 == 4)
-      LaunchKernelWithFactors<K_PADDED, 4, 4, 1>(data, stream, scores_in, vocab_size, batch_size);
-    else if (factors.factor1 == 4)
-      LaunchKernelWithFactors<K_PADDED, 4, 1, 1>(data, stream, scores_in, vocab_size, batch_size);
-    else if (factors.factor1 == 2)
-      LaunchKernelWithFactors<K_PADDED, 2, 1, 1>(data, stream, scores_in, vocab_size, batch_size);
-    else
-      LaunchKernelWithFactors<K_PADDED, 1, 1, 1>(data, stream, scores_in, vocab_size, batch_size);
+    if (factors.factor1 == 8 && factors.factor2 == 8) LAUNCH_WITH_FACTORS(8, 8, 1);
+    else if (factors.factor1 == 8 && factors.factor2 == 4) LAUNCH_WITH_FACTORS(8, 4, 1);
+    else if (factors.factor1 == 8) LAUNCH_WITH_FACTORS(8, 1, 1);
+    else if (factors.factor1 == 4 && factors.factor2 == 4) LAUNCH_WITH_FACTORS(4, 4, 1);
+    else if (factors.factor1 == 4) LAUNCH_WITH_FACTORS(4, 1, 1);
+    else if (factors.factor1 == 2) LAUNCH_WITH_FACTORS(2, 1, 1);
+    else LAUNCH_WITH_FACTORS(1, 1, 1);
   }
+#undef LAUNCH_WITH_FACTORS
 }
 
 // --- Unified Host-Side Launcher ---
 void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vocab_size, int batch_size, int k) {
   assert(IsSupported(batch_size, vocab_size, k));  // caller shall check IsSupported before calling this function.
+  
+  if (data->cascaded_sort_partition_size == 0) {
+    data->cascaded_sort_partition_size = EstimateBestPartitionSize(vocab_size);
+  }
 
   const int partition_size = data->cascaded_sort_partition_size;
   const int num_partitions = CeilDiv(vocab_size, partition_size);
@@ -401,20 +395,23 @@ template <int K_PADDED, int Factor1, int Factor2, int Factor3>
 bool CheckSupportWithFactors(int batch_size, int partition_size, int num_partitions) {
   constexpr int kBlockSize = GetOptimalBlockSize<K_PADDED>();
   const int total_blocks = num_partitions * batch_size;
+  const auto& benchmarks = GetSortBenchmarkResults();
+  bool use_merge_s1 = benchmarks.GetBestAlgo(partition_size) == SortAlgo::CUB_BLOCK_MERGE;
+
   void* kernel = nullptr;
 
   switch (partition_size) {
     case kAllowedPartitionSizes[0]:
-      kernel = (void*)CascadedSortKernel<K_PADDED, kBlockSize, kAllowedPartitionSizes[0], Factor1, Factor2, Factor3>;
+      kernel = use_merge_s1 ? (void*)CascadedSortKernel<K_PADDED, kBlockSize, kAllowedPartitionSizes[0], Factor1, Factor2, Factor3, true> : (void*)CascadedSortKernel<K_PADDED, kBlockSize, kAllowedPartitionSizes[0], Factor1, Factor2, Factor3, false>;
       break;
     case kAllowedPartitionSizes[1]:
-      kernel = (void*)CascadedSortKernel<K_PADDED, kBlockSize, kAllowedPartitionSizes[1], Factor1, Factor2, Factor3>;
+      kernel = use_merge_s1 ? (void*)CascadedSortKernel<K_PADDED, kBlockSize, kAllowedPartitionSizes[1], Factor1, Factor2, Factor3, true> : (void*)CascadedSortKernel<K_PADDED, kBlockSize, kAllowedPartitionSizes[1], Factor1, Factor2, Factor3, false>;
       break;
     case kAllowedPartitionSizes[2]:
-      kernel = (void*)CascadedSortKernel<K_PADDED, kBlockSize, kAllowedPartitionSizes[2], Factor1, Factor2, Factor3>;
+      kernel = use_merge_s1 ? (void*)CascadedSortKernel<K_PADDED, kBlockSize, kAllowedPartitionSizes[2], Factor1, Factor2, Factor3, true> : (void*)CascadedSortKernel<K_PADDED, kBlockSize, kAllowedPartitionSizes[2], Factor1, Factor2, Factor3, false>;
       break;
     case kAllowedPartitionSizes[3]:
-      kernel = (void*)CascadedSortKernel<K_PADDED, kBlockSize, kAllowedPartitionSizes[3], Factor1, Factor2, Factor3>;
+      kernel = use_merge_s1 ? (void*)CascadedSortKernel<K_PADDED, kBlockSize, kAllowedPartitionSizes[3], Factor1, Factor2, Factor3, true> : (void*)CascadedSortKernel<K_PADDED, kBlockSize, kAllowedPartitionSizes[3], Factor1, Factor2, Factor3, false>;
       break;
     default:
       return false;
@@ -436,18 +433,15 @@ template <int K_PADDED>
 bool CheckSupport(int batch_size, int vocab_size, int k, int partition_size, int num_partitions) {
   const auto factors = GetReductionFactors(num_partitions, k);
 
-  // Use `if constexpr` to prevent instantiation of invalid template combinations.
   if constexpr (K_PADDED > 32) {
-    // Only instantiate checks for factors that are valid for large K.
-  if (factors.factor1 == 4 && factors.factor2 == 4 && factors.factor3 == 4) return CheckSupportWithFactors<K_PADDED, 4, 4, 4>(batch_size, partition_size, num_partitions);
-  if (factors.factor1 == 4 && factors.factor2 == 4 && factors.factor3 == 2) return CheckSupportWithFactors<K_PADDED, 4, 4, 2>(batch_size, partition_size, num_partitions);
-  if (factors.factor1 == 4 && factors.factor2 == 4) return CheckSupportWithFactors<K_PADDED, 4, 4, 1>(batch_size, partition_size, num_partitions);
-  if (factors.factor1 == 4 && factors.factor2 == 2) return CheckSupportWithFactors<K_PADDED, 4, 2, 1>(batch_size, partition_size, num_partitions);
-  if (factors.factor1 == 4) return CheckSupportWithFactors<K_PADDED, 4, 1, 1>(batch_size, partition_size, num_partitions);
-  if (factors.factor1 == 2) return CheckSupportWithFactors<K_PADDED, 2, 1, 1>(batch_size, partition_size, num_partitions);
-  return CheckSupportWithFactors<K_PADDED, 1, 1, 1>(batch_size, partition_size, num_partitions);
+    if (factors.factor1 == 4 && factors.factor2 == 4 && factors.factor3 == 4) return CheckSupportWithFactors<K_PADDED, 4, 4, 4>(batch_size, partition_size, num_partitions);
+    if (factors.factor1 == 4 && factors.factor2 == 4 && factors.factor3 == 2) return CheckSupportWithFactors<K_PADDED, 4, 4, 2>(batch_size, partition_size, num_partitions);
+    if (factors.factor1 == 4 && factors.factor2 == 4) return CheckSupportWithFactors<K_PADDED, 4, 4, 1>(batch_size, partition_size, num_partitions);
+    if (factors.factor1 == 4 && factors.factor2 == 2) return CheckSupportWithFactors<K_PADDED, 4, 2, 1>(batch_size, partition_size, num_partitions);
+    if (factors.factor1 == 4) return CheckSupportWithFactors<K_PADDED, 4, 1, 1>(batch_size, partition_size, num_partitions);
+    if (factors.factor1 == 2) return CheckSupportWithFactors<K_PADDED, 2, 1, 1>(batch_size, partition_size, num_partitions);
+    return CheckSupportWithFactors<K_PADDED, 1, 1, 1>(batch_size, partition_size, num_partitions);
   } else {
-    // Instantiate all factor combinations for smaller K.
     if (factors.factor1 == 8 && factors.factor2 == 8) return CheckSupportWithFactors<K_PADDED, 8, 8, 1>(batch_size, partition_size, num_partitions);
     if (factors.factor1 == 8 && factors.factor2 == 4) return CheckSupportWithFactors<K_PADDED, 8, 4, 1>(batch_size, partition_size, num_partitions);
     if (factors.factor1 == 8) return CheckSupportWithFactors<K_PADDED, 8, 1, 1>(batch_size, partition_size, num_partitions);
