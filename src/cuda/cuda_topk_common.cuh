@@ -267,9 +267,6 @@ __device__ __host__ __forceinline__ constexpr int Log2NextPowerOfTwo(int n) {
   return log2;
 #endif
 }
-// =================================================================================================
-//                                  NEW COMMON REDUCTION HELPERS
-// =================================================================================================
 
 /**
  * @brief A unified, benchmark-driven helper for performing a reduction (merge) step.
@@ -314,7 +311,7 @@ __device__ void BlockReduceTopK(const float* scores_in_batch,
         smem.stage2_storage.indices[threadIdx.x] = my_index;
       }
     }
-  } else if constexpr (kSortSize > 32 && kSortSize <= 256) {
+  } else if constexpr (kSortSize > 32 && kSortSize <= 128) {
     // --- 2. CUB Warp Merge Sort or SMEM Bitonic Sort (for 32 < kSortSize <= 256) ---
     // This range is covered by either primitive. We default to SMEM bitonic for larger sizes in this range,
     // and warp merge for smaller, as it has less overhead. The host planner will select the correct kernel.
@@ -331,13 +328,9 @@ __device__ void BlockReduceTopK(const float* scores_in_batch,
       }
     }
     __syncthreads();
-    if constexpr (kSortSize <= 128) {
-      bitonic_sort::WarpMergeSort<kSortSizePo2>(smem.stage2_storage.scores, smem.stage2_storage.indices, &smem.cub_warp_storage, num_elements_to_sort);
-    } else {
-      bitonic_sort::SharedMemBitonicSort<kBlockSize, kSortSizePo2>(smem.stage2_storage.scores, smem.stage2_storage.indices);
-    }
+    bitonic_sort::WarpMergeSort<kSortSizePo2>(smem.stage2_storage.scores, smem.stage2_storage.indices, &smem.cub_warp_storage, num_elements_to_sort);
   } else {
-    // --- 3. CUB Block Merge Sort (for kSortSize > 256) ---
+    // --- 3. CUB Block Merge Sort (for kSortSize > 128) ---
 #ifdef STABLE_TOPK
     using SortKeyT = uint64_t;
     SortKeyT thread_keys[kItemsPerThread];
@@ -400,4 +393,3 @@ __device__ void BlockReduceTopK(const float* scores_in_batch,
 }  // namespace topk_common
 }  // namespace cuda
 }  // namespace Generators
-

@@ -72,7 +72,7 @@ struct TopkDataDetail {
   int iterative_sort_partition_size = 0;
   int cascaded_sort_partition_size = 0;
   int flash_convergent_partition_size = 0;
-  int flash_convergent_partition_size_k = 0; // The k value used in estimating the partition size for flash_convergent.
+  int flash_convergent_partition_size_k = 0;  // The k value used in estimating the partition size for flash_convergent.
 
   // The number of elements required for intermediate buffers, sized to accommodate the worst-case scenario.
   size_t intermediate_buffer_elements = 0;
@@ -164,7 +164,7 @@ void RunTopK(TopkData* topk_data, cudaStream_t stream, const float* scores_in, i
  * This is primarily intended for correctness validation and as a performance baseline. It is only efficient for very small k.
  */
 namespace select_sort {
-constexpr const char* kAlgorithmName = "Select_Sort";
+constexpr const char* kAlgorithmName = "Select";
 void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vocab_size, int batch_size, int k);
 }  // namespace select_sort
 
@@ -174,7 +174,7 @@ void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vo
  * This approach is particularly effective for very large vocabularies and small batch sizes.
  */
 namespace distributed_select_sort {
-constexpr const char* kAlgorithmName = "Distributed_Select_Sort";
+constexpr const char* kAlgorithmName = "Distributed_Select";
 bool IsSupported(int batch_size, int vocab_size, int k);
 void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vocab_size, int batch_size, int k);
 }  // namespace distributed_select_sort
@@ -184,7 +184,7 @@ void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vo
  * then extracts the top-k elements. This is a robust but inefficient fallback.
  */
 namespace full_sort {
-constexpr const char* kAlgorithmName = "Segmented_Radix_Sort";
+constexpr const char* kAlgorithmName = "Segmented_Radix";
 void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vocab_size, int batch_size, int k);
 }  // namespace full_sort
 
@@ -193,7 +193,7 @@ void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vo
  * This is an effective strategy for smaller batch sizes where parallelism between batches is high.
  */
 namespace per_batch_radix_sort {
-constexpr const char* kAlgorithmName = "Per_Batch_Radix_Sort";
+constexpr const char* kAlgorithmName = "Per_Batch_Radix";
 void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vocab_size, int batch_size, int k);
 }  // namespace per_batch_radix_sort
 
@@ -204,7 +204,7 @@ void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vo
  * This minimizes synchronization but is limited by the number of partitions a single block can handle.
  */
 namespace flash_convergent {
-constexpr const char* kAlgorithmName = "Flash_Convergent_Sort";
+constexpr const char* kAlgorithmName = "Flash_Convergent";
 bool IsSupported(int batch_size, int vocab_size, int k);
 int EstimateBestPartitionSize(int vocab_size, int k);
 void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vocab_size, int batch_size, int k);
@@ -218,7 +218,7 @@ void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vo
  * Does not require cooperative launch, making it highly portable.
  */
 namespace hybrid_sort {
-constexpr const char* kAlgorithmName = "Multi_Kernel_Hybrid_Sort";
+constexpr const char* kAlgorithmName = "Multi_Kernel_Hybrid";
 bool IsSupported(int batch_size, int vocab_size, int k);
 int EstimateBestPartitionSize(int vocab_size);
 void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vocab_size, int batch_size, int k);
@@ -230,7 +230,7 @@ void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vo
  * It is optimized for small `k` using a fast warp-level bitonic sort for reduction.
  */
 namespace iterative_sort {
-constexpr const char* kAlgorithmName = "Iterative_Merge_Sort";
+constexpr const char* kAlgorithmName = "Iterative_Merge";
 bool IsSupported(int batch_size, int vocab_size, int k);
 int EstimateBestPartitionSize(int vocab_size);
 void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vocab_size, int batch_size, int k);
@@ -242,7 +242,7 @@ void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vo
  * wider range of `k` values and partition counts than `iterative_sort`.
  */
 namespace cascaded_sort {
-constexpr const char* kAlgorithmName = "Cascaded_Merge_Sort";
+constexpr const char* kAlgorithmName = "Cascaded_Merge";
 bool IsSupported(int batch_size, int vocab_size, int k);
 int EstimateBestPartitionSize(int vocab_size);
 void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vocab_size, int batch_size, int k);

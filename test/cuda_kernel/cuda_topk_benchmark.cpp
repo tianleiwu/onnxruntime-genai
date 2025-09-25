@@ -38,7 +38,7 @@ struct BenchmarkParams {
 struct BenchmarkResult {
   BenchmarkParams params;
   std::string algo_name;
-  
+
   int parameter;
 
   float latency_ms;
@@ -384,4 +384,3 @@ TEST(TopKBenchmarks, PerformanceTests) {
 }
 
 #endif
-

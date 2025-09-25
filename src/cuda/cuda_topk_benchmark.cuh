@@ -159,4 +159,3 @@ static TopkAlgo BenchmarkAndSelectBestAlgo(TopkData* topk_data,
 
 }  // namespace cuda
 }  // namespace Generators
-

@@ -308,26 +308,42 @@ void LaunchKernel(TopkData* data, cudaStream_t stream, const float* scores_in, i
   const auto& benchmarks = GetSortBenchmarkResults();
   bool use_merge_s1 = benchmarks.GetBestAlgo(data->cascaded_sort_partition_size) == SortAlgo::CUB_BLOCK_MERGE;
 
-#define LAUNCH_WITH_FACTORS(F1, F2, F3) \
-    if (use_merge_s1) LaunchKernelWithFactors<K_PADDED, F1, F2, F3, true>(data, stream, scores_in, vocab_size, batch_size); \
-    else LaunchKernelWithFactors<K_PADDED, F1, F2, F3, false>(data, stream, scores_in, vocab_size, batch_size)
+#define LAUNCH_WITH_FACTORS(F1, F2, F3)                                                                   \
+  if (use_merge_s1)                                                                                       \
+    LaunchKernelWithFactors<K_PADDED, F1, F2, F3, true>(data, stream, scores_in, vocab_size, batch_size); \
+  else                                                                                                    \
+    LaunchKernelWithFactors<K_PADDED, F1, F2, F3, false>(data, stream, scores_in, vocab_size, batch_size)
 
   if constexpr (K_PADDED > 32) {
-    if (factors.factor1 == 4 && factors.factor2 == 4 && factors.factor3 == 4) LAUNCH_WITH_FACTORS(4, 4, 4);
-    else if (factors.factor1 == 4 && factors.factor2 == 4 && factors.factor3 == 2) LAUNCH_WITH_FACTORS(4, 4, 2);
-    else if (factors.factor1 == 4 && factors.factor2 == 4) LAUNCH_WITH_FACTORS(4, 4, 1);
-    else if (factors.factor1 == 4 && factors.factor2 == 2) LAUNCH_WITH_FACTORS(4, 2, 1);
-    else if (factors.factor1 == 4) LAUNCH_WITH_FACTORS(4, 1, 1);
-    else if (factors.factor1 == 2) LAUNCH_WITH_FACTORS(2, 1, 1);
-    else LAUNCH_WITH_FACTORS(1, 1, 1);
+    if (factors.factor1 == 4 && factors.factor2 == 4 && factors.factor3 == 4)
+      LAUNCH_WITH_FACTORS(4, 4, 4);
+    else if (factors.factor1 == 4 && factors.factor2 == 4 && factors.factor3 == 2)
+      LAUNCH_WITH_FACTORS(4, 4, 2);
+    else if (factors.factor1 == 4 && factors.factor2 == 4)
+      LAUNCH_WITH_FACTORS(4, 4, 1);
+    else if (factors.factor1 == 4 && factors.factor2 == 2)
+      LAUNCH_WITH_FACTORS(4, 2, 1);
+    else if (factors.factor1 == 4)
+      LAUNCH_WITH_FACTORS(4, 1, 1);
+    else if (factors.factor1 == 2)
+      LAUNCH_WITH_FACTORS(2, 1, 1);
+    else
+      LAUNCH_WITH_FACTORS(1, 1, 1);
   } else {
-    if (factors.factor1 == 8 && factors.factor2 == 8) LAUNCH_WITH_FACTORS(8, 8, 1);
-    else if (factors.factor1 == 8 && factors.factor2 == 4) LAUNCH_WITH_FACTORS(8, 4, 1);
-    else if (factors.factor1 == 8) LAUNCH_WITH_FACTORS(8, 1, 1);
-    else if (factors.factor1 == 4 && factors.factor2 == 4) LAUNCH_WITH_FACTORS(4, 4, 1);
-    else if (factors.factor1 == 4) LAUNCH_WITH_FACTORS(4, 1, 1);
-    else if (factors.factor1 == 2) LAUNCH_WITH_FACTORS(2, 1, 1);
-    else LAUNCH_WITH_FACTORS(1, 1, 1);
+    if (factors.factor1 == 8 && factors.factor2 == 8)
+      LAUNCH_WITH_FACTORS(8, 8, 1);
+    else if (factors.factor1 == 8 && factors.factor2 == 4)
+      LAUNCH_WITH_FACTORS(8, 4, 1);
+    else if (factors.factor1 == 8)
+      LAUNCH_WITH_FACTORS(8, 1, 1);
+    else if (factors.factor1 == 4 && factors.factor2 == 4)
+      LAUNCH_WITH_FACTORS(4, 4, 1);
+    else if (factors.factor1 == 4)
+      LAUNCH_WITH_FACTORS(4, 1, 1);
+    else if (factors.factor1 == 2)
+      LAUNCH_WITH_FACTORS(2, 1, 1);
+    else
+      LAUNCH_WITH_FACTORS(1, 1, 1);
   }
 #undef LAUNCH_WITH_FACTORS
 }
@@ -335,7 +351,7 @@ void LaunchKernel(TopkData* data, cudaStream_t stream, const float* scores_in, i
 // --- Unified Host-Side Launcher ---
 void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vocab_size, int batch_size, int k) {
   assert(IsSupported(batch_size, vocab_size, k));  // caller shall check IsSupported before calling this function.
-  
+
   if (data->cascaded_sort_partition_size == 0) {
     data->cascaded_sort_partition_size = EstimateBestPartitionSize(vocab_size);
   }
@@ -507,4 +523,3 @@ bool IsSupported(int batch_size, int vocab_size, int k) {
 }  // namespace cascaded_sort
 }  // namespace cuda
 }  // namespace Generators
-

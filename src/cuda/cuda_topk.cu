@@ -220,4 +220,3 @@ void RunTopK(TopkData* topk_data, cudaStream_t stream, const float* scores_in, i
 
 }  // namespace cuda
 }  // namespace Generators
-

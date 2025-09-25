@@ -49,7 +49,6 @@ namespace hybrid_sort {
 enum class ReductionAlgorithm {
   WARP_BITONIC,
   WARP_MERGE_SORT,
-  BLOCK_BITONIC,
   CUB_BLOCK_MERGE,
   CUB_RADIX_SORT
 };
@@ -152,9 +151,6 @@ inline ReductionPlan GetReductionPlan(int num_partitions, int k_padded, cudaStre
       case SortAlgo::CUB_WARP_MERGE:
         step.algorithm = ReductionAlgorithm::WARP_MERGE_SORT;
         break;
-      case SortAlgo::SMEM_BITONIC:
-        step.algorithm = ReductionAlgorithm::BLOCK_BITONIC;
-        break;
       case SortAlgo::CUB_BLOCK_MERGE:
         step.algorithm = ReductionAlgorithm::CUB_BLOCK_MERGE;
         break;
@@ -205,7 +201,7 @@ __global__ void BlockReduceTopK(const float* __restrict__ scores_in, const int* 
   const int batch_idx = blockIdx.y;
   const int block_start_partition = blockIdx.x * PartitionsPerBlock;
   if (block_start_partition >= num_partitions_in) {
-      return;
+    return;
   }
   const int num_partitions_to_process = min(PartitionsPerBlock, num_partitions_in - block_start_partition);
   const int num_elements_to_sort = K_PADDED * num_partitions_to_process;
@@ -351,7 +347,7 @@ __global__ void BlockReduceTopK(const float* __restrict__ scores_in, const int* 
       }
     }
 
-    if constexpr (Algorithm == ReductionAlgorithm::WARP_BITONIC || Algorithm == ReductionAlgorithm::BLOCK_BITONIC) {
+    if constexpr (Algorithm == ReductionAlgorithm::WARP_BITONIC) {
       for (int i = kSortSize + threadIdx.x; i < kSortSizePo2; i += kBlockSize) {
         smem_sort.scores[i] = -FLT_MAX;
         smem_sort.indices[i] = INT_MAX;
@@ -371,8 +367,6 @@ __global__ void BlockReduceTopK(const float* __restrict__ scores_in, const int* 
       }
     } else if constexpr (Algorithm == ReductionAlgorithm::WARP_MERGE_SORT) {
       bitonic_sort::WarpMergeSort<kSortSizePo2>(smem_sort.scores, smem_sort.indices, &smem_union.cub_warp_storage, num_elements_to_sort);
-    } else if constexpr (Algorithm == ReductionAlgorithm::BLOCK_BITONIC) {
-      bitonic_sort::SharedMemBitonicSort<kBlockSize, kSortSizePo2>(smem_sort.scores, smem_sort.indices);
     }
 
     __syncthreads();
@@ -408,13 +402,6 @@ void LaunchReductionStep(const ReductionStep& step, cudaStream_t stream,
         BlockReduceTopK<B_SIZE, K_PADDED, P_PER_BLOCK, ReductionAlgorithm::CUB_BLOCK_MERGE><<<grid, block, 0, stream>>>(
             scores_in, indices_in, scores_out, indices_out, num_partitions_in);
         break;
-      case ReductionAlgorithm::BLOCK_BITONIC:
-        if constexpr (kSortSize > 128 && kSortSize <= 256) {
-          BlockReduceTopK<B_SIZE, K_PADDED, P_PER_BLOCK, ReductionAlgorithm::BLOCK_BITONIC><<<grid, block, 0, stream>>>(
-              scores_in, indices_in, scores_out, indices_out, num_partitions_in);
-        }
-        break;
-
       case ReductionAlgorithm::WARP_MERGE_SORT:
         if constexpr (kSortSize > 32 && kSortSize <= 128) {
           BlockReduceTopK<B_SIZE, K_PADDED, P_PER_BLOCK, ReductionAlgorithm::WARP_MERGE_SORT><<<grid, block, 0, stream>>>(
@@ -466,22 +453,30 @@ void LaunchStage1(cudaStream_t stream, int partition_size, int num_partitions, i
   const auto& benchmarks = GetSortBenchmarkResults();
   bool use_merge_sort = benchmarks.GetBestAlgo(partition_size) == SortAlgo::CUB_BLOCK_MERGE;
 
-#define LAUNCH_STAGE1_KERNEL(P_SIZE, USE_MERGE)                                                                   \
-  Stage1_FindPartitionsTopK<256, P_SIZE, K_TEMPLATE, USE_MERGE><<<grid_stage1, block_stage1, 0, stream>>>(        \
+#define LAUNCH_STAGE1_KERNEL(P_SIZE, USE_MERGE)                                                            \
+  Stage1_FindPartitionsTopK<256, P_SIZE, K_TEMPLATE, USE_MERGE><<<grid_stage1, block_stage1, 0, stream>>>( \
       scores_in, data->intermediate_indices_1, data->intermediate_scores_1, vocab_size, num_partitions)
 
   if (partition_size == kCandidatePartitionSizes[0]) {
-    if (use_merge_sort) LAUNCH_STAGE1_KERNEL(kCandidatePartitionSizes[0], true);
-    else LAUNCH_STAGE1_KERNEL(kCandidatePartitionSizes[0], false);
+    if (use_merge_sort)
+      LAUNCH_STAGE1_KERNEL(kCandidatePartitionSizes[0], true);
+    else
+      LAUNCH_STAGE1_KERNEL(kCandidatePartitionSizes[0], false);
   } else if (partition_size == kCandidatePartitionSizes[1]) {
-    if (use_merge_sort) LAUNCH_STAGE1_KERNEL(kCandidatePartitionSizes[1], true);
-    else LAUNCH_STAGE1_KERNEL(kCandidatePartitionSizes[1], false);
+    if (use_merge_sort)
+      LAUNCH_STAGE1_KERNEL(kCandidatePartitionSizes[1], true);
+    else
+      LAUNCH_STAGE1_KERNEL(kCandidatePartitionSizes[1], false);
   } else if (partition_size == kCandidatePartitionSizes[2]) {
-    if (use_merge_sort) LAUNCH_STAGE1_KERNEL(kCandidatePartitionSizes[2], true);
-    else LAUNCH_STAGE1_KERNEL(kCandidatePartitionSizes[2], false);
+    if (use_merge_sort)
+      LAUNCH_STAGE1_KERNEL(kCandidatePartitionSizes[2], true);
+    else
+      LAUNCH_STAGE1_KERNEL(kCandidatePartitionSizes[2], false);
   } else if (partition_size == kCandidatePartitionSizes[3]) {
-    if (use_merge_sort) LAUNCH_STAGE1_KERNEL(kCandidatePartitionSizes[3], true);
-    else LAUNCH_STAGE1_KERNEL(kCandidatePartitionSizes[3], false);
+    if (use_merge_sort)
+      LAUNCH_STAGE1_KERNEL(kCandidatePartitionSizes[3], true);
+    else
+      LAUNCH_STAGE1_KERNEL(kCandidatePartitionSizes[3], false);
   } else {
     // This path should not be taken due to the checks in IsSupported.
     assert(false);
@@ -494,7 +489,7 @@ void LaunchStage1(cudaStream_t stream, int partition_size, int num_partitions, i
 
 void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vocab_size, int batch_size, int k) {
   assert(IsSupported(batch_size, vocab_size, k));  // caller shall check IsSupported before calling this function.
-  if (data->hybrid_sort_partition_size  == 0) {
+  if (data->hybrid_sort_partition_size == 0) {
     data->hybrid_sort_partition_size = EstimateBestPartitionSize(vocab_size);
   }
 
@@ -504,13 +499,20 @@ void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vo
 
   // Pad k to a supported value for template instantiation.
   int k_padded;
-  if (k <= 4) k_padded = 4;
-  else if (k <= 8) k_padded = 8;
-  else if (k <= 16) k_padded = 16;
-  else if (k <= 32) k_padded = 32;
-  else if (k <= 64) k_padded = 64;
-  else if (k <= 128) k_padded = 128;
-  else k_padded = 256;
+  if (k <= 4)
+    k_padded = 4;
+  else if (k <= 8)
+    k_padded = 8;
+  else if (k <= 16)
+    k_padded = 16;
+  else if (k <= 32)
+    k_padded = 32;
+  else if (k <= 64)
+    k_padded = 64;
+  else if (k <= 128)
+    k_padded = 128;
+  else
+    k_padded = 256;
 
   // Create the reduction plan based on the padded k value.
   const ReductionPlan plan = GetReductionPlan(num_partitions, k_padded, stream);
@@ -550,13 +552,20 @@ void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vo
     data->topk_stride = K_PADDED;
   };
 
-  if (k_padded == 4) launch_kernels(std::integral_constant<int, 4>());
-  else if (k_padded == 8) launch_kernels(std::integral_constant<int, 8>());
-  else if (k_padded == 16) launch_kernels(std::integral_constant<int, 16>());
-  else if (k_padded == 32) launch_kernels(std::integral_constant<int, 32>());
-  else if (k_padded == 64) launch_kernels(std::integral_constant<int, 64>());
-  else if (k_padded == 128) launch_kernels(std::integral_constant<int, 128>());
-  else if (k_padded == 256) launch_kernels(std::integral_constant<int, 256>());
+  if (k_padded == 4)
+    launch_kernels(std::integral_constant<int, 4>());
+  else if (k_padded == 8)
+    launch_kernels(std::integral_constant<int, 8>());
+  else if (k_padded == 16)
+    launch_kernels(std::integral_constant<int, 16>());
+  else if (k_padded == 32)
+    launch_kernels(std::integral_constant<int, 32>());
+  else if (k_padded == 64)
+    launch_kernels(std::integral_constant<int, 64>());
+  else if (k_padded == 128)
+    launch_kernels(std::integral_constant<int, 128>());
+  else if (k_padded == 256)
+    launch_kernels(std::integral_constant<int, 256>());
 }
 
 bool IsSupported(int /*batch_size*/, int vocab_size, int k) {
@@ -589,4 +598,3 @@ bool IsSupported(int /*batch_size*/, int vocab_size, int k) {
 }  // namespace hybrid_sort
 }  // namespace cuda
 }  // namespace Generators
-

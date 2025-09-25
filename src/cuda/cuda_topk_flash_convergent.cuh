@@ -280,7 +280,7 @@ void* GetKernel() {
     if constexpr (sort_size_s2 <= 256) {
       return (void*)FlashConvergentKernel<kBlockSize, kPartitionSize, K_PADDED, kMaxPartitionsForKernel, ReductionAlgorithm::WARP_MERGE_SORT, UseMergeS1>;
     }
-  } else if (best_algo_s2 == SortAlgo::CUB_BLOCK_MERGE || best_algo_s2 == SortAlgo::SMEM_BITONIC) {
+  } else if (best_algo_s2 == SortAlgo::CUB_BLOCK_MERGE) {
     return (void*)FlashConvergentKernel<kBlockSize, kPartitionSize, K_PADDED, kMaxPartitionsForKernel, ReductionAlgorithm::CUB_BLOCK_MERGE, UseMergeS1>;
   }
 
@@ -421,4 +421,3 @@ bool IsSupported(int batch_size, int vocab_size, int k) {
 }  // namespace flash_convergent
 }  // namespace cuda
 }  // namespace Generators
-

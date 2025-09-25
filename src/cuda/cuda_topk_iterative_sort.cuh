@@ -177,16 +177,22 @@ void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vo
     dim3 grid(num_partitions, batch_size);
     switch (partition_size) {
       case 1024:
-        if (use_merge_s1) CUDA_CHECK(cudaLaunchCooperativeKernel((void*)IterativeSortKernel<K_PADDED, kBlockSize, 1024, true>, grid, block, kernel_args, 0, stream));
-        else CUDA_CHECK(cudaLaunchCooperativeKernel((void*)IterativeSortKernel<K_PADDED, kBlockSize, 1024, false>, grid, block, kernel_args, 0, stream));
+        if (use_merge_s1)
+          CUDA_CHECK(cudaLaunchCooperativeKernel((void*)IterativeSortKernel<K_PADDED, kBlockSize, 1024, true>, grid, block, kernel_args, 0, stream));
+        else
+          CUDA_CHECK(cudaLaunchCooperativeKernel((void*)IterativeSortKernel<K_PADDED, kBlockSize, 1024, false>, grid, block, kernel_args, 0, stream));
         break;
       case 2048:
-        if (use_merge_s1) CUDA_CHECK(cudaLaunchCooperativeKernel((void*)IterativeSortKernel<K_PADDED, kBlockSize, 2048, true>, grid, block, kernel_args, 0, stream));
-        else CUDA_CHECK(cudaLaunchCooperativeKernel((void*)IterativeSortKernel<K_PADDED, kBlockSize, 2048, false>, grid, block, kernel_args, 0, stream));
+        if (use_merge_s1)
+          CUDA_CHECK(cudaLaunchCooperativeKernel((void*)IterativeSortKernel<K_PADDED, kBlockSize, 2048, true>, grid, block, kernel_args, 0, stream));
+        else
+          CUDA_CHECK(cudaLaunchCooperativeKernel((void*)IterativeSortKernel<K_PADDED, kBlockSize, 2048, false>, grid, block, kernel_args, 0, stream));
         break;
       default:
-        if (use_merge_s1) CUDA_CHECK(cudaLaunchCooperativeKernel((void*)IterativeSortKernel<K_PADDED, kBlockSize, 4096, true>, grid, block, kernel_args, 0, stream));
-        else CUDA_CHECK(cudaLaunchCooperativeKernel((void*)IterativeSortKernel<K_PADDED, kBlockSize, 4096, false>, grid, block, kernel_args, 0, stream));
+        if (use_merge_s1)
+          CUDA_CHECK(cudaLaunchCooperativeKernel((void*)IterativeSortKernel<K_PADDED, kBlockSize, 4096, true>, grid, block, kernel_args, 0, stream));
+        else
+          CUDA_CHECK(cudaLaunchCooperativeKernel((void*)IterativeSortKernel<K_PADDED, kBlockSize, 4096, false>, grid, block, kernel_args, 0, stream));
         break;
     }
   };
@@ -304,4 +310,3 @@ bool IsSupported(int batch_size, int vocab_size, int k) {
 }  // namespace iterative_sort
 }  // namespace cuda
 }  // namespace Generators
-
