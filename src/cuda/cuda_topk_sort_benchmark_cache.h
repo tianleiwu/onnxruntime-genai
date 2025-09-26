@@ -9,6 +9,7 @@
 #include <mutex>
 #include <vector>
 #include <iomanip>
+#include <map>
 
 #include "cuda_topk.h"
 #include "cuda_topk_warp_sort_helper.cuh"
@@ -16,25 +17,58 @@
 namespace Generators {
 namespace cuda {
 
-// Defines the internal sorting algorithms that are benchmarked.
-enum class SortAlgo {
-  WARP_BITONIC = 0,
-  CUB_WARP_MERGE,
-  CUB_BLOCK_MERGE,
-  CUB_BLOCK_RADIX,
-  COUNT  // Keep this last
-};
-
 // A struct to hold the results of the one-time sort micro-benchmark.
-struct SortBenchmarkResults {
+struct SortBenchmarkResults : public ISortAlgoPicker {
   std::vector<int> sort_sizes;
   std::vector<std::vector<float>> latencies;  // [SortAlgo][sort_size_index]
+  std::vector<SortAlgo> best_algos;           // [sort_size_index]
 
   SortBenchmarkResults() : latencies(static_cast<int>(SortAlgo::COUNT)) {}
 
-  // Finds the fastest algorithm for a given sort size, respecting architectural constraints.
-  SortAlgo GetBestAlgo(int sort_size) const {
+  // Computes and caches the best algorithm for each benchmarked sort size.
+  void ComputeBestAlgos() {
     if (sort_sizes.empty()) {
+      return;
+    }
+    best_algos.resize(sort_sizes.size());
+    for (size_t i = 0; i < sort_sizes.size(); ++i) {
+      float min_latency = std::numeric_limits<float>::max();
+      // Default to a robust, general-purpose algorithm.
+      SortAlgo best_algo_for_size = SortAlgo::CUB_BLOCK_MERGE;
+      int current_sort_size = sort_sizes[i];
+
+      for (int j = 0; j < static_cast<int>(SortAlgo::COUNT); ++j) {
+        bool is_supported = false;
+        SortAlgo current_algo = static_cast<SortAlgo>(j);
+
+        // Apply hard architectural constraints for each algorithm.
+        switch (current_algo) {
+          case SortAlgo::WARP_BITONIC:
+            is_supported = (current_sort_size <= 32);
+            break;
+          case SortAlgo::CUB_WARP_MERGE:
+            is_supported = (current_sort_size >= 32 && current_sort_size <= 256);
+            break;
+          case SortAlgo::CUB_BLOCK_MERGE:
+          case SortAlgo::CUB_BLOCK_RADIX:
+            is_supported = (current_sort_size >= 64);
+            break;
+          default:
+            is_supported = false;
+        }
+
+        if (is_supported && !latencies[j].empty() && latencies[j][i] > 0 && latencies[j][i] < min_latency) {
+          min_latency = latencies[j][i];
+          best_algo_for_size = current_algo;
+        }
+      }
+      best_algos[i] = best_algo_for_size;
+    }
+  }
+
+  // Finds the fastest algorithm for a given sort size using the pre-computed cache.
+  SortAlgo GetBestAlgo(int sort_size) const override {
+    if (best_algos.empty()) {
       // Fallback for safety, though this should not be called on an empty result set.
       return sort_size <= 2048 ? SortAlgo::CUB_BLOCK_MERGE : SortAlgo::CUB_BLOCK_RADIX;
     }
@@ -42,44 +76,14 @@ struct SortBenchmarkResults {
     auto it = std::lower_bound(sort_sizes.begin(), sort_sizes.end(), sort_size);
     if (it == sort_sizes.end()) {
       // If sort_size is larger than any benchmarked size, use the results for the largest size.
-      it = sort_sizes.end() - 1;
+      return best_algos.back();
     }
     size_t index = std::distance(sort_sizes.begin(), it);
-
-    float min_latency = std::numeric_limits<float>::max();
-    // Default to a robust, general-purpose algorithm.
-    SortAlgo best_algo = SortAlgo::CUB_BLOCK_MERGE;
-
-    for (int i = 0; i < static_cast<int>(SortAlgo::COUNT); ++i) {
-      bool is_supported = false;
-      SortAlgo current_algo = static_cast<SortAlgo>(i);
-
-      // Apply hard architectural constraints for each algorithm.
-      switch (current_algo) {
-        case SortAlgo::WARP_BITONIC:
-          is_supported = (sort_size <= 32);
-          break;
-        case SortAlgo::CUB_WARP_MERGE:
-          is_supported = (sort_size >= 32 && sort_size <= 256);
-          break;
-        case SortAlgo::CUB_BLOCK_MERGE:
-        case SortAlgo::CUB_BLOCK_RADIX:
-          is_supported = (sort_size >= 64);
-          break;
-        default:
-          is_supported = false;
-      }
-
-      if (is_supported && !latencies[i].empty() && latencies[i][index] > 0 && latencies[i][index] < min_latency) {
-        min_latency = latencies[i][index];
-        best_algo = current_algo;
-      }
-    }
-    return best_algo;
+    return best_algos[index];
   }
 
   // Gets the latency for a given algo and sort size using the nearest benchmarked point.
-  float GetLatency(SortAlgo algo, int sort_size) const {
+  float GetLatency(SortAlgo algo, int sort_size) const override{
     if (sort_sizes.empty() || algo >= SortAlgo::COUNT) {
       return std::numeric_limits<float>::max();
     }
@@ -131,7 +135,8 @@ float TimeKernel(cudaStream_t stream, std::function<void()> kernel_func, int war
 
 // --- Singleton Cache Manager ---
 namespace {  // Anonymous namespace for internal benchmark kernels
-#ifdef ENABLE_SORT_BENCHMARK
+#define ENABLE_SORT_BENCHMARK 1
+#if ENABLE_SORT_BENCHMARK
 __global__ void warpBitonicSortKernel_b(const float* scores_in, float* scores_out, int k) {
   if (threadIdx.x >= 32) return;
   float my_score = scores_in[threadIdx.x];
@@ -200,6 +205,22 @@ __global__ void cubBlockRadixSortKernel_b(const float* scores_in, float* scores_
   BlockRadixSort(temp_storage).SortDescendingBlockedToStriped(thread_scores, thread_indices);
   if (threadIdx.x < k) {
     scores_out[threadIdx.x] = thread_scores[0];
+  }
+}
+
+// Helper to convert SortAlgo enum to its string representation for printing.
+static const char* SortAlgoToString(SortAlgo algo) {
+  switch (algo) {
+    case SortAlgo::WARP_BITONIC:
+      return "Warp Bitonic";
+    case SortAlgo::CUB_WARP_MERGE:
+      return "CUB Warp Merge";
+    case SortAlgo::CUB_BLOCK_MERGE:
+      return "CUB Block Merge";
+    case SortAlgo::CUB_BLOCK_RADIX:
+      return "CUB Block Radix";
+    default:
+      return "Unknown";
   }
 }
 
@@ -315,26 +336,39 @@ void RunAndCacheSortBenchmark(int device_id, cudaStream_t stream, SortBenchmarkR
     std::cout << "\n";
   }
   std::cout << "-------------------------------------------------------------------------------------------------------------------\n";
+
+  // Pre-compute the best algorithm for each sort size.
+  results.ComputeBestAlgos();
 }
 #else
 void RunAndCacheSortBenchmark(int /*device_id*/, cudaStream_t /*stream*/, SortBenchmarkResults& results) {
-  /* Store the following benchmark result from RTX 4090 GPU to cache:
-  N       Warp Bitonic      CUB Warp Merge    CUB Block Merge   CUB Block Radix
-  -------------------------------------------------------------------------------------------------------------------
-  32      7.707             9.009             N/A               N/A
-  64      N/A               10.182            11.232            15.094
-  128     N/A               7.983             8.140             15.048
-  256     N/A               11.956            9.211             14.129
-  512     N/A               N/A               8.839             14.795
-  1024    N/A               N/A               11.205            15.891
-  2048    N/A               N/A               17.848            16.927
-  4096    N/A               N/A               49.508            26.689
-  8192    N/A               N/A               90.038            20.429
-*/
-  results.latencies[0] = {7.707f, -1.f, -1.f, -1.f, -1.f, -1.f, -1.f, -1.f, -1.f};
-  results.latencies[1] = {9.009f, 10.182f, 7.983f, 11.956f, -1.f, -1.f, -1.f, -1.f, -1.f};
-  results.latencies[2] = {-1.f, 11.232f, 8.140f, 9.211f, 8.839f, 11.205f, 17.848f, 49.508f, 90.038f};
-  results.latencies[3] = {-1.f, 15.094f, 15.048f, 14.129f, 14.795f, 15.891f, 16.927f, 26.689f, 20.429f};
+  /*
+    Store the following benchmark result from an NVIDIA RTX 4090 GPU to cache.
+    These results are a fallback for when the online benchmark is disabled.
+    CUDA Version: 12.8, Driver Version: 580.88
+
+      N       Warp Bitonic      CUB Warp Merge    CUB Block Merge   CUB Block Radix
+-------------------------------------------------------------------------------------------------------------------
+      32              5.338 *          5.622            N/A               N/A
+      64               N/A             6.287*           6.545              8.164
+     128               N/A             7.848            6.569 *            8.039
+     256               N/A             7.141            6.953 *            7.234
+     512               N/A               N/A            6.971 *            7.196
+    1024               N/A               N/A            7.537 *            7.789
+    2048               N/A               N/A            10.112 *           10.254
+    4096               N/A               N/A            15.002             14.561 *
+    8192               N/A               N/A            77.912             20.857 *
+-------------------------------------------------------------------------------------------------------------------
+
+  */
+  results.sort_sizes = {32, 64, 128, 256, 512, 1024, 2048, 4096, 8192};
+  results.latencies[static_cast<int>(SortAlgo::WARP_BITONIC)] = {4.636f, -1.f, -1.f, -1.f, -1.f, -1.f, -1.f, -1.f, -1.f};
+  results.latencies[static_cast<int>(SortAlgo::CUB_WARP_MERGE)] = {5.728f, 5.071f, 6.338f, 7.419f, -1.f, -1.f, -1.f, -1.f, -1.f};
+  results.latencies[static_cast<int>(SortAlgo::CUB_BLOCK_MERGE)] = {-1.f, 6.474f, 6.285f, 6.505f, 7.235f, 7.574f, 11.388f, 24.312f, 77.912f};
+  results.latencies[static_cast<int>(SortAlgo::CUB_BLOCK_RADIX)] = {-1.f, 6.939f, 7.100f, 6.491f, 6.536f, 9.695f, 10.900f, 13.896f, 20.857f};
+
+  // Pre-compute the best algorithm for each sort size.
+  results.ComputeBestAlgos();
 }
 #endif
 
@@ -359,6 +393,9 @@ class SortBenchmarkCacheManager {
   }
 
  private:
+  // We only have one set of benchmark results even though multiple devices may exist,
+  // because the sorting algorithms are not device-specific, and the benchmark result can be
+  // reused across devices of the same architecture.
   std::unique_ptr<SortBenchmarkResults> results_;
   std::once_flag once_flag_;
   std::atomic<bool> is_initialized_{false};
@@ -369,22 +406,6 @@ SortBenchmarkCacheManager& GetSortCache() {
   static SortBenchmarkCacheManager g_sort_benchmark_cache;
   return g_sort_benchmark_cache;
 }
-
-// Helper to convert SortAlgo enum to its string representation for printing.
-static const char* SortAlgoToString(SortAlgo algo) {
-  switch (algo) {
-    case SortAlgo::WARP_BITONIC:
-      return "Warp Bitonic";
-    case SortAlgo::CUB_WARP_MERGE:
-      return "CUB Warp Merge";
-    case SortAlgo::CUB_BLOCK_MERGE:
-      return "CUB Block Merge";
-    case SortAlgo::CUB_BLOCK_RADIX:
-      return "CUB Block Radix";
-    default:
-      return "Unknown";
-  }
-}
 }  // namespace
 
 // Public-facing functions to access the global sort benchmark cache.
@@ -394,6 +415,12 @@ inline const SortBenchmarkResults& GetOrRunSortBenchmark(cudaStream_t stream) {
   return GetSortCache().GetOrRun(device_id, stream);
 }
 
+
+/**
+ * @brief Gets previously cached benchmark results for the current device.
+ * @return A const reference to the benchmark results.
+ * @throws std::runtime_error if the benchmark has not yet been run for the current device.
+ */
 inline const SortBenchmarkResults& GetSortBenchmarkResults() {
   return GetSortCache().Get();
 }

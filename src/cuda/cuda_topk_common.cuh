@@ -9,7 +9,7 @@
 #include <float.h>
 #include "cuda_topk.h"
 #include "cuda_topk_stable_sort_helper.cuh"
-#include "cuda_topk_bitonic_sort_helper.cuh"
+#include "cuda_topk_warp_sort_helper.cuh"
 
 namespace Generators {
 namespace cuda {
@@ -388,6 +388,30 @@ __device__ void BlockReduceTopK(const float* scores_in_batch,
       indices_out_batch[out_offset] = smem.stage2_storage.indices[threadIdx.x];
     }
   }
+}
+
+bool IsSupportedCooperative(void* kernel, int total_blocks, int block_size=256, int device_id = -1) {
+  if (device_id < 0) {
+    CUDA_CHECK(cudaGetDevice(&device_id));
+  }
+
+  int cooperative_launch_support = 0;
+  CUDA_CHECK(cudaDeviceGetAttribute(&cooperative_launch_support, cudaDevAttrCooperativeLaunch, device_id));
+  if (!cooperative_launch_support) {
+    return false;
+  }
+
+  int num_sm = 0;
+  CUDA_CHECK(cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, device_id));
+  int max_blocks_per_sm = 0;
+  CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_sm, kernel, block_size, 0));
+  int max_active_blocks = num_sm * max_blocks_per_sm;
+
+  if (total_blocks > max_active_blocks) {
+    return false;
+  }
+
+  return true;
 }
 
 }  // namespace topk_common

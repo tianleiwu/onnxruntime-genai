@@ -111,11 +111,11 @@ inline int EstimateBestPartitionSize(int vocab_size) {
  * This function determines how many partitions to merge in each step to minimize
  * kernel launches, and which internal sort algorithm is best for each step based on benchmark data.
  */
-inline ReductionPlan GetReductionPlan(int num_partitions, int k_padded, cudaStream_t stream) {
+inline ReductionPlan GetReductionPlan(const ISortAlgoPicker* sort_algo_picker, int num_partitions, int k_padded, cudaStream_t stream) {
+  assert(sort_algo_picker != nullptr);
+
   ReductionPlan plan;
   int current_partitions = num_partitions;
-
-  const auto& benchmarks = GetOrRunSortBenchmark(stream);
 
   while (current_partitions > 1) {
     // Determine the max number of partitions we can merge in one block based on shared memory budget.
@@ -143,7 +143,7 @@ inline ReductionPlan GetReductionPlan(int num_partitions, int k_padded, cudaStre
     int sort_size = k_padded * step.partitions_per_block;
 
     // Use benchmark results to pick the fastest algorithm for this sort size.
-    SortAlgo best_algo = benchmarks.GetBestAlgo(sort_size);
+    SortAlgo best_algo = sort_algo_picker->GetBestAlgo(sort_size);
     switch (best_algo) {
       case SortAlgo::WARP_BITONIC:
         step.algorithm = ReductionAlgorithm::WARP_BITONIC;
@@ -450,33 +450,21 @@ void LaunchStage1(cudaStream_t stream, int partition_size, int num_partitions, i
   dim3 grid_stage1(num_partitions, batch_size);
   dim3 block_stage1(256);
 
-  const auto& benchmarks = GetSortBenchmarkResults();
-  bool use_merge_sort = benchmarks.GetBestAlgo(partition_size) == SortAlgo::CUB_BLOCK_MERGE;
+  // When sort size is larger than 1024, CUB's block radix sort is better than block merge sort (See cuda_topk_sort_benchmark_cache.h).
+  constexpr bool kUseMergeSort = false;
 
-#define LAUNCH_STAGE1_KERNEL(P_SIZE, USE_MERGE)                                                            \
-  Stage1_FindPartitionsTopK<256, P_SIZE, K_TEMPLATE, USE_MERGE><<<grid_stage1, block_stage1, 0, stream>>>( \
+#define LAUNCH_STAGE1_KERNEL(P_SIZE)                                                            \
+  Stage1_FindPartitionsTopK<256, P_SIZE, K_TEMPLATE, kUseMergeSort><<<grid_stage1, block_stage1, 0, stream>>>( \
       scores_in, data->intermediate_indices_1, data->intermediate_scores_1, vocab_size, num_partitions)
 
   if (partition_size == kCandidatePartitionSizes[0]) {
-    if (use_merge_sort)
-      LAUNCH_STAGE1_KERNEL(kCandidatePartitionSizes[0], true);
-    else
-      LAUNCH_STAGE1_KERNEL(kCandidatePartitionSizes[0], false);
+    LAUNCH_STAGE1_KERNEL(kCandidatePartitionSizes[0]);
   } else if (partition_size == kCandidatePartitionSizes[1]) {
-    if (use_merge_sort)
-      LAUNCH_STAGE1_KERNEL(kCandidatePartitionSizes[1], true);
-    else
-      LAUNCH_STAGE1_KERNEL(kCandidatePartitionSizes[1], false);
+    LAUNCH_STAGE1_KERNEL(kCandidatePartitionSizes[1]);
   } else if (partition_size == kCandidatePartitionSizes[2]) {
-    if (use_merge_sort)
-      LAUNCH_STAGE1_KERNEL(kCandidatePartitionSizes[2], true);
-    else
-      LAUNCH_STAGE1_KERNEL(kCandidatePartitionSizes[2], false);
+    LAUNCH_STAGE1_KERNEL(kCandidatePartitionSizes[2]);
   } else if (partition_size == kCandidatePartitionSizes[3]) {
-    if (use_merge_sort)
-      LAUNCH_STAGE1_KERNEL(kCandidatePartitionSizes[3], true);
-    else
-      LAUNCH_STAGE1_KERNEL(kCandidatePartitionSizes[3], false);
+    LAUNCH_STAGE1_KERNEL(kCandidatePartitionSizes[3]);
   } else {
     // This path should not be taken due to the checks in IsSupported.
     assert(false);
@@ -515,7 +503,7 @@ void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vo
     k_padded = 256;
 
   // Create the reduction plan based on the padded k value.
-  const ReductionPlan plan = GetReductionPlan(num_partitions, k_padded, stream);
+  const ReductionPlan plan = GetReductionPlan(data->sort_algo_picker, num_partitions, k_padded, stream);
 
   // This lambda captures the launch logic to be called by the k-dispatch below.
   auto launch_kernels = [&](auto k_padded_const) {
@@ -574,18 +562,6 @@ bool IsSupported(int /*batch_size*/, int vocab_size, int k) {
   }
 
   const int partition_size = EstimateBestPartitionSize(vocab_size);
-  // Ensure the estimated partition size is one of the valid, non-zero candidates
-  // before proceeding. This prevents invalid template instantiations.
-  bool is_valid_psize = false;
-  for (int p_size : kCandidatePartitionSizes) {
-    if (partition_size == p_size) {
-      is_valid_psize = true;
-      break;
-    }
-  }
-  if (!is_valid_psize) {
-    return false;
-  }
 
   const int num_partitions = CeilDiv(vocab_size, partition_size);
   if (num_partitions > kMaxPartitions) {

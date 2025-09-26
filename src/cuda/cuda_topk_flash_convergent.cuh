@@ -370,24 +370,21 @@ template <int K_PADDED, int kMaxPartitionsForKernel>
 bool CheckSupport(int batch_size, int num_partitions, int partition_size) {
   constexpr int kBlockSize = 256;
   const int total_blocks = num_partitions * batch_size;
-  const auto& benchmarks = GetSortBenchmarkResults();
-  bool use_merge_s1 = benchmarks.GetBestAlgo(partition_size) == SortAlgo::CUB_BLOCK_MERGE;
+
+  // When sort size is larger than 1024, CUB's block radix sort is better than block merge sort (See cuda_topk_sort_benchmark_cache.h).
+  constexpr bool kUseMergeSortS1 = false;
 
   void* kernel;
   if (partition_size == kPartitionSizes[0])
-    kernel = use_merge_s1 ? GetKernel<kBlockSize, kPartitionSizes[0], K_PADDED, kMaxPartitionsForKernel, true>() : GetKernel<kBlockSize, kPartitionSizes[0], K_PADDED, kMaxPartitionsForKernel, false>();
+    kernel = GetKernel<kBlockSize, kPartitionSizes[0], K_PADDED, kMaxPartitionsForKernel, kUseMergeSortS1>();
   else if (partition_size == kPartitionSizes[1])
-    kernel = use_merge_s1 ? GetKernel<kBlockSize, kPartitionSizes[1], K_PADDED, kMaxPartitionsForKernel, true>() : GetKernel<kBlockSize, kPartitionSizes[1], K_PADDED, kMaxPartitionsForKernel, false>();
+    kernel = GetKernel<kBlockSize, kPartitionSizes[1], K_PADDED, kMaxPartitionsForKernel, kUseMergeSortS1>();
   else if (partition_size == kPartitionSizes[2])
-    kernel = use_merge_s1 ? GetKernel<kBlockSize, kPartitionSizes[2], K_PADDED, kMaxPartitionsForKernel, true>() : GetKernel<kBlockSize, kPartitionSizes[2], K_PADDED, kMaxPartitionsForKernel, false>();
+    kernel = GetKernel<kBlockSize, kPartitionSizes[2], K_PADDED, kMaxPartitionsForKernel, kUseMergeSortS1>();
   else
-    kernel = use_merge_s1 ? GetKernel<kBlockSize, kPartitionSizes[3], K_PADDED, kMaxPartitionsForKernel, true>() : GetKernel<kBlockSize, kPartitionSizes[3], K_PADDED, kMaxPartitionsForKernel, false>();
+    kernel = GetKernel<kBlockSize, kPartitionSizes[3], K_PADDED, kMaxPartitionsForKernel, kUseMergeSortS1>();
 
-  int device, num_sm, max_blocks_per_sm;
-  CUDA_CHECK(cudaGetDevice(&device));
-  CUDA_CHECK(cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, device));
-  CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_sm, kernel, kBlockSize, 0));
-  return total_blocks <= (num_sm * max_blocks_per_sm);
+  return topk_common::IsSupportedCooperative(kernel, total_blocks, kBlockSize);
 }
 
 template <int K_PADDED>
@@ -400,10 +397,6 @@ bool IsSupportedDispatch(int batch_size, int partition_size, int num_partitions)
 
 bool IsSupported(int batch_size, int vocab_size, int k) {
   if (k > kConvergentSortMaxK) return false;
-
-  int coop_support = 0;
-  cudaDeviceGetAttribute(&coop_support, cudaDevAttrCooperativeLaunch, 0);
-  if (!coop_support) return false;
 
   const int partition_size = EstimateBestPartitionSize(vocab_size, k);
   if (partition_size == 0) return false;

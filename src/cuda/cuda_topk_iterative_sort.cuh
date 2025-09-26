@@ -58,13 +58,16 @@ __host__ __device__ inline void swap_ptr(int*& a, int*& b) {
   b = tmp;
 }
 
-template <int K_PADDED, int kBlockSize, int kPartitionSize, bool UseMergeS1>
+template <int K_PADDED, int kBlockSize, int kPartitionSize>
 __global__ void IterativeSortKernel(const float* __restrict__ input_scores,
                                     int* __restrict__ intermediate_indices_1,
                                     float* __restrict__ intermediate_scores_1,
                                     int* __restrict__ intermediate_indices_2,
                                     float* __restrict__ intermediate_scores_2,
                                     int vocab_size) {
+  // When sort size is larger than 1024, CUB's block radix sort is better than block merge sort (See cuda_topk_sort_benchmark_cache.h).
+  constexpr bool UseCubMergeSort = (kPartitionSize <= 1024);
+
   cg::grid_group grid = cg::this_grid();
   const int partition_idx = blockIdx.x;
   const int batch_idx = blockIdx.y;
@@ -91,7 +94,7 @@ __global__ void IterativeSortKernel(const float* __restrict__ input_scores,
   __shared__ SharedStorage smem;
 
   // --- Stage 1: Find Top-K within each partition ---
-  topk_common::FindPartitionTopK<kBlockSize, kPartitionSize, K_PADDED, UseMergeS1>(
+  topk_common::FindPartitionTopK<kBlockSize, kPartitionSize, K_PADDED, UseCubMergeSort>(
       input_scores, intermediate_indices_1, intermediate_scores_1, vocab_size, num_partitions, smem.stage1_storage);
 
   grid.sync();
@@ -168,31 +171,19 @@ void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vo
   kernel_args[4] = (void*)&data->intermediate_scores_2;
   kernel_args[5] = (void*)&vocab_size;
 
-  const auto& benchmarks = GetSortBenchmarkResults();
-  bool use_merge_s1 = benchmarks.GetBestAlgo(partition_size) == SortAlgo::CUB_BLOCK_MERGE;
-
   auto launch_iterative_sort = [&](auto k_padded) {
     constexpr int K_PADDED = decltype(k_padded)::value;
     dim3 block(kBlockSize);
     dim3 grid(num_partitions, batch_size);
     switch (partition_size) {
       case 1024:
-        if (use_merge_s1)
-          CUDA_CHECK(cudaLaunchCooperativeKernel((void*)IterativeSortKernel<K_PADDED, kBlockSize, 1024, true>, grid, block, kernel_args, 0, stream));
-        else
-          CUDA_CHECK(cudaLaunchCooperativeKernel((void*)IterativeSortKernel<K_PADDED, kBlockSize, 1024, false>, grid, block, kernel_args, 0, stream));
+        CUDA_CHECK(cudaLaunchCooperativeKernel((void*)IterativeSortKernel<K_PADDED, kBlockSize, 1024>, grid, block, kernel_args, 0, stream));
         break;
       case 2048:
-        if (use_merge_s1)
-          CUDA_CHECK(cudaLaunchCooperativeKernel((void*)IterativeSortKernel<K_PADDED, kBlockSize, 2048, true>, grid, block, kernel_args, 0, stream));
-        else
-          CUDA_CHECK(cudaLaunchCooperativeKernel((void*)IterativeSortKernel<K_PADDED, kBlockSize, 2048, false>, grid, block, kernel_args, 0, stream));
+        CUDA_CHECK(cudaLaunchCooperativeKernel((void*)IterativeSortKernel<K_PADDED, kBlockSize, 2048>, grid, block, kernel_args, 0, stream));
         break;
       default:
-        if (use_merge_s1)
-          CUDA_CHECK(cudaLaunchCooperativeKernel((void*)IterativeSortKernel<K_PADDED, kBlockSize, 4096, true>, grid, block, kernel_args, 0, stream));
-        else
-          CUDA_CHECK(cudaLaunchCooperativeKernel((void*)IterativeSortKernel<K_PADDED, kBlockSize, 4096, false>, grid, block, kernel_args, 0, stream));
+        CUDA_CHECK(cudaLaunchCooperativeKernel((void*)IterativeSortKernel<K_PADDED, kBlockSize, 4096>, grid, block, kernel_args, 0, stream));
         break;
     }
   };
@@ -246,28 +237,20 @@ bool IsSupported(int batch_size, int vocab_size, int k) {
     return false;
   }
 
-  int cooperative_launch_support = 0;
-  cudaDeviceGetAttribute(&cooperative_launch_support, cudaDevAttrCooperativeLaunch, 0);
-  if (!cooperative_launch_support) {
-    return false;
-  }
-
   constexpr int kBlockSize = 256;
   const int partition_size = EstimateBestPartitionSize(vocab_size);
   const int num_partitions = CeilDiv(vocab_size, partition_size);
   const int total_blocks = num_partitions * batch_size;
-  const auto& benchmarks = GetSortBenchmarkResults();
-  bool use_merge_s1 = benchmarks.GetBestAlgo(partition_size) == SortAlgo::CUB_BLOCK_MERGE;
 
   auto get_kernel = [&](auto k_padded) {
     constexpr int K_PADDED = decltype(k_padded)::value;
     switch (partition_size) {
       case 1024:
-        return use_merge_s1 ? (void*)IterativeSortKernel<K_PADDED, kBlockSize, 1024, true> : (void*)IterativeSortKernel<K_PADDED, kBlockSize, 1024, false>;
+        return (void*)IterativeSortKernel<K_PADDED, kBlockSize, 1024>;
       case 2048:
-        return use_merge_s1 ? (void*)IterativeSortKernel<K_PADDED, kBlockSize, 2048, true> : (void*)IterativeSortKernel<K_PADDED, kBlockSize, 2048, false>;
+        return (void*)IterativeSortKernel<K_PADDED, kBlockSize, 2048>;
       default:
-        return use_merge_s1 ? (void*)IterativeSortKernel<K_PADDED, kBlockSize, 4096, true> : (void*)IterativeSortKernel<K_PADDED, kBlockSize, 4096, false>;
+        return (void*)IterativeSortKernel<K_PADDED, kBlockSize, 4096>;
     }
   };
 
@@ -292,19 +275,7 @@ bool IsSupported(int batch_size, int vocab_size, int k) {
 
   if (kernel == nullptr) return false;
 
-  int device;
-  CUDA_CHECK(cudaGetDevice(&device));
-  int num_sm = 0;
-  CUDA_CHECK(cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, device));
-  int max_blocks_per_sm = 0;
-  CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_sm, kernel, kBlockSize, 0));
-  int max_active_blocks = num_sm * max_blocks_per_sm;
-
-  if (total_blocks > max_active_blocks) {
-    return false;
-  }
-
-  return true;
+  return topk_common::IsSupportedCooperative(kernel, total_blocks, kBlockSize);
 }
 
 }  // namespace iterative_sort

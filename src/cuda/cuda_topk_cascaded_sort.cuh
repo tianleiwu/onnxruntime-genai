@@ -305,14 +305,11 @@ template <int K_PADDED>
 void LaunchKernel(TopkData* data, cudaStream_t stream, const float* scores_in, int vocab_size, int batch_size, int k) {
   const int num_partitions = CeilDiv(vocab_size, data->cascaded_sort_partition_size);
   const auto factors = GetReductionFactors(num_partitions, k);
-  const auto& benchmarks = GetSortBenchmarkResults();
-  bool use_merge_s1 = benchmarks.GetBestAlgo(data->cascaded_sort_partition_size) == SortAlgo::CUB_BLOCK_MERGE;
 
-#define LAUNCH_WITH_FACTORS(F1, F2, F3)                                                                   \
-  if (use_merge_s1)                                                                                       \
-    LaunchKernelWithFactors<K_PADDED, F1, F2, F3, true>(data, stream, scores_in, vocab_size, batch_size); \
-  else                                                                                                    \
-    LaunchKernelWithFactors<K_PADDED, F1, F2, F3, false>(data, stream, scores_in, vocab_size, batch_size)
+  // When sort size is larger than 1024, CUB's block radix sort is better than block merge sort (See cuda_topk_sort_benchmark_cache.h).
+  constexpr bool kUseMergeSortS1 = false;
+
+#define LAUNCH_WITH_FACTORS(F1, F2, F3) LaunchKernelWithFactors<K_PADDED, F1, F2, F3, kUseMergeSortS1>(data, stream, scores_in, vocab_size, batch_size)
 
   if constexpr (K_PADDED > 32) {
     if (factors.factor1 == 4 && factors.factor2 == 4 && factors.factor3 == 4)
@@ -411,37 +408,30 @@ template <int K_PADDED, int Factor1, int Factor2, int Factor3>
 bool CheckSupportWithFactors(int batch_size, int partition_size, int num_partitions) {
   constexpr int kBlockSize = GetOptimalBlockSize<K_PADDED>();
   const int total_blocks = num_partitions * batch_size;
-  const auto& benchmarks = GetSortBenchmarkResults();
-  bool use_merge_s1 = benchmarks.GetBestAlgo(partition_size) == SortAlgo::CUB_BLOCK_MERGE;
+
+  // When sort size is larger than 1024, CUB's block radix sort is better than block merge sort (See cuda_topk_sort_benchmark_cache.h).
+  constexpr bool kUseMergeSortS1 = false;
 
   void* kernel = nullptr;
 
   switch (partition_size) {
     case kAllowedPartitionSizes[0]:
-      kernel = use_merge_s1 ? (void*)CascadedSortKernel<K_PADDED, kBlockSize, kAllowedPartitionSizes[0], Factor1, Factor2, Factor3, true> : (void*)CascadedSortKernel<K_PADDED, kBlockSize, kAllowedPartitionSizes[0], Factor1, Factor2, Factor3, false>;
+      kernel = (void*)CascadedSortKernel<K_PADDED, kBlockSize, kAllowedPartitionSizes[0], Factor1, Factor2, Factor3, kUseMergeSortS1>;
       break;
     case kAllowedPartitionSizes[1]:
-      kernel = use_merge_s1 ? (void*)CascadedSortKernel<K_PADDED, kBlockSize, kAllowedPartitionSizes[1], Factor1, Factor2, Factor3, true> : (void*)CascadedSortKernel<K_PADDED, kBlockSize, kAllowedPartitionSizes[1], Factor1, Factor2, Factor3, false>;
+      kernel = (void*)CascadedSortKernel<K_PADDED, kBlockSize, kAllowedPartitionSizes[1], Factor1, Factor2, Factor3, kUseMergeSortS1>;
       break;
     case kAllowedPartitionSizes[2]:
-      kernel = use_merge_s1 ? (void*)CascadedSortKernel<K_PADDED, kBlockSize, kAllowedPartitionSizes[2], Factor1, Factor2, Factor3, true> : (void*)CascadedSortKernel<K_PADDED, kBlockSize, kAllowedPartitionSizes[2], Factor1, Factor2, Factor3, false>;
+      kernel = (void*)CascadedSortKernel<K_PADDED, kBlockSize, kAllowedPartitionSizes[2], Factor1, Factor2, Factor3, kUseMergeSortS1>;
       break;
     case kAllowedPartitionSizes[3]:
-      kernel = use_merge_s1 ? (void*)CascadedSortKernel<K_PADDED, kBlockSize, kAllowedPartitionSizes[3], Factor1, Factor2, Factor3, true> : (void*)CascadedSortKernel<K_PADDED, kBlockSize, kAllowedPartitionSizes[3], Factor1, Factor2, Factor3, false>;
+      kernel = (void*)CascadedSortKernel<K_PADDED, kBlockSize, kAllowedPartitionSizes[3], Factor1, Factor2, Factor3, kUseMergeSortS1>;
       break;
     default:
       return false;
   }
 
-  int device;
-  CUDA_CHECK(cudaGetDevice(&device));
-  int num_sm = 0;
-  CUDA_CHECK(cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, device));
-  int max_blocks_per_sm = 0;
-  CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_sm, kernel, kBlockSize, 0));
-  int max_active_blocks = num_sm * max_blocks_per_sm;
-
-  return total_blocks <= max_active_blocks;
+  return topk_common::IsSupportedCooperative(kernel, total_blocks, kBlockSize);
 }
 
 // Templated helper to check for support with a constexpr block size.
@@ -478,12 +468,6 @@ bool IsSupported(int batch_size, int vocab_size, int k) {
   }
   const int num_partitions = CeilDiv(vocab_size, partition_size);
   if (num_partitions > 64) {
-    return false;
-  }
-
-  int cooperative_launch_support = 0;
-  cudaDeviceGetAttribute(&cooperative_launch_support, cudaDevAttrCooperativeLaunch, 0);
-  if (!cooperative_launch_support) {
     return false;
   }
 
