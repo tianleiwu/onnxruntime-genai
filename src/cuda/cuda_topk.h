@@ -20,12 +20,6 @@ enum class SortAlgo {
   COUNT  // Keep this last
 };
 
-class ISortAlgoPicker {
-public:
-  virtual SortAlgo GetBestAlgo(int sort_size) const = 0;
-  virtual float GetLatency(SortAlgo algo, int sort_size) const = 0;
-};
-
 // To enable stable Top-K for kernels that support it, define STABLE_TOPK during compilation.
 // A stable sort preserves the original relative order of elements with equal scores.
 // By default, a faster, unstable sort is used if STABLE_TOPK is not defined.
@@ -93,8 +87,6 @@ struct TopkDataDetail {
 
   // The size of the temporary storage buffer required by CUB routines.
   size_t cub_temp_storage_bytes = 0;
-
-  const ISortAlgoPicker* sort_algo_picker = nullptr;
 };
 
 // This struct manages all device memory buffers and operational data required for the Top-K algorithms.

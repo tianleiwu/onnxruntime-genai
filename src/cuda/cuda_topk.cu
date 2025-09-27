@@ -24,10 +24,6 @@ namespace cuda {
 
 // Constructor for the host-side parameter planning struct.
 TopkDataDetail::TopkDataDetail(int batch_size, int vocab_size, cudaStream_t stream) {
-  // Ensure the low-level sort micro-benchmark is run once before any planning.
-  const auto& benchmarks = GetSortBenchmarkResults();
-  sort_algo_picker = &benchmarks;
-
   // Partition sizes are now calculated just-in-time in the benchmark/run functions
   // based on the specific `k` value for the operation.
   hybrid_sort_partition_size = 0;

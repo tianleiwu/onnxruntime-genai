@@ -10,6 +10,7 @@
 #include "cuda_topk.h"
 #include "cuda_topk_stable_sort_helper.cuh"
 #include "cuda_topk_warp_sort_helper.cuh"
+#include "cuda_topk_sort_benchmark_cache.h"
 
 namespace Generators {
 namespace cuda {
@@ -273,7 +274,7 @@ __device__ __host__ __forceinline__ constexpr int Log2NextPowerOfTwo(int n) {
  * It loads candidate data from N partitions, sorts them, and writes the top K back to global memory.
  * The internal sorting algorithm is selected at compile time based on kSortSize.
  */
-template <int kBlockSize, int kSortSize, int K_PADDED, typename TempStorage>
+template <int kBlockSize, int kSortSize, int K_PADDED, int kItemsPerThread, typename TempStorage>
 __device__ void BlockReduceTopK(const float* scores_in_batch,
                                 const int* indices_in_batch,
                                 float* scores_out_batch,
@@ -282,13 +283,13 @@ __device__ void BlockReduceTopK(const float* scores_in_batch,
                                 int first_child_partition,
                                 int partition_idx,
                                 TempStorage& smem) {
-  constexpr int kItemsPerThread = CeilDiv(kSortSize, kBlockSize);
+  // constexpr int kItemsPerThread = CeilDiv(kSortSize, kBlockSize);
   constexpr int kSortSizePo2 = NextPowerOfTwo(kSortSize);
 
   // This unified helper selects the sort algorithm based on the compile-time kSortSize,
   // consistent with the constraints applied in hybrid_sort and the micro-benchmark.
-  if constexpr (kSortSize <= 32) {
-    // --- 1. Warp Bitonic Sort (for kSortSize <= 32) ---
+  if constexpr (kSortSize <= BestAlgoThresholds::kWarpBitonic_MaxSize) {
+    // --- 1. Warp Bitonic Sort ---
     // Load to shared memory first
     for (int i = threadIdx.x; i < kSortSize; i += kBlockSize) {
       if (i < num_elements_to_sort) {
@@ -311,10 +312,8 @@ __device__ void BlockReduceTopK(const float* scores_in_batch,
         smem.stage2_storage.indices[threadIdx.x] = my_index;
       }
     }
-  } else if constexpr (kSortSize > 32 && kSortSize <= 128) {
-    // --- 2. CUB Warp Merge Sort or SMEM Bitonic Sort (for 32 < kSortSize <= 256) ---
-    // This range is covered by either primitive. We default to SMEM bitonic for larger sizes in this range,
-    // and warp merge for smaller, as it has less overhead. The host planner will select the correct kernel.
+  } else if constexpr (kSortSize <= BestAlgoThresholds::kCubWarpMerge_MaxSize) {
+    // --- 2. CUB Warp Merge Sort ---
     for (int i = threadIdx.x; i < kSortSizePo2; i += kBlockSize) {
       if (i < num_elements_to_sort) {
         int part_idx = i / K_PADDED;
@@ -330,7 +329,7 @@ __device__ void BlockReduceTopK(const float* scores_in_batch,
     __syncthreads();
     topk_common::WarpMergeSort<kSortSizePo2>(smem.stage2_storage.scores, smem.stage2_storage.indices, &smem.cub_warp_storage, num_elements_to_sort);
   } else {
-    // --- 3. CUB Block Merge Sort (for kSortSize > 128) ---
+    // --- 3. CUB Block Merge Sort ---
 #ifdef STABLE_TOPK
     using SortKeyT = uint64_t;
     SortKeyT thread_keys[kItemsPerThread];
@@ -381,7 +380,7 @@ __device__ void BlockReduceTopK(const float* scores_in_batch,
   __syncthreads();
 
   // Final write to global memory for warp-based and smem-based sorts
-  if constexpr (kSortSize <= 256) {
+  if constexpr (kSortSize <= BestAlgoThresholds::kCubWarpMerge_MaxSize) {
     if (threadIdx.x < K_PADDED) {
       size_t out_offset = static_cast<size_t>(partition_idx) * K_PADDED + threadIdx.x;
       scores_out_batch[out_offset] = smem.stage2_storage.scores[threadIdx.x];
