@@ -16,7 +16,7 @@
 
 // --- User-Provided Headers ---
 // Note: These must be in the same directory or in the include path.
-#include "cuda_topk_bitonic_sort_helper.cuh"
+#include "cuda_topk_warp_sort_helper.cuh"
 #include "cuda_topk_stable_sort_helper.cuh"
 #include "cuda_topk_common.cuh"
 
@@ -37,7 +37,7 @@ __global__ void warpBitonicSortKernel(const float* scores_in, const int* indices
     if (threadIdx.x >= 32) return;
     float my_score = scores_in[threadIdx.x];
     int my_index = indices_in[threadIdx.x];
-    Generators::cuda::bitonic_sort::WarpBitonicSort(my_score, my_index);
+    Generators::cuda::topk_common::WarpBitonicSort(my_score, my_index);
     if (threadIdx.x < k) {
         scores_out[threadIdx.x] = my_score;
         indices_out[threadIdx.x] = my_index;
@@ -68,7 +68,7 @@ __global__ void cubWarpMergeSortKernel(const float* scores_in, const int* indice
     __syncthreads();
 
     if (threadIdx.x < 32) {
-       Generators::cuda::bitonic_sort::WarpMergeSort<SORT_SIZE_PO2>(
+       Generators::cuda::topk_common::WarpMergeSort<SORT_SIZE_PO2>(
            smem.sort_data.scores, smem.sort_data.indices, &smem.cub_storage, SORT_SIZE);
     }
     __syncthreads();
@@ -79,31 +79,31 @@ __global__ void cubWarpMergeSortKernel(const float* scores_in, const int* indice
     }
 }
 
-// --- 3. Shared Memory Bitonic Sort ---
-template <int BLOCK_SIZE, int SORT_SIZE>
-__global__ void sharedMemBitonicSortKernel(const float* scores_in, const int* indices_in, float* scores_out, int* indices_out, int k) {
-    constexpr int SORT_SIZE_PO2 = Generators::cuda::topk_common::NextPowerOfTwo(SORT_SIZE);
-    __shared__ float smem_scores[SORT_SIZE_PO2];
-    __shared__ int smem_indices[SORT_SIZE_PO2];
+// // --- 3. Shared Memory Bitonic Sort ---
+// template <int BLOCK_SIZE, int SORT_SIZE>
+// __global__ void sharedMemBitonicSortKernel(const float* scores_in, const int* indices_in, float* scores_out, int* indices_out, int k) {
+//     constexpr int SORT_SIZE_PO2 = Generators::cuda::topk_common::NextPowerOfTwo(SORT_SIZE);
+//     __shared__ float smem_scores[SORT_SIZE_PO2];
+//     __shared__ int smem_indices[SORT_SIZE_PO2];
 
-    for (int i = threadIdx.x; i < SORT_SIZE; i += blockDim.x) {
-        smem_scores[i] = scores_in[i];
-        smem_indices[i] = indices_in[i];
-    }
-    for (int i = threadIdx.x + SORT_SIZE; i < SORT_SIZE_PO2; i += blockDim.x) {
-        smem_scores[i] = -FLT_MAX;
-        smem_indices[i] = INT_MAX;
-    }
-    __syncthreads();
+//     for (int i = threadIdx.x; i < SORT_SIZE; i += blockDim.x) {
+//         smem_scores[i] = scores_in[i];
+//         smem_indices[i] = indices_in[i];
+//     }
+//     for (int i = threadIdx.x + SORT_SIZE; i < SORT_SIZE_PO2; i += blockDim.x) {
+//         smem_scores[i] = -FLT_MAX;
+//         smem_indices[i] = INT_MAX;
+//     }
+//     __syncthreads();
 
-    Generators::cuda::bitonic_sort::SharedMemBitonicSort<BLOCK_SIZE, SORT_SIZE_PO2>(smem_scores, smem_indices);
-    __syncthreads();
+//     Generators::cuda::bitonic_sort::SharedMemBitonicSort<BLOCK_SIZE, SORT_SIZE_PO2>(smem_scores, smem_indices);
+//     __syncthreads();
 
-    if (threadIdx.x < k) {
-        scores_out[threadIdx.x] = smem_scores[threadIdx.x];
-        indices_out[threadIdx.x] = smem_indices[threadIdx.x];
-    }
-}
+//     if (threadIdx.x < k) {
+//         scores_out[threadIdx.x] = smem_scores[threadIdx.x];
+//         indices_out[threadIdx.x] = smem_indices[threadIdx.x];
+//     }
+// }
 
 // --- 4. CUB Block Merge Sort ---
 template <int BLOCK_SIZE, int ITEMS_PER_THREAD>
@@ -177,12 +177,10 @@ void verifyTopK(const std::vector<float>& h_scores_out, const std::vector<int>& 
 void runBenchmarks() {
     // UPDATED N_values for more granular testing
     std::vector<int> N_values = {
-        32, 64, 128, 256, 512, 1024, 2048,
-        2304, 2560, 2816, 3072, 3328, 3584, 3840,
-        4096
+        32, 64, 128, 256, 512, 1024, 2048, 4096, 8192
     };
     std::vector<int> k_values = {4, 8, 16, 32, 64};
-    const int num_iterations = 2000;
+    const int num_iterations = 10000;
     const int block_size = 256;
 
     std::cout << std::fixed << std::setprecision(3);
@@ -193,7 +191,7 @@ void runBenchmarks() {
     std::cout << std::setw(8) << "N" << std::setw(8) << "K"
               << std::setw(20) << "Warp Bitonic Sort"
               << std::setw(20) << "CUB Warp Merge"
-              << std::setw(20) << "SMEM Bitonic Sort"
+              // << std::setw(20) << "SMEM Bitonic Sort"
               << std::setw(20) << "CUB Block Merge"
               << std::setw(20) << "CUB Block Radix"
               << "\n";
@@ -266,29 +264,29 @@ void runBenchmarks() {
             std::cout << std::setw(20) << time_warp_merge;
 
             // --- 3. SMEM Bitonic Sort ---
-            float time_smem_bitonic = -1.0f;
-            if (n >= 128 && n <= 512) { // Suitable for medium N
-                auto launch_smem_bitonic = [&](auto n_const) {
-                    constexpr int SORT_SIZE = n_const.value;
-                    sharedMemBitonicSortKernel<block_size, SORT_SIZE><<<1, block_size>>>(d_scores_in, d_indices_in, d_scores_out, d_indices_out, k); // Warmup
-                    cudaEventRecord(start);
-                    for (int i = 0; i < num_iterations; ++i) {
-                        sharedMemBitonicSortKernel<block_size, SORT_SIZE><<<1, block_size>>>(d_scores_in, d_indices_in, d_scores_out, d_indices_out, k);
-                    }
-                };
-                if (n == 128) launch_smem_bitonic(std::integral_constant<int, 128>());
-                else if (n == 256) launch_smem_bitonic(std::integral_constant<int, 256>());
-                else if (n == 512) launch_smem_bitonic(std::integral_constant<int, 512>());
+            // float time_smem_bitonic = -1.0f;
+            // if (n >= 128 && n <= 512) { // Suitable for medium N
+            //     auto launch_smem_bitonic = [&](auto n_const) {
+            //         constexpr int SORT_SIZE = n_const.value;
+            //         sharedMemBitonicSortKernel<block_size, SORT_SIZE><<<1, block_size>>>(d_scores_in, d_indices_in, d_scores_out, d_indices_out, k); // Warmup
+            //         cudaEventRecord(start);
+            //         for (int i = 0; i < num_iterations; ++i) {
+            //             sharedMemBitonicSortKernel<block_size, SORT_SIZE><<<1, block_size>>>(d_scores_in, d_indices_in, d_scores_out, d_indices_out, k);
+            //         }
+            //     };
+            //     if (n == 128) launch_smem_bitonic(std::integral_constant<int, 128>());
+            //     else if (n == 256) launch_smem_bitonic(std::integral_constant<int, 256>());
+            //     else if (n == 512) launch_smem_bitonic(std::integral_constant<int, 512>());
 
-                cudaEventRecord(stop);
-                cudaEventSynchronize(stop);
-                cudaEventElapsedTime(&ms, start, stop);
-                time_smem_bitonic = (ms * 1000.0f) / num_iterations;
-                cudaMemcpy(h_scores_out.data(), d_scores_out, k * sizeof(float), cudaMemcpyDeviceToHost);
-                cudaMemcpy(h_indices_out.data(), d_indices_out, k * sizeof(int), cudaMemcpyDeviceToHost);
-                verifyTopK(h_scores_out, h_indices_out, h_scores_in, h_indices_in, k, "SmemBitonicSort");
-            }
-            std::cout << std::setw(20) << time_smem_bitonic;
+            //     cudaEventRecord(stop);
+            //     cudaEventSynchronize(stop);
+            //     cudaEventElapsedTime(&ms, start, stop);
+            //     time_smem_bitonic = (ms * 1000.0f) / num_iterations;
+            //     cudaMemcpy(h_scores_out.data(), d_scores_out, k * sizeof(float), cudaMemcpyDeviceToHost);
+            //     cudaMemcpy(h_indices_out.data(), d_indices_out, k * sizeof(int), cudaMemcpyDeviceToHost);
+            //     verifyTopK(h_scores_out, h_indices_out, h_scores_in, h_indices_in, k, "SmemBitonicSort");
+            // }
+            // std::cout << std::setw(20) << time_smem_bitonic;
 
             // --- 4. CUB Block Merge Sort ---
             float time_block_merge = -1.0f;

@@ -46,6 +46,37 @@ static const char* TopkAlgoToString(TopkAlgo algo) {
   }
 }
 
+/**
+ * @brief Measures the average execution time of a CUDA kernel over several runs.
+ * This is a lightweight version for online benchmarking, using fewer iterations
+ * than an offline profiler to minimize runtime overhead.
+ * @param stream The CUDA stream to run the kernel on.
+ * @param kernel_func A lambda function that launches the kernel.
+ * @return The average execution time in milliseconds.
+ */
+float TimeKernel(cudaStream_t stream, std::function<void()> kernel_func, int warm_up_runs = 2, int total_runs = 5) {
+  cuda_event_holder start_event, stop_event;
+
+  // Warm-up runs to handle any one-time kernel loading costs or JIT compilation.
+  for (int i = 0; i < warm_up_runs; ++i) {
+    kernel_func();
+  }
+  CUDA_CHECK(cudaStreamSynchronize(stream));
+
+  // Timed runs.
+  CUDA_CHECK(cudaEventRecord(start_event, stream));
+  for (int i = 0; i < total_runs; ++i) {
+    kernel_func();
+  }
+  CUDA_CHECK(cudaEventRecord(stop_event, stream));
+  CUDA_CHECK(cudaEventSynchronize(stop_event));
+
+  float ms = 0.0f;
+  CUDA_CHECK(cudaEventElapsedTime(&ms, start_event, stop_event));
+
+  return ms / total_runs;
+}
+
 // Helper macro to benchmark a kernel, update the best algorithm, and handle potential CUDA errors.
 #define BENCHMARK_KERNEL(algo_enum, kernel_lambda)                                      \
   try {                                                                                 \
@@ -59,7 +90,7 @@ static const char* TopkAlgoToString(TopkAlgo algo) {
               << " kernel with k=" << k << ", batch_size=" << batch_size                \
               << ", vocab_size=" << vocab_size << ". Error: " << e.what() << std::endl; \
   }
-
+  
 /**
  * @brief Performs online benchmarking to select the best Top-K algorithm for the current problem size and hardware.
  *
@@ -77,9 +108,6 @@ static TopkAlgo BenchmarkAndSelectBestAlgo(TopkData* topk_data,
                                            int vocab_size,
                                            int batch_size,
                                            int k) {
-  // Ensure the low-level sort benchmark has been run once for this device.
-  GetOrRunSortBenchmark(stream);
-
   float min_latency = std::numeric_limits<float>::max();
   TopkAlgo best_algo = TopkAlgo::UNKNOWN;
 

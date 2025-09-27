@@ -338,7 +338,7 @@ void RunBenchmarks(const BenchmarkParams& params, std::vector<CsvSummaryResult>&
 TEST(TopKBenchmarks, PerformanceTests) {
   std::vector<CsvSummaryResult> csv_summary_results;
 
-  constexpr bool is_build_pipeline = true;
+  constexpr bool is_build_pipeline = false;
   if constexpr (is_build_pipeline) {
     std::vector<int> batch_sizes = {1};
     std::vector<int> vocab_sizes = {201088, 262400, 152064, 128256, 32256};
