@@ -179,7 +179,7 @@ void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vo
 /**
  * @brief A distributed selection sort that partitions the input across SMs.
  * Each SM finds local candidates, which are then merged atomically.
- * This approach is particularly effective for very large vocabularies and small batch sizes.
+ * This approach is particularly effective for very large vocabularies and small batch sizes, and is unbeatable for k=1.
  */
 namespace distributed_select_sort {
 constexpr const char* kAlgorithmName = "Distributed_Select";
@@ -206,10 +206,10 @@ void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vo
 }  // namespace per_batch_radix_sort
 
 /**
- * @brief A high-performance two-stage cooperative algorithm.
- * Stage 1: Finds top candidates in parallel partitions using block-wide radix sort.
- * Stage 2: A single thread block merges all candidates in one step, switching between bitonic and radix sort internally.
- * This minimizes synchronization but is limited by the number of partitions a single block can handle.
+ * @brief A two-stage cooperative algorithm specialized for **small k (2-16)**.
+ * Its single-step reduction phase has minimal overhead, making it ideal when the core
+ * sorting computation is small. It uses a single block to merge all partition candidates,
+ * choosing the fastest CUB block-level sort internally.
  */
 namespace flash_convergent {
 constexpr const char* kAlgorithmName = "Flash_Convergent";
@@ -219,38 +219,37 @@ void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vo
 }  // namespace flash_convergent
 
 /**
- * @brief A portable, multi-kernel, host-planned algorithm.
- * Stage 1: Finds top candidates in partitions.
- * Stage 2: A series of reduction kernels merge these candidates. The reduction kernel is "hybrid", using
- * compile-time logic to select the best internal sorting method (warp bitonic, block bitonic, or CUB radix).
- * Does not require cooperative launch, making it highly portable.
+ * @brief A two-kernel "cooperative hybrid" sort, the champion for **very large k (>64)** or **very large vocabularies**.
+ * Stage 1: A standard, highly scalable kernel finds top candidates in partitions.
+ * Stage 2: A single cooperative kernel performs an efficient, multi-step reduction cascade based on a pre-computed optimal plan.
+ * This design combines scalability with low reduction overhead.
  */
 namespace hybrid_sort {
-constexpr const char* kAlgorithmName = "Multi_Kernel_Hybrid";
+constexpr const char* kAlgorithmName = "Hybrid_Sort";
 bool IsSupported(int batch_size, int vocab_size, int k);
 int EstimateBestPartitionSize(int vocab_size);
 void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vocab_size, int batch_size, int k);
 }  // namespace hybrid_sort
 
 /**
- * @brief A high-performance, single-kernel cooperative sort with iterative reduction.
- * It performs a tree-based reduction with a fixed factor, minimizing kernel launch overhead.
- * It is optimized for small `k` using a fast warp-level bitonic sort for reduction.
+ * @brief A single-kernel cooperative sort specialized for **mid-to-large k (32-64) on large vocabularies (>250k)**.
+ * It uses a smart host-side planner to choose a single, optimal reduction factor that minimizes workload
+ * imbalance. This balances the low overhead of a single-kernel iterative reduction with an efficient, adaptive plan.
  */
 namespace iterative_sort {
-constexpr const char* kAlgorithmName = "Iterative_Merge";
+constexpr const char* kAlgorithmName = "Iterative_Sort";
 bool IsSupported(int batch_size, int vocab_size, int k);
-int EstimateBestPartitionSize(int vocab_size);
+int EstimateBestPartitionSize(int vocab_size, int k_padded);
 void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vocab_size, int batch_size, int k);
 }  // namespace iterative_sort
 
 /**
- * @brief A high-performance, single-kernel cooperative "cascaded" sort optimized for LLM workloads.
- * It uses an adaptive, multi-step reduction strategy that provides better performance across a
- * wider range of `k` values and partition counts than `iterative_sort`.
+ * @brief A high-performance, single-kernel cooperative "cascaded" sort, the all-around champion for **mid-range k (16-64)**.
+ * It uses an adaptive, two-step reduction strategy based on a pre-computed optimal plan from H200
+ * benchmarks, providing the best performance for the most common LLM workloads.
  */
 namespace cascaded_sort {
-constexpr const char* kAlgorithmName = "Cascaded_Merge";
+constexpr const char* kAlgorithmName = "Cascaded_Sort";
 bool IsSupported(int batch_size, int vocab_size, int k);
 int EstimateBestPartitionSize(int vocab_size);
 void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vocab_size, int batch_size, int k);

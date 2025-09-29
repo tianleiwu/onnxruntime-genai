@@ -22,9 +22,9 @@ namespace iterative_sort {
  * Algorithm Overview:
  * This is an evolution of the original iterative sort, now featuring an adaptive reduction factor.
  *
- * 1.  **Host-Side Planning**: A simple host-side planner (`GetBestReductionFactor`) chooses a
- * single, fixed reduction factor (e.g., 6, 7, or 8) for the entire reduction process.
- * The factor is chosen to minimize workload imbalance for the specific number of partitions.
+ * 1.  **Host-Side Planning**: A smart host-side planner (`EstimateBestPartitionSize`)
+ * considers a wide range of partition sizes and co-designs the partition count with an
+ * optimal reduction factor to minimize workload imbalance and overall cost.
  *
  * 2.  **Stage 1 (Partition Top-K)**: All blocks find top candidates in parallel.
  *
@@ -109,41 +109,71 @@ __global__ void AdaptiveIterativeSortKernel(const float* __restrict__ input_scor
   }
 }
 
-inline int EstimateBestPartitionSize(int vocab_size) {
-  if (vocab_size <= 1024) return 1024;
-  if (vocab_size <= 2048) return 2048;
-  return 4096;
-}
-
-// Simple planner to find the best single reduction factor
+// Planner to find the best single reduction factor
 inline int GetBestReductionFactor(int num_partitions, int k_padded) {
     int best_factor = 2;
-    float min_waste = 1.0f;
+    float min_waste = std::numeric_limits<float>::max();
 
-    // Iterate through possible factors, favoring larger ones
     for (int factor = 8; factor >= 2; --factor) {
-        if (k_padded * factor > 4096) continue; // Shared mem limit
+        if (k_padded * factor > 4096) continue;
 
-        int num_blocks = CeilDiv(num_partitions, factor);
-        int last_block_workload = num_partitions - (num_blocks - 1) * factor;
-        float waste_ratio = 1.0f - (float)last_block_workload / factor;
+        float total_waste = 0.0f;
+        int current_partitions = num_partitions;
+        while(current_partitions > 1) {
+            int num_blocks = CeilDiv(current_partitions, factor);
+            int last_block_workload = current_partitions - (num_blocks - 1) * factor;
+            if (last_block_workload > 0 && num_blocks > 1) {
+              total_waste += 1.0f - (float)last_block_workload / factor;
+            }
+            current_partitions = num_blocks;
+        }
 
-        if (waste_ratio < min_waste) {
-            min_waste = waste_ratio;
+        if (total_waste < min_waste) {
+            min_waste = total_waste;
             best_factor = factor;
         }
     }
     return best_factor;
 }
 
+// Smarter planner that co-designs partition size and reduction factor
+inline int EstimateBestPartitionSize(int vocab_size, int k_padded) {
+    constexpr std::array<int, 6> kCandidatePartitionSizes = {1024, 1280, 1792, 2048, 3328, 4096};
+    int best_partition_size = 4096;
+    float min_total_cost = std::numeric_limits<float>::max();
+
+    for (int p_size : kCandidatePartitionSizes) {
+        int num_partitions = CeilDiv(vocab_size, p_size);
+        if (num_partitions > 64) continue;
+
+        int factor = GetBestReductionFactor(num_partitions, k_padded);
+        
+        float total_waste = 0.0f;
+        int current_partitions = num_partitions;
+        while(current_partitions > 1) {
+            int num_blocks = CeilDiv(current_partitions, factor);
+            int last_block_workload = current_partitions - (num_blocks - 1) * factor;
+            if (last_block_workload > 0 && num_blocks > 1) {
+              total_waste += (1.0f - (float)last_block_workload / factor) * num_blocks;
+            }
+            current_partitions = num_blocks;
+        }
+
+        float cost = total_waste;
+        if (p_size > 1024) {
+            cost *= 1.2f; // Penalty for slower Radix Sort in Stage 1
+        }
+
+        if (cost < min_total_cost) {
+            min_total_cost = cost;
+            best_partition_size = p_size;
+        }
+    }
+    return best_partition_size;
+}
+
 void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vocab_size, int batch_size, int k) {
   assert(IsSupported(batch_size, vocab_size, k));
-  if (data->iterative_sort_partition_size == 0) {
-    data->iterative_sort_partition_size = EstimateBestPartitionSize(vocab_size);
-  }
-
-  const int partition_size = data->iterative_sort_partition_size;
-  const int num_partitions = CeilDiv(vocab_size, partition_size);
   
   int k_padded_val;
   if (k <= 4) k_padded_val = 4;
@@ -152,6 +182,12 @@ void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vo
   else if (k <= 32) k_padded_val = 32;
   else k_padded_val = 64;
 
+  if (data->iterative_sort_partition_size == 0) {
+    data->iterative_sort_partition_size = EstimateBestPartitionSize(vocab_size, k_padded_val);
+  }
+
+  const int partition_size = data->iterative_sort_partition_size;
+  const int num_partitions = CeilDiv(vocab_size, partition_size);
   const int reduction_factor = GetBestReductionFactor(num_partitions, k_padded_val);
 
   void* kernel_args[6];
@@ -169,17 +205,14 @@ void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vo
       dim3 grid(num_partitions, batch_size);
       dim3 block(kBlockSize);
 
-      switch (partition_size) {
-          case 1024:
-              CUDA_CHECK((cudaLaunchCooperativeKernel((void*)AdaptiveIterativeSortKernel<K_PADDED, kBlockSize, 1024, R_FACTOR>, grid, block, kernel_args, 0, stream)));
-              break;
-          case 2048:
-              CUDA_CHECK((cudaLaunchCooperativeKernel((void*)AdaptiveIterativeSortKernel<K_PADDED, kBlockSize, 2048, R_FACTOR>, grid, block, kernel_args, 0, stream)));
-              break;
-          default:
-              CUDA_CHECK((cudaLaunchCooperativeKernel((void*)AdaptiveIterativeSortKernel<K_PADDED, kBlockSize, 4096, R_FACTOR>, grid, block, kernel_args, 0, stream)));
-              break;
-      }
+#define LAUNCH_KERNEL_P(P_SIZE) CUDA_CHECK((cudaLaunchCooperativeKernel((void*)AdaptiveIterativeSortKernel<K_PADDED, kBlockSize, P_SIZE, R_FACTOR>, grid, block, kernel_args, 0, stream)))
+      if (partition_size == 1024) { LAUNCH_KERNEL_P(1024); }
+      else if (partition_size == 1280) { LAUNCH_KERNEL_P(1280); }
+      else if (partition_size == 1792) { LAUNCH_KERNEL_P(1792); }
+      else if (partition_size == 2048) { LAUNCH_KERNEL_P(2048); }
+      else if (partition_size == 3328) { LAUNCH_KERNEL_P(3328); }
+      else { LAUNCH_KERNEL_P(4096); }
+#undef LAUNCH_KERNEL_P
   };
 
   auto dispatch_by_factor = [&](auto k_padded) {
@@ -191,7 +224,7 @@ void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vo
           case 6: launch_iterative_sort(k_padded, std::integral_constant<int, 6>()); break;
           case 7: launch_iterative_sort(k_padded, std::integral_constant<int, 7>()); break;
           case 8: launch_iterative_sort(k_padded, std::integral_constant<int, 8>()); break;
-          default: launch_iterative_sort(k_padded, std::integral_constant<int, 4>()); break; // Fallback
+          default: launch_iterative_sort(k_padded, std::integral_constant<int, 4>());
       }
   };
 
@@ -207,7 +240,7 @@ void RunTopK(TopkData* data, cudaStream_t stream, const float* scores_in, int vo
   if (num_partitions > 1) {
     int partitions_remaining = num_partitions;
     while (partitions_remaining > 1) {
-      partitions_remaining = (partitions_remaining + reduction_factor - 1) / reduction_factor;
+      partitions_remaining = CeilDiv(partitions_remaining, reduction_factor);
       num_reduction_loops++;
     }
   }
@@ -228,41 +261,46 @@ bool CheckSupportForFactor(int batch_size, int num_partitions, int partition_siz
     const int total_blocks = num_partitions * batch_size;
     void* kernel = nullptr;
 
-    switch (partition_size) {
-        case 1024:
-            kernel = (void*)AdaptiveIterativeSortKernel<K_PADDED, kBlockSize, 1024, kReductionFactor>;
-            break;
-        case 2048:
-            kernel = (void*)AdaptiveIterativeSortKernel<K_PADDED, kBlockSize, 2048, kReductionFactor>;
-            break;
-        default:
-            kernel = (void*)AdaptiveIterativeSortKernel<K_PADDED, kBlockSize, 4096, kReductionFactor>;
-            break;
-    }
+#define GET_KERNEL_P(P_SIZE) (void*)AdaptiveIterativeSortKernel<K_PADDED, kBlockSize, P_SIZE, kReductionFactor>
+    if (partition_size == 1024) { kernel = GET_KERNEL_P(1024); }
+    else if (partition_size == 1280) { kernel = GET_KERNEL_P(1280); }
+    else if (partition_size == 1792) { kernel = GET_KERNEL_P(1792); }
+    else if (partition_size == 2048) { kernel = GET_KERNEL_P(2048); }
+    else if (partition_size == 3328) { kernel = GET_KERNEL_P(3328); }
+    else { kernel = GET_KERNEL_P(4096); }
+#undef GET_KERNEL_P
+    
     return topk_common::IsSupportedCooperative(kernel, total_blocks, kBlockSize);
 }
 
 template <int K_PADDED>
 bool CheckSupport(int batch_size, int num_partitions, int partition_size) {
-    // Check against the worst-case (largest) reduction factor for resource usage.
-    constexpr int kMaxReductionFactor = 8;
-    return CheckSupportForFactor<K_PADDED, kMaxReductionFactor>(batch_size, num_partitions, partition_size);
+    const int reduction_factor = GetBestReductionFactor(num_partitions, K_PADDED);
+    switch(reduction_factor) {
+        case 2: return CheckSupportForFactor<K_PADDED, 2>(batch_size, num_partitions, partition_size);
+        case 3: return CheckSupportForFactor<K_PADDED, 3>(batch_size, num_partitions, partition_size);
+        case 4: return CheckSupportForFactor<K_PADDED, 4>(batch_size, num_partitions, partition_size);
+        case 5: return CheckSupportForFactor<K_PADDED, 5>(batch_size, num_partitions, partition_size);
+        case 6: return CheckSupportForFactor<K_PADDED, 6>(batch_size, num_partitions, partition_size);
+        case 7: return CheckSupportForFactor<K_PADDED, 7>(batch_size, num_partitions, partition_size);
+        case 8: return CheckSupportForFactor<K_PADDED, 8>(batch_size, num_partitions, partition_size);
+    }
+    return false;
 }
 
 bool IsSupported(int batch_size, int vocab_size, int k) {
-    if (k > kIterativeSortMaxK) {
-        return false;
-    }
-
-    const int partition_size = EstimateBestPartitionSize(vocab_size);
-    const int num_partitions = CeilDiv(vocab_size, partition_size);
-
+    if (k > kIterativeSortMaxK) return false;
+    
     int k_padded_val;
     if (k <= 4) k_padded_val = 4;
     else if (k <= 8) k_padded_val = 8;
     else if (k <= 16) k_padded_val = 16;
     else if (k <= 32) k_padded_val = 32;
     else k_padded_val = 64;
+
+    const int partition_size = EstimateBestPartitionSize(vocab_size, k_padded_val);
+    const int num_partitions = CeilDiv(vocab_size, partition_size);
+    if (num_partitions > 64) return false;
 
     if (k_padded_val == 4) return CheckSupport<4>(batch_size, num_partitions, partition_size);
     if (k_padded_val == 8) return CheckSupport<8>(batch_size, num_partitions, partition_size);
