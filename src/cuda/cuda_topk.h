@@ -130,6 +130,8 @@ struct TopkData : public TopkDataDetail {
   // A stride > k indicates the results are not contiguously packed and may need a compaction step.
   int topk_stride = 0;
 
+  void GetCompactOutput(float* compact_scores, int* compact_indices, int batch_size, int k, cudaStream_t stream);
+
  protected:
   // Assigns pointers based on offsets into the single allocated buffer.
   virtual void InitializeBuffers(int batch_size, int vocab_size, cudaStream_t stream);

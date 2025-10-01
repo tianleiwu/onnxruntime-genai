@@ -8,8 +8,12 @@
 #include "beam_search_scorer_cuda.cuh"
 #include "beam_search_scorer_cuda.h"
 #include "beam_search_topk.h"
+#include "cuda_topk.h"
 #include <queue>
 #include <random>
+#include <iostream>
+#include <vector>
+#include <iomanip>
 
 namespace Generators {
 
@@ -65,12 +69,16 @@ BeamSearch_Cuda::BeamSearch_Cuda(const GeneratorParams& params)
   topk_next_scores_ = CudaMallocArray<float>(2 * batch_beam_size);
   softmax_buffer_ = CudaMallocArray<float>(batch_beam_size * params_->config.model.vocab_size);
 
-  constexpr size_t max_parts_of_vocab = 128;
-  size_t topk_buffer_size = batch_beam_size * (max_parts_of_vocab + 1) * params_->search.num_beams * 2 * 2;
-  topk_buffer_ = CudaMallocArray<float>(topk_buffer_size);
-  static_assert(sizeof(float) == sizeof(int32_t));  // The topk_buffer assumes these match, fix for float16
+  const int k_vocab_top_k = 2 * 16; // 2 * params_->search.num_beams;
+  topk_tmp_scores_ = CudaMallocArray<float>(batch_beam_size * k_vocab_top_k);
+  topk_tmp_tokens_ = CudaMallocArray<int32_t>(batch_beam_size * k_vocab_top_k);
 
-  cudaMemsetAsync(topk_buffer_.get(), 0, topk_buffer_size * sizeof(float), GetStream());
+  size_t topk_buffer_size = cuda::TopkData::CalculateTotalSize(batch_beam_size, params.config.model.vocab_size, GetStream());
+  topk_buffer_ = params.p_device->Allocate<uint8_t>(topk_buffer_size);
+
+  // Create TopkData with the externally allocated buffer
+  topk_data_ = std::make_unique<cuda::TopkData>(batch_beam_size, params.config.model.vocab_size, GetStream(),
+                                               topk_buffer_.Span().data(), topk_buffer_size);
 }
 
 BeamSearch_Cuda::~BeamSearch_Cuda() = default;
@@ -99,11 +107,6 @@ void BeamSearch_Cuda::SelectTop() {
   cuda::DispatchBlockwiseSoftmaxForward<true>(GetStream(), softmax_buffer_.get(), next_token_scores_.Span().data(), params_->config.model.vocab_size,
                                               params_->config.model.vocab_size, params_->config.model.vocab_size, params_->BatchBeamSize());
 
-  // Copy next_token_scores to CPU
-  auto next_token_scores_cpu = CudaMallocHostArray<float>(params_->BatchBeamSize() * params_->config.model.vocab_size);
-  cudaMemcpyAsync(next_token_scores_cpu.get(), softmax_buffer_.get(), params_->BatchBeamSize() * params_->config.model.vocab_size * sizeof(float), cudaMemcpyDeviceToHost, GetStream());
-  CudaCheck() == cudaStreamSynchronize(GetStream());
-
   auto beam_scores = beam_scorer_->GetNextScores();
 
   // Add beam score to next token scores. Corresponding python code is like:
@@ -111,43 +114,24 @@ void BeamSearch_Cuda::SelectTop() {
   cuda::LaunchAddProbsKernel(softmax_buffer_.get(), beam_scores.Span().data(),
                              params_->search.batch_size, params_->search.num_beams, params_->config.model.vocab_size, GetStream());
 
-  if (params_->search.num_beams <= 32) {
-    constexpr size_t max_parts_of_vocab = 128;
-    size_t candidate_count = params_->BatchBeamSize() * 2 * params_->search.num_beams;
-    float* topk_tmp_buffer = topk_buffer_.get();
-    float* topk_scores_1st_stage = topk_tmp_buffer;
-    int32_t* topk_tokens_1st_stage = reinterpret_cast<int32_t*>(topk_scores_1st_stage + candidate_count * max_parts_of_vocab);
-    float* topk_scores_2nd_stage = reinterpret_cast<float*>(topk_tokens_1st_stage + candidate_count * max_parts_of_vocab);
-    int32_t* topk_tokens_2nd_stage = reinterpret_cast<int32_t*>(topk_scores_2nd_stage + candidate_count);
-
-    cuda::BeamSearchTopK(softmax_buffer_.get(),
-                         params_->search.batch_size,
-                         params_->search.num_beams,
-                         params_->config.model.vocab_size,
-                         2 * params_->search.num_beams,
-                         topk_scores_1st_stage,
-                         topk_tokens_1st_stage,
-                         topk_scores_2nd_stage,
-                         topk_tokens_2nd_stage,
-                         topk_next_scores_.get(),
-                         topk_next_tokens_.get(),
-                         topk_next_indices_.get(),
-                         GetStream());
-  } else
-    assert(false);
-
+  cuda::BeamSearchTopK(topk_data_.get(),
+                       softmax_buffer_.get(),
+                       params_->search.batch_size,
+                       params_->search.num_beams,
+                       params_->config.model.vocab_size,
+                       topk_tmp_scores_.get(),
+                       topk_tmp_tokens_.get(),
+                       topk_next_scores_.get(),
+                       topk_next_tokens_.get(),
+                       topk_next_indices_.get(),
+                       GetStream());
+      
   CudaCheck() == cudaStreamSynchronize(GetStream());
 
-  size_t size = params_->BatchBeamSize() * 2;
-  std::span<float> next_scores{topk_next_scores_.get(), size};
-  std::span<int32_t> next_tokens{topk_next_tokens_.get(), size};
-  std::span<int32_t> next_indices{topk_next_indices_.get(), size};
-
-#if 0  // TODO(ryanhill): Use logging option
-  DumpCudaSpan(std::cout, next_scores);
-  DumpCudaSpan(std::cout, next_tokens);
-  DumpCudaSpan(std::cout, next_indices);
-#endif
+  const size_t valid_candidate_count = static_cast<size_t>(params_->search.batch_size) * params_->search.num_beams;
+  std::span<const float> next_scores{topk_next_scores_.get(), valid_candidate_count};
+  std::span<const int32_t> next_tokens{topk_next_tokens_.get(), valid_candidate_count};
+  std::span<const int32_t> next_indices{topk_next_indices_.get(), valid_candidate_count};
 
   beam_scorer_->Process(sequences_, next_scores, next_tokens, next_indices);
   auto next_tokens_device = beam_scorer_->GetNextTokens();
@@ -272,3 +256,4 @@ void Search_Cuda::ApplyRepetitionPenalty(float penalty) {
 }
 
 }  // namespace Generators
+

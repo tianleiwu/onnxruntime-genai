@@ -3,12 +3,17 @@
 
 #pragma once
 #include <cuda_runtime.h>
+#include <memory>
 #include "search_cuda.cuh"
 #include "cuda_sampling.h"
 
 namespace Generators {
 
 struct BeamSearchScorer_Cuda;
+
+namespace cuda {
+struct TopkData;
+}
 
 struct Search_Cuda : Search {
   Search_Cuda(const GeneratorParams& params);
@@ -89,16 +94,11 @@ struct BeamSearch_Cuda : Search_Cuda {
   cuda_unique_ptr<float> topk_next_scores_;
   cuda_unique_ptr<float> softmax_buffer_;
 
-  // temp buffer for topk computation, including:
-  // 1st stage needs:
-  //   temp score: (batch_size * num_beams * parts_vocab, 2 * num_beams)
-  //   temp token: (batch_size * num_beams * parts_vocab, 2 * num_beams)
-  // 2nd stage needs:
-  //   temp score: (batch_size * num_beams, 2 * num_beams)
-  //   temp token: (batch_size * num_beams, 2 * num_beams)
-  // in total, it will be:
-  // 2 * (batch_size * num_beams * (parts_vocab + 1), 2 * num_beams)
-  cuda_unique_ptr<float> topk_buffer_;
+  cuda_unique_ptr<float> topk_tmp_scores_;
+  cuda_unique_ptr<int32_t> topk_tmp_tokens_;
+  
+  DeviceSpan<uint8_t> topk_buffer_;
+  std::unique_ptr<cuda::TopkData> topk_data_;
 };
 
 namespace Processors_Cuda {

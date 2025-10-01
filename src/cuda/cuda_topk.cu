@@ -145,13 +145,18 @@ __global__ void CompactStridedData(const T* input, T* output, int k, int batch_s
   }
 }
 
+void TopkData::GetCompactOutput(float* compact_scores, int* compact_indices, int batch_size, int k, cudaStream_t stream){
+  dim3 grid(batch_size);
+  dim3 block(256);
+  CompactStridedData<float><<<grid, block, 0, stream>>>(topk_scores, compact_scores, k, batch_size, topk_stride);
+  CompactStridedData<int><<<grid, block, 0, stream>>>(topk_indices, compact_indices, k, batch_size, topk_stride);
+}
+
+
 void TopkDataCompact::CompactOutput(int batch_size, int k, cudaStream_t stream) {
   topk_scores_compact = CudaMallocArray<float>(static_cast<size_t>(batch_size) * k);
   topk_indices_compact = CudaMallocArray<int>(static_cast<size_t>(batch_size) * k);
-  dim3 grid(batch_size);
-  dim3 block(256);
-  CompactStridedData<float><<<grid, block, 0, stream>>>(topk_scores, topk_scores_compact.get(), k, batch_size, topk_stride);
-  CompactStridedData<int><<<grid, block, 0, stream>>>(topk_indices, topk_indices_compact.get(), k, batch_size, topk_stride);
+  GetCompactOutput(topk_scores_compact.get(), topk_indices_compact.get(), batch_size, k, stream);
 }
 
 // Main dispatcher for Top-K. It implements the caching and benchmarking logic to select and run the best algorithm.
