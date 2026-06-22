@@ -445,6 +445,8 @@ def get_args():
                     Orthogonal to int4_algo_config; can be combined with any base method.
                 int8_linear_attn = Promote linear-attention projections and their MLPs to int8 (for hybrid attention models like Qwen3.5). Default is false.
                     Orthogonal to int4_algo_config; can be combined with any base method.
+                int4_prequantized_attention = Path to a DiscQuant pre-quantized SYMMETRIC attention sidecar (directory with prequant_manifest.json + prequant_attention.safetensors, format ort_matmulnbits_prequant_v1).
+                    When set, attention q/k/v/o_proj are emitted as MatMulNBits directly from the sidecar's exact integer codes/scales with NO re-quantization, giving symmetric (fast) AND lossless attention. Each projection may be int4 or int8 (carried per-tensor). Forces unpacked q/k/v (disables qkv fusion). Requires precision=int4.
                 shared_embeddings = Enable weight sharing between embedding and LM head layers. Default is false.
                     Use this option to share weights and reduce model size by eliminating duplicate weights.
                     For quantized models (INT4/UINT4): Shares quantized weights using GatherBlockQuantized. Only works with rtn and k_quant algorithms, and cannot be used if LM head is excluded.

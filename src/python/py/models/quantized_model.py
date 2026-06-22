@@ -1250,6 +1250,17 @@ class GPTQModel(QuantizedModel):
         return self.get_overrides(layer_name).get("group_size", self.global_group_size)
 
 
+class DiscQuantModel(GPTQModel):
+    """DiscQuant (https://github.com/microsoft/DiscQuant) exported checkpoints.
+
+    DiscQuant is a discrepancy-theory-based rounding method. Its quantization grid
+    is the standard affine integer grid ``W = (q - zero) * scale`` (block-wise along
+    K, or per-output-channel), which is identical to AutoGPTQ. The DiscQuant exporter
+    (``export_ort.py``) writes tensors in the AutoGPTQ layout, so the GPTQ unpack /
+    repack pipeline applies unchanged; only the ``quant_method`` label differs.
+    """
+
+
 class QuarkModel(QuantizedModel):
     def __init__(self, quant_type, input_path, quant_attrs, q_size, kv_size, intermediate_size, num_layers):
         super().__init__(quant_type, input_path, quant_attrs, q_size, kv_size, intermediate_size, num_layers)
@@ -1647,6 +1658,8 @@ class QuantModel:
             model = AWQModel(quant_type, **kwargs)
         elif quant_type == "gptq":
             model = GPTQModel(quant_type, **kwargs)
+        elif quant_type == "discquant":
+            model = DiscQuantModel(quant_type, **kwargs)
         elif quant_type == "olive":
             model = OliveModel(quant_type, **kwargs)
         elif quant_type == "quark":
