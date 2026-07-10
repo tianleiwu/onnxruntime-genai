@@ -27,6 +27,7 @@ Model = base_module.Model
 
 class _FakeGQAModel:
     is_fused_qk_norm_gqa_supported = Model.is_fused_qk_norm_gqa_supported
+    make_quantized_kv_cache_init = Model.make_quantized_kv_cache_init
     make_group_query_attention = Model.make_group_query_attention
 
     def __init__(self, ep="cpu", fuse_qk_norm_gqa=True):
@@ -46,6 +47,7 @@ class _FakeGQAModel:
         }
         self.rope_attrs = {"interleaved": 0}
         self.io_dtype = None
+        self.kv_cache_quant_type = "none"
         self.nodes = []
 
     def make_node(self, op_type, inputs, outputs, name, domain, **attributes):
@@ -60,12 +62,12 @@ def test_cpu_does_not_enable_fused_qk_norm_gqa_by_default():
     assert _FakeGQAModel("cuda").is_fused_qk_norm_gqa_supported()
 
 
-def test_plain_gqa_omits_qk_norm_epsilon_attribute():
+def test_plain_gqa_emits_qk_norm_epsilon_attribute():
     model = _FakeGQAModel()
 
     model.make_group_query_attention("/gqa", q_path="q", k_path="k", v_path="v")
 
-    assert "qk_norm_epsilon" not in model.nodes[-1]["attributes"]
+    assert model.nodes[-1]["attributes"]["qk_norm_epsilon"] == 1e-6
 
 
 def test_fused_qk_norm_gqa_emits_qk_norm_epsilon_attribute():
@@ -81,3 +83,85 @@ def test_fused_qk_norm_gqa_emits_qk_norm_epsilon_attribute():
     )
 
     assert model.nodes[-1]["attributes"]["qk_norm_epsilon"] == 1e-6
+
+
+def test_quantized_gqa_wires_scales_before_qk_norm_inputs():
+    model = _FakeGQAModel("cuda")
+    model.kv_cache_quant_type = "int8_per_channel"
+    model.kv_quant_type = "PER_CHANNEL"
+    model.kv_cache_bit_width = 8
+
+    model.make_group_query_attention(
+        "/gqa",
+        layer_id=3,
+        q_path="q",
+        k_path="k",
+        v_path="v",
+        q_norm_weight="q_norm_weight",
+        k_norm_weight="k_norm_weight",
+    )
+
+    node = model.nodes[-1]
+    assert node["inputs"][12:16] == [
+        "/model/kv_cache_scales/k_scale.3",
+        "/model/kv_cache_scales/v_scale.3",
+        "q_norm_weight",
+        "k_norm_weight",
+    ]
+    assert node["attributes"]["k_quant_type"] == "PER_CHANNEL"
+    assert node["attributes"]["v_quant_type"] == "PER_CHANNEL"
+    assert node["attributes"]["kv_cache_bit_width"] == 8
+
+
+def test_int4_kv_cache_uses_uint8_packed_head_dimension():
+    model = _FakeGQAModel("cuda")
+    model.kv_cache_quant_type = "int4_per_tensor"
+    model.head_size = 17
+    model.input_types = {"past_key_values.key": None, "past_key_values.value": None}
+    model.output_types = {"present.key": None, "present.value": None}
+    model.input_shapes = {
+        "past_key_values.key": ["batch", "heads", "past", 17],
+        "past_key_values.value": ["batch", "heads", "past", 17],
+    }
+    model.output_shapes = {
+        "present.key": ["batch", "heads", "total", 17],
+        "present.value": ["batch", "heads", "total", 17],
+    }
+    model.past_present_share_buffer = True
+
+    model.make_quantized_kv_cache_init()
+
+    assert model.input_types["past_key_values.key"] == base_module.ir.DataType.UINT8
+    assert model.output_types["present.value"] == base_module.ir.DataType.UINT8
+    assert model.input_shapes["past_key_values.key"][-1] == 9
+    assert model.output_shapes["present.value"][-1] == 9
+    assert model.past_present_share_buffer
+
+    model.ep = "cpu"
+    model.make_quantized_kv_cache_init()
+    assert not model.past_present_share_buffer
+
+
+def test_fp8_kv_cache_uses_float8_dtype_without_packing():
+    model = _FakeGQAModel("cuda")
+    model.kv_cache_quant_type = "fp8_per_tensor"
+    model.input_types = {"past_key_values.key": None, "past_key_values.value": None}
+    model.output_types = {"present.key": None, "present.value": None}
+    model.input_shapes = {
+        "past_key_values.key": ["batch", "heads", "past", 64],
+        "past_key_values.value": ["batch", "heads", "past", 64],
+    }
+    model.output_shapes = {
+        "present.key": ["batch", "heads", "total", 64],
+        "present.value": ["batch", "heads", "total", 64],
+    }
+
+    model.make_quantized_kv_cache_init()
+
+    assert model.input_types["past_key_values.key"] == base_module.ir.DataType.FLOAT8E4M3FN
+    assert model.output_types["present.value"] == base_module.ir.DataType.FLOAT8E4M3FN
+    assert model.kv_cache_bit_width == 8
+    assert model.kv_quant_type == "PER_TENSOR"
+    # FP8 is not bit-packed: the head dimension is unchanged.
+    assert model.input_shapes["past_key_values.key"][-1] == 64
+    assert model.output_shapes["present.value"][-1] == 64

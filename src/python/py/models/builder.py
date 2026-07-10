@@ -116,6 +116,28 @@ def check_extra_options(kv_pairs, execution_provider):
         )
         kv_pairs["enable_webgpu_graph"] = False
 
+    if "kv_cache_quant_type" in kv_pairs:
+        valid_kv_quant_types = {
+            "none",
+            "int8_per_tensor",
+            "int8_per_channel",
+            "int4_per_tensor",
+            "int4_per_channel",
+            "fp8_per_tensor",
+            "fp8_per_channel",
+        }
+        quant_type = kv_pairs["kv_cache_quant_type"].lower()
+        if quant_type not in valid_kv_quant_types:
+            raise ValueError(
+                f"kv_cache_quant_type must be one of {valid_kv_quant_types}, got '{kv_pairs['kv_cache_quant_type']}'"
+            )
+        if quant_type != "none" and execution_provider not in {"cpu", "cuda"}:
+            raise ValueError(
+                "Quantized KV cache is only supported for the CPU and CUDA execution providers. "
+                f"Got execution_provider='{execution_provider}'."
+            )
+        kv_pairs["kv_cache_quant_type"] = quant_type
+
 
 def parse_extra_options(kv_items, execution_provider):
     """
@@ -432,7 +454,7 @@ def get_args():
                     Default is -1.
                 matmulnbits_weights_prepacked = 0/1/2: Specify the CUDA MatMulNBits (int4/int8) weight layout.
                     0 exports raw blockwise weights, 1 exports the SM80/Ampere fpA_intB prepacked layout, and 2 exports the SM90/Hopper fpA_intB prepacked layout.
-                    Only applies to the CUDA EP. An offline-prepacked model must be run with ORT_FPA_INTB_GEMM enabling the relevant nbits.
+                    Only applies to the CUDA EP. An offline-prepacked model runs on the fpA_intB kernel automatically; ORT_FPA_INTB_GEMM is not required.
                     Default is 0.
                 int4_is_symmetric = Quantize the weights symmetrically. Default is true.
                     If true, quantization is done to int4. If false, quantization is done to uint4.

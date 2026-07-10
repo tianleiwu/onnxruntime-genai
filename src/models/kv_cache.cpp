@@ -82,6 +82,10 @@ void CombinedKeyValueCache::RewindTo(size_t index) {
     }
   } else if (type_ == Ort::TypeToTensorType<float>) {
     RewindPastTensorsTo<float>(index);
+  } else if (type_ == Ort::TypeToTensorType<int8_t>) {
+    RewindPastTensorsTo<int8_t>(index);
+  } else if (type_ == Ort::TypeToTensorType<uint8_t> || type_ == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E4M3FN) {
+    RewindPastTensorsTo<uint8_t>(index);
   } else {
     RewindPastTensorsTo<Ort::Float16_t>(index);
   }
@@ -143,6 +147,10 @@ void CombinedKeyValueCache::PickPastState(DeviceSpan<int32_t> beam_indices_devic
 void CombinedKeyValueCache::PickPastState(DeviceSpan<int32_t> beam_indices, int index) {
   if (type_ == Ort::TypeToTensorType<float>) {
     PickPastState<float>(beam_indices, index);
+  } else if (type_ == Ort::TypeToTensorType<int8_t>) {
+    PickPastState<int8_t>(beam_indices, index);
+  } else if (type_ == Ort::TypeToTensorType<uint8_t> || type_ == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E4M3FN) {
+    PickPastState<uint8_t>(beam_indices, index);
   } else {
     PickPastState<Ort::Float16_t>(beam_indices, index);
   }
@@ -521,6 +529,10 @@ void DefaultKeyValueCache::RewindTo(size_t index) {
     }
   } else if (type_ == Ort::TypeToTensorType<float>) {
     RewindPastTensorsTo<float>(index);
+  } else if (type_ == Ort::TypeToTensorType<int8_t>) {
+    RewindPastTensorsTo<int8_t>(index);
+  } else if (type_ == Ort::TypeToTensorType<uint8_t> || type_ == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E4M3FN) {
+    RewindPastTensorsTo<uint8_t>(index);
   } else {
     RewindPastTensorsTo<Ort::Float16_t>(index);
   }
@@ -633,6 +645,10 @@ void DefaultKeyValueCache::PickPastState(DeviceSpan<int32_t> beam_indices_device
 void DefaultKeyValueCache::PickPastState(DeviceSpan<int32_t> beam_indices, int index) {
   if (type_ == Ort::TypeToTensorType<float>) {
     PickPastState<float>(beam_indices, index);
+  } else if (type_ == Ort::TypeToTensorType<int8_t>) {
+    PickPastState<int8_t>(beam_indices, index);
+  } else if (type_ == Ort::TypeToTensorType<uint8_t> || type_ == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E4M3FN) {
+    PickPastState<uint8_t>(beam_indices, index);
   } else {
     PickPastState<Ort::Float16_t>(beam_indices, index);
   }
