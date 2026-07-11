@@ -103,6 +103,93 @@ void LaunchAddLogitsMask(float* batch_logits, int batch_beam_size, int vocab_siz
   CUDA_CHECK_LAUNCH();
 }
 
+// ---------------------------------------------------------------------------
+// Teacher-forcing log-probabilities.
+//
+// out[row] = log_softmax(logits[row, :])[targets[row]]
+//          = (logit[row, target] - max_row) - log(sum_v exp(logit[row, v] - max_row))
+//
+// One block per row (a flattened batch*seq position). Reads the [rows, vocab]
+// logits once from device memory, so no full [rows, vocab] copy to host and no
+// host-side exp over the ~200k vocab is needed. Used for perplexity / scoring.
+// ---------------------------------------------------------------------------
+template <typename T>
+__device__ __forceinline__ float LogitToFloat(T v);
+template <>
+__device__ __forceinline__ float LogitToFloat<float>(float v) { return v; }
+template <>
+__device__ __forceinline__ float LogitToFloat<half>(half v) { return __half2float(v); }
+template <>
+__device__ __forceinline__ float LogitToFloat<__nv_bfloat16>(__nv_bfloat16 v) { return __bfloat162float(v); }
+
+// Clamp non-finite logits to the fp16 finite range (matches host nan_to_num),
+// so an occasional NaN/inf logit from the model does not poison log_softmax.
+// Uses bit inspection rather than isnan/isinf, which nvcc fast-math optimizes away.
+__device__ __forceinline__ float SanitizeLogit(float v) {
+  const unsigned int u = __float_as_uint(v);
+  if ((u & 0x7f800000u) == 0x7f800000u) {          // exponent all ones: inf or nan
+    if (u & 0x007fffffu) return 0.0f;              // nan  -> 0
+    return (u & 0x80000000u) ? -65504.0f : 65504.0f;  // +/-inf -> +/-65504
+  }
+  return fminf(fmaxf(v, -65504.0f), 65504.0f);
+}
+
+template <typename T>
+__global__ void TargetLogProbsKernel(const T* __restrict__ logits, const int32_t* __restrict__ targets,
+                                     float* __restrict__ out, int vocab_size) {
+  const int row = blockIdx.x;
+  const T* row_ptr = logits + static_cast<size_t>(row) * vocab_size;
+  const int num_warps = (blockDim.x + 31) / 32;
+  __shared__ float s_reduce[32];
+
+  // Pass 1: row max (numerical stability).
+  float local_max = -INFINITY;
+  for (int i = threadIdx.x; i < vocab_size; i += blockDim.x)
+    local_max = fmaxf(local_max, SanitizeLogit(LogitToFloat<T>(row_ptr[i])));
+  for (int off = 16; off > 0; off >>= 1)
+    local_max = fmaxf(local_max, __shfl_down_sync(0xffffffff, local_max, off));
+  if ((threadIdx.x & 31) == 0) s_reduce[threadIdx.x >> 5] = local_max;
+  __syncthreads();
+  float row_max = -INFINITY;
+  if (threadIdx.x < 32) {
+    row_max = (threadIdx.x < num_warps) ? s_reduce[threadIdx.x] : -INFINITY;
+    for (int off = 16; off > 0; off >>= 1)
+      row_max = fmaxf(row_max, __shfl_down_sync(0xffffffff, row_max, off));
+    if (threadIdx.x == 0) s_reduce[0] = row_max;
+  }
+  __syncthreads();
+  row_max = s_reduce[0];
+  __syncthreads();  // ensure all threads read row_max before s_reduce is reused
+
+  // Pass 2: sum of exp(logit - max).
+  float local_sum = 0.0f;
+  for (int i = threadIdx.x; i < vocab_size; i += blockDim.x)
+    local_sum += expf(SanitizeLogit(LogitToFloat<T>(row_ptr[i])) - row_max);
+  for (int off = 16; off > 0; off >>= 1)
+    local_sum += __shfl_down_sync(0xffffffff, local_sum, off);
+  if ((threadIdx.x & 31) == 0) s_reduce[threadIdx.x >> 5] = local_sum;
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float sum = 0.0f;
+    for (int w = 0; w < num_warps; ++w) sum += s_reduce[w];
+    const int tgt = targets[row];
+    out[row] = (SanitizeLogit(LogitToFloat<T>(row_ptr[tgt])) - row_max) - logf(sum);
+  }
+}
+
+template <typename T>
+void LaunchTargetLogProbs(const T* logits, const int32_t* targets, float* out,
+                          int rows, int vocab_size, cudaStream_t stream) {
+  if (rows <= 0) return;
+  constexpr int block_size = 256;
+  TargetLogProbsKernel<T><<<rows, block_size, 0, stream>>>(logits, targets, out, vocab_size);
+  CUDA_CHECK_LAUNCH();
+}
+
+template void LaunchTargetLogProbs(const float*, const int32_t*, float*, int, int, cudaStream_t);
+template void LaunchTargetLogProbs(const half*, const int32_t*, float*, int, int, cudaStream_t);
+template void LaunchTargetLogProbs(const __nv_bfloat16*, const int32_t*, float*, int, int, cudaStream_t);
+
 __global__ void ConvertFp16ToFp32(const half* src, float* dst, int count) {
   int idx = threadIdx.x + blockIdx.x * blockDim.x;
   if (idx < count)

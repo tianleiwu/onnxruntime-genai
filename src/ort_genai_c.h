@@ -620,6 +620,19 @@ OGA_EXPORT OgaResult* OGA_API_CALL OgaGenerator_GetOutput(const OgaGenerator* ge
 OGA_EXPORT OgaResult* OGA_API_CALL OgaGenerator_GetLogits(OgaGenerator* generator, OgaTensor** out);
 
 /**
+ * \brief Computes teacher-forcing log-probabilities on-device from the full sequence logits.
+ *        out[i] = log_softmax(logits[i])[targets[i]] for i in [0, targets_count).
+ *        Position i corresponds to the model's prediction of token i+1, so pass the
+ *        shifted next-token ids. Returns a CPU OgaTensor of shape [targets_count] float32.
+ * \param[in] generator The generator holding the prefill logits (call AppendTokens first).
+ * \param[in] targets The target token ids, one per scored position.
+ * \param[in] targets_count Number of scored positions; must be <= batch*seq of the logits.
+ * \param[out] out The returned CPU OgaTensor of per-position log-probabilities.
+ * \return OgaResult containing the error message if the computation failed.
+ */
+OGA_EXPORT OgaResult* OGA_API_CALL OgaGenerator_GetTargetLogProbs(OgaGenerator* generator, const int32_t* targets, size_t targets_count, OgaTensor** out);
+
+/**
  * \brief Sets the logits to the generator. This is useful when the user wants to set the logits to a specific value
  *        for example when doing guided generation.
  * \param[in] generator The generator to set the logits on

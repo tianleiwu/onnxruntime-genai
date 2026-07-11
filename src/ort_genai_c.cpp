@@ -590,6 +590,49 @@ OgaResult* OGA_API_CALL OgaGenerator_GetLogits(OgaGenerator* generator, OgaTenso
   OGA_CATCH
 }
 
+OgaResult* OGA_API_CALL OgaGenerator_GetTargetLogProbs(OgaGenerator* oga_generator, const int32_t* targets, size_t targets_count, OgaTensor** out) {
+  OGA_TRY
+  auto& generator = *reinterpret_cast<Generators::Generator*>(oga_generator);
+  auto& device = *generator.model_->p_device_;
+  const std::string& logits_name = generator.model_->config_->model.decoder.outputs.logits;
+  OrtValue* logits_ov = generator.state_->GetOutput(logits_name.c_str());
+  if (logits_ov == nullptr)
+    throw std::runtime_error("Logits are not available; call AppendTokens before GetTargetLogProbs.");
+
+  auto info = logits_ov->GetTensorTypeAndShapeInfo();
+  auto shape = info->GetShape();  // [batch, seq, vocab]
+  if (shape.size() != 3)
+    throw std::runtime_error("GetTargetLogProbs expects logits of shape [batch, seq, vocab].");
+  const int64_t total_rows = shape[0] * shape[1];
+  const int vocab_size = static_cast<int>(shape[2]);
+  if (targets_count == 0 || static_cast<int64_t>(targets_count) > total_rows)
+    throw std::runtime_error("targets_count must be in (0, batch*seq] of the logits.");
+
+  auto logits_bytes = Generators::ByteWrapTensor(device, *logits_ov);
+  auto targets_device = device.Allocate<int32_t>(targets_count);
+  Generators::copy(std::span<const int32_t>(targets, targets_count), targets_device.CpuSpan());
+  targets_device.CopyCpuToDevice();
+  auto out_device = device.Allocate<float>(targets_count);
+
+  // Ensure the model forward (which produces the logits) and the target H2D copy
+  // have completed before the reduction kernel reads them. The logits are owned
+  // by the ORT session and may be produced on a different stream than the device
+  // compute stream used below, so an explicit sync is required for correctness.
+  device.Synchronize();
+  device.LaunchTargetLogProbs(logits_bytes.Span().data(), info->GetElementType(),
+                              targets_device.Span().data(), out_device.Span().data(),
+                              static_cast<int>(targets_count), vocab_size);
+
+  std::span<const float> cpu = out_device.CopyDeviceToCpu();
+  std::unique_ptr<OrtValue> ortvalue_clone = OrtValue::CreateTensor<float>(
+      generator.model_->allocator_cpu_, std::array<int64_t, 1>{static_cast<int64_t>(targets_count)});
+  Generators::copy(cpu, std::span<float>(ortvalue_clone->GetTensorMutableData<float>(), targets_count));
+  auto tensor = std::make_shared<Generators::Tensor>(std::move(ortvalue_clone));
+  *out = ReturnShared<OgaTensor>(tensor);
+  return nullptr;
+  OGA_CATCH
+}
+
 OgaResult* OGA_API_CALL OgaGenerator_SetLogits(OgaGenerator* generator, OgaTensor* tensor) {
   OGA_TRY
   auto logits = generator->search_->GetLogits();

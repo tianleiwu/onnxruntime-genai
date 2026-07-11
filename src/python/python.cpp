@@ -266,6 +266,12 @@ struct PyGenerator {
     return ToNumpy(*generator_->GetLogits());
   }
 
+  pybind11::array_t<float> GetTargetLogProbs(pybind11::array_t<int32_t> targets) {
+    pybind11::array_t<int32_t, pybind11::array::c_style | pybind11::array::forcecast> contiguous(targets);
+    pybind11::buffer_info info = contiguous.request();
+    return ToNumpy(*generator_->GetTargetLogProbs(static_cast<const int32_t*>(info.ptr), static_cast<size_t>(info.size)));
+  }
+
   void SetLogits(pybind11::array_t<float> new_logits) {
     generator_->SetLogits(*ToOgaTensor(new_logits, false));
   }
@@ -499,6 +505,7 @@ PYBIND11_MODULE(onnxruntime_genai, m) {
       .def("append_tokens", pybind11::overload_cast<OgaTensor&>(&PyGenerator::AppendTokens))
       .def("token_count", &PyGenerator::TokenCount)
       .def("get_logits", &PyGenerator::GetLogits)
+      .def("get_target_logprobs", &PyGenerator::GetTargetLogProbs)
       .def("set_logits", &PyGenerator::SetLogits)
       .def("generate_next_token", &PyGenerator::GenerateNextToken)
       .def("rewind_to", &PyGenerator::RewindTo)

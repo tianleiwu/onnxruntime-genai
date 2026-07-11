@@ -543,6 +543,12 @@ struct OgaGenerator : OgaAbstract {
     return std::unique_ptr<OgaTensor>(out);
   }
 
+  std::unique_ptr<OgaTensor> GetTargetLogProbs(const int32_t* targets, size_t targets_count) {
+    OgaTensor* out;
+    OgaCheckResult(OgaGenerator_GetTargetLogProbs(this, targets, targets_count, &out));
+    return std::unique_ptr<OgaTensor>(out);
+  }
+
   void SetLogits(OgaTensor& tensor) {
     OgaCheckResult(OgaGenerator_SetLogits(this, &tensor));
   }

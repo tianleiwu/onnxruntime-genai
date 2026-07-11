@@ -4,6 +4,8 @@
 #include "generators.h"
 #include "ort_genai_c.h"  // For OGA_EXPORT
 #include "interface.h"
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include "../search.h"
 #include "search_cuda.h"
 #include "kernels.h"
@@ -173,6 +175,17 @@ struct CudaInterfaceImplBase : DeviceInterface {
 
   void LaunchAddLogitsMask(float* batch_logits, int batch_beam_size, int vocab_size, const uint32_t* logits_mask) override {
     cuda::LaunchAddLogitsMask(batch_logits, batch_beam_size, vocab_size, logits_mask, GetStream());
+  }
+
+  void LaunchTargetLogProbs(const void* logits, ONNXTensorElementDataType logits_type, const int32_t* targets, float* out, int rows, int vocab_size) override {
+    if (logits_type == Ort::TypeToTensorType<Ort::Float16_t>)
+      cuda::LaunchTargetLogProbs(reinterpret_cast<const half*>(logits), targets, out, rows, vocab_size, GetStream());
+    else if (logits_type == Ort::TypeToTensorType<Ort::BFloat16_t>)
+      cuda::LaunchTargetLogProbs(reinterpret_cast<const __nv_bfloat16*>(logits), targets, out, rows, vocab_size, GetStream());
+    else if (logits_type == Ort::TypeToTensorType<float>)
+      cuda::LaunchTargetLogProbs(reinterpret_cast<const float*>(logits), targets, out, rows, vocab_size, GetStream());
+    else
+      throw std::runtime_error("LaunchTargetLogProbs: unsupported logits element type");
   }
 
   void GetAvailableMemory(size_t& free_bytes, size_t& total_bytes) override {
