@@ -633,6 +633,23 @@ OGA_EXPORT OgaResult* OGA_API_CALL OgaGenerator_GetLogits(OgaGenerator* generato
 OGA_EXPORT OgaResult* OGA_API_CALL OgaGenerator_GetTargetLogProbs(OgaGenerator* generator, const int32_t* targets, size_t targets_count, OgaTensor** out);
 
 /**
+ * \brief Exposes a model output as device (GPU) memory WITHOUT copying to host.
+ *        Returns the raw device data pointer, element type, and shape of the named output so a
+ *        caller (e.g. PyTorch via __cuda_array_interface__) can reduce the tensor in place. The
+ *        device is synchronized before returning so the producing forward has completed. The memory
+ *        is owned by the generator/session and is only valid until the next generation step; the
+ *        caller must not free it and must finish reading before advancing or destroying the generator.
+ * \param[in] generator The generator holding the output (call AppendTokens first).
+ * \param[in] name The name of the output tensor (e.g. "logits").
+ * \param[out] data Receives the raw device data pointer.
+ * \param[out] type Receives the element type of the output.
+ * \param[out] shape Caller-provided buffer receiving the shape dims; must have capacity for at least 8 dims.
+ * \param[out] rank Receives the number of dimensions written to shape.
+ * \return OgaResult containing the error message if the output is unavailable or not a supported rank.
+ */
+OGA_EXPORT OgaResult* OGA_API_CALL OgaGenerator_GetOutputDeviceInfo(const OgaGenerator* generator, const char* name, void** data, OgaElementType* type, int64_t* shape, size_t* rank);
+
+/**
  * \brief Sets the logits to the generator. This is useful when the user wants to set the logits to a specific value
  *        for example when doing guided generation.
  * \param[in] generator The generator to set the logits on

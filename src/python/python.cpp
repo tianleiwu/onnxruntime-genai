@@ -221,6 +221,27 @@ struct PyGeneratorParams {
   std::vector<pybind11::object> refs_;  // References to data we want to ensure doesn't get garbage collected
 };
 
+// Maps an OgaElementType to a numpy-style typestr for __cuda_array_interface__.
+// bfloat16 has no standard typestr, so it is exposed as raw uint16 (caller bitcasts).
+static const char* OgaTypeToCaiTypestr(OgaElementType type) {
+  switch (type) {
+    case OgaElementType_float32:
+      return "<f4";
+    case OgaElementType_float16:
+      return "<f2";
+    case OgaElementType_float64:
+      return "<f8";
+    case OgaElementType_int32:
+      return "<i4";
+    case OgaElementType_int64:
+      return "<i8";
+    case OgaElementType_bfloat16:
+      return "<u2";
+    default:
+      throw std::runtime_error("Unsupported output dtype for CUDA array interface");
+  }
+}
+
 struct PyGenerator {
   PyGenerator(const OgaModel& model, PyGeneratorParams& params) {
     generator_ = OgaGenerator::Create(model, *params.params_);
@@ -270,6 +291,29 @@ struct PyGenerator {
     pybind11::array_t<int32_t, pybind11::array::c_style | pybind11::array::forcecast> contiguous(targets);
     pybind11::buffer_info info = contiguous.request();
     return ToNumpy(*generator_->GetTargetLogProbs(static_cast<const int32_t*>(info.ptr), static_cast<size_t>(info.size)));
+  }
+
+  // Returns a __cuda_array_interface__ dict for a device (GPU) output, without copying
+  // to host. The caller (e.g. torch.as_tensor) can zero-copy wrap it and reduce in place.
+  // The underlying memory is owned by the generator and only valid until the next step;
+  // finish reading (synchronize) before advancing or destroying the generator.
+  pybind11::dict GetOutputCudaArrayInterface(const std::string& name) {
+    void* data = nullptr;
+    OgaElementType type = OgaElementType_undefined;
+    int64_t shape[8];
+    size_t rank = 0;
+    OgaCheckResult(OgaGenerator_GetOutputDeviceInfo(generator_.get(), name.c_str(), &data, &type, shape, &rank));
+    pybind11::tuple shp(rank);
+    for (size_t i = 0; i < rank; ++i)
+      shp[i] = shape[i];
+    pybind11::dict cai;
+    cai["shape"] = shp;
+    cai["typestr"] = OgaTypeToCaiTypestr(type);
+    cai["data"] = pybind11::make_tuple(reinterpret_cast<uintptr_t>(data), false);
+    cai["strides"] = pybind11::none();
+    cai["stream"] = 1;  // device already synchronized in C++; legacy default stream
+    cai["version"] = 3;
+    return cai;
   }
 
   void SetLogits(pybind11::array_t<float> new_logits) {
@@ -506,6 +550,7 @@ PYBIND11_MODULE(onnxruntime_genai, m) {
       .def("token_count", &PyGenerator::TokenCount)
       .def("get_logits", &PyGenerator::GetLogits)
       .def("get_target_logprobs", &PyGenerator::GetTargetLogProbs)
+      .def("get_output_cuda_array_interface", &PyGenerator::GetOutputCudaArrayInterface)
       .def("set_logits", &PyGenerator::SetLogits)
       .def("generate_next_token", &PyGenerator::GenerateNextToken)
       .def("rewind_to", &PyGenerator::RewindTo)

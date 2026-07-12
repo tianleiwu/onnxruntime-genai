@@ -633,6 +633,33 @@ OgaResult* OGA_API_CALL OgaGenerator_GetTargetLogProbs(OgaGenerator* oga_generat
   OGA_CATCH
 }
 
+OgaResult* OGA_API_CALL OgaGenerator_GetOutputDeviceInfo(const OgaGenerator* oga_generator, const char* name,
+                                                         void** data, OgaElementType* type, int64_t* shape, size_t* rank) {
+  OGA_TRY
+  auto& generator = *reinterpret_cast<const Generators::Generator*>(oga_generator);
+  OrtValue* ortvalue = generator.state_->GetOutput(name);
+  if (ortvalue == nullptr)
+    throw std::runtime_error(std::string("Output not available: ") + name + "; call AppendTokens first.");
+  auto info = ortvalue->GetTensorTypeAndShapeInfo();
+  auto dims = info->GetShape();
+  if (dims.size() > 8)
+    throw std::runtime_error("GetOutputDeviceInfo supports outputs of rank <= 8.");
+
+  // Ensure the model forward that produced this output has completed before the caller
+  // (e.g. torch on its own stream) reads the device memory. The output is owned by the
+  // ORT session and may be produced on a different stream than the caller's.
+  generator.model_->p_device_->Synchronize();
+
+  auto bytes = Generators::ByteWrapTensor(*generator.model_->p_device_, *ortvalue);
+  *data = bytes.Span().data();
+  *type = static_cast<OgaElementType>(info->GetElementType());
+  *rank = dims.size();
+  for (size_t i = 0; i < dims.size(); ++i)
+    shape[i] = dims[i];
+  return nullptr;
+  OGA_CATCH
+}
+
 OgaResult* OGA_API_CALL OgaGenerator_SetLogits(OgaGenerator* generator, OgaTensor* tensor) {
   OGA_TRY
   auto logits = generator->search_->GetLogits();
