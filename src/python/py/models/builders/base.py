@@ -1070,7 +1070,7 @@ class Model:
             )
 
         # Delete temporary cache dir if empty
-        if not os.listdir(self.cache_dir):
+        if os.path.isdir(self.cache_dir) and not os.listdir(self.cache_dir):
             os.rmdir(self.cache_dir)
 
     def to_str_dtype(self, dtype: ir.DataType) -> str:
