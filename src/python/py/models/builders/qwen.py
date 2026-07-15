@@ -2200,6 +2200,35 @@ class Qwen35MoeTextModel(Qwen35TextModel):
             self._mtp_ep = ep
             self._mtp_cache_dir = cache_dir
             self._mtp_extra_options = copy.deepcopy(extra_options)
+            # MTP head precision selection. The checkpoint stores the mtp.* weights in
+            # bf16, so by default (neither option set) the head inherits the main model's
+            # precision. Two overrides trade off draft cost vs. acceptance rate:
+            #   * mtp_head_fp16 : dense fp16 MoE head. Highest acceptance, but the dense
+            #     fp16 MoE op is GPU-compute-bound and dominates the speculative step.
+            #   * mtp_head_int8 : INT8 QMoE head. ~2x cheaper to draft than the dense fp16
+            #     head (weight-only int8 vs dense fp16 GEMM) while keeping most of the
+            #     acceptance, since the tiny single-layer head tolerates int8 well.
+            # The two are mutually exclusive.
+            _mtp_head_fp16 = str(extra_options.get("mtp_head_fp16", "false")).lower() in ("1", "true", "yes")
+            _mtp_head_int8 = str(extra_options.get("mtp_head_int8", "false")).lower() in ("1", "true", "yes")
+            if _mtp_head_fp16 and _mtp_head_int8:
+                raise ValueError("mtp_head_fp16 and mtp_head_int8 are mutually exclusive.")
+            if _mtp_head_fp16:
+                self._mtp_onnx_dtype = ir.DataType.FLOAT16
+                self._mtp_io_dtype = ir.DataType.FLOAT16
+                for _k in ("use_nvfp4_moe", "use_fp4_moe", "use_8bits_moe",
+                           "int4_block_size", "int4_algo_config", "int4_is_symmetric"):
+                    self._mtp_extra_options.pop(_k, None)
+            elif _mtp_head_int8:
+                # Keep onnx_dtype=INT4 (so the MoE op stays QMoE) and io_dtype=fp16, but
+                # quantize the head's (bf16) MoE experts to INT8 on the fly via the standard
+                # QMoE RTN path (make_qmoe_weights) instead of consuming the native NVFP4
+                # experts. The lm_head / attention int8/int4 placement (int4_algo_config)
+                # is left as the main model's so the two lm_heads stay byte-identical and
+                # can be deduplicated on disk.
+                self._mtp_extra_options["use_8bits_moe"] = True
+                for _k in ("use_nvfp4_moe", "use_fp4_moe"):
+                    self._mtp_extra_options.pop(_k, None)
 
     def make_model(self, input_path):
         # Build the main decoder model first.
@@ -2713,7 +2742,16 @@ class Qwen35MtpHead(Qwen35MoeTextModel):
 
         mtp_state = {}
         embed_weight = None
+        # The lm_head in a Model Optimizer NVFP4 checkpoint is stored packed:
+        # "lm_head.weight" is uint8 [N, K/2] E2M1 codes, with a per-block E4M3
+        # "lm_head.weight_scale" [N, K/16] and a per-tensor FP32 "lm_head.weight_scale_2".
+        # It must be dequantized to a plain BF16 [N, K] weight the same way the main
+        # model does (see ModeloptModel._dequant_linear); feeding the packed uint8
+        # tensor straight into make_lm_head halves K (K/2 read as K) and corrupts the
+        # LM head. Collect all three tensors and reconstruct below.
         lm_head_weight = None
+        lm_head_weight_scale = None
+        lm_head_weight_scale_2 = None
         # The embedding tensor name varies: plain text models use
         # "model.embed_tokens.weight" while the Qwen3.6 VL checkpoint nests it
         # under "model.language_model.embed_tokens.weight".
@@ -2727,6 +2765,10 @@ class Qwen35MtpHead(Qwen35MoeTextModel):
                         embed_weight = f.get_tensor(key)
                     elif key == "lm_head.weight":
                         lm_head_weight = f.get_tensor(key)
+                    elif key == "lm_head.weight_scale":
+                        lm_head_weight_scale = f.get_tensor(key)
+                    elif key == "lm_head.weight_scale_2":
+                        lm_head_weight_scale_2 = f.get_tensor(key)
 
         if not mtp_state:
             raise ValueError(
@@ -2740,6 +2782,22 @@ class Qwen35MtpHead(Qwen35MoeTextModel):
             )
         if lm_head_weight is None:
             raise ValueError("Could not find 'lm_head.weight' for the MTP head LM head.")
+
+        # Reconstruct the dense BF16 lm_head from NVFP4 (block-16 E2M1 + E4M3 block
+        # scale + FP32 global scale). This mirrors the main model's lm_head so the two
+        # are byte-identical after quantization and can be deduplicated on disk
+        # (see _share_mtp_embedding_lm_head).
+        if lm_head_weight_scale_2 is not None:
+            from onnxruntime_genai.models.quantized_model import _modelopt_dequant_nvfp4
+
+            if lm_head_weight_scale is None:
+                raise ValueError(
+                    "Found 'lm_head.weight_scale_2' but not 'lm_head.weight_scale'; "
+                    "cannot dequantize the NVFP4 MTP head LM head."
+                )
+            lm_head_weight = _modelopt_dequant_nvfp4(
+                lm_head_weight, lm_head_weight_scale, lm_head_weight_scale_2
+            )
 
         self._embed_weight = embed_weight
         self._lm_head_weight = lm_head_weight

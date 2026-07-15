@@ -343,6 +343,13 @@ python builder.py -i path_to_local_folder_on_disk -o path_to_output_folder -p pr
 
 Note that `enable_mtp` is only supported for Qwen3.6 MoE models (`Qwen3_5MoeForConditionalGeneration`) that ship `mtp.*` weights in their safetensors. The MTP weights are read directly from the source safetensors because Hugging Face `transformers` discards them on load.
 
+By default the MTP head inherits the main model's precision. Two optional overrides trade off draft cost vs. acceptance rate for the small single-layer head:
+
+* `mtp_head_fp16=true` — build the head as a dense fp16 `MoE` op. Highest acceptance rate.
+* `mtp_head_int8=true` — build the head as an INT8 `QMoE` op. ~2.6x smaller on disk than the fp16 head with comparable acceptance and throughput, so it is preferred when GPU memory matters.
+
+`mtp_head_fp16` and `mtp_head_int8` are mutually exclusive. Both require the main model to be quantized (`-p int4`).
+
 #### Enable WebGPU Graph Capture
 
 This scenario is for when you want to enable WebGPU graph capture for your ONNX model.
