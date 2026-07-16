@@ -7,6 +7,9 @@
 #include "models/model.h"
 #include "mtp_generator.h"
 
+#include <cstdlib>
+#include <cstring>
+
 namespace Generators {
 
 namespace {
@@ -26,13 +29,32 @@ int32_t ArgmaxRow(const float* row, int vocab_size) {
 
 MtpGenerator::MtpGenerator(const Model& main_model, const Model& mtp_model, const GeneratorParams& params)
     : main_model_{main_model}, mtp_model_{mtp_model} {
-  // MTP runs both a 1-token decode and a 2-token verify on the main model. Allow CUDA graph
-  // capture of both shapes (each captured under its own annotation id with pre-sized static
-  // buffers). Harmless for the MTP head, which only ever runs a single token per step.
-  const_cast<GeneratorParams&>(params).max_graph_capture_length = 2;
+  // Number of speculative draft tokens per step (N). N=1 is the original single-token fast path;
+  // N>1 chains the single MTP module N times (feeding its own post-norm hidden back), as vLLM's
+  // AutoRegressiveSpeculator does. Tunable via env var for benchmarking without an API change;
+  // N>1 requires the head exported with `mtp_emit_hidden=true` (extra output hidden_states_out).
+  num_speculative_tokens_ = 1;
+  if (const char* env = std::getenv("ORT_MTP_NUM_SPECULATIVE_TOKENS")) {
+    const int v = std::atoi(env);
+    if (v >= 1) num_speculative_tokens_ = v;
+  }
+  if (num_speculative_tokens_ > 1) {
+    throw std::runtime_error(
+        "MtpGenerator: ORT_MTP_NUM_SPECULATIVE_TOKENS > 1 is unsupported for this CUDA graph "
+        "decoder export. Captured verifies of length 3+ are not causal-equivalent, and eager "
+        "decode is unavailable. Use the lossless 1-token MTP path.");
+  }
+
+  // The established MTP path captures the 1-token decode and 2-token verify shapes.
+  auto& main_params = const_cast<GeneratorParams&>(params);
+  main_params.max_graph_capture_length = 2;
 
   main_ = CreateGenerator(main_model_, params);
-  mtp_ = CreateGenerator(mtp_model_, params);
+  mtp_params_ = std::make_shared<GeneratorParams>(mtp_model_);
+  mtp_params_->search = params.search;
+  mtp_params_->max_graph_capture_length = 1;
+  mtp_params_->use_graph_capture = false;
+  mtp_ = CreateGenerator(mtp_model_, *mtp_params_);
 
   hidden_size_ = main_model_.config_->model.decoder.hidden_size;
   vocab_size_ = main_model_.config_->model.vocab_size;
@@ -52,20 +74,101 @@ MtpGenerator::MtpGenerator(const Model& main_model, const Model& mtp_model, cons
       main_model_.session_info_.GetOutputDataType(main_model_.config_->model.decoder.outputs.hidden_states));
   const std::array<int64_t, 3> slice2_shape{1, 2, hidden_size_};
   hidden_slice2_->CreateTensor(slice2_shape);
+
+  // Multi-token (N>1) scratch: the head's own hidden output (chain feedback) and a re-feed buffer
+  // used to re-materialize accepted drafts in the head KV with the main model's hidden states.
+  if (num_speculative_tokens_ > 1) {
+    head_out_hidden_ = std::make_shared<Tensor>(
+      mtp_model_.p_device_inputs_,
+      mtp_model_.session_info_.GetInputDataType(mtp_model_.config_->model.decoder.inputs.hidden_states));
+    head_out_hidden_->CreateTensor(slice_shape);
+    refeed_hidden_ = std::make_shared<Tensor>(
+      mtp_model_.p_device_inputs_,
+      mtp_model_.session_info_.GetInputDataType(mtp_model_.config_->model.decoder.inputs.hidden_states));
+    refeed_hidden_->CreateTensor(slice_shape);
+    drafts_.resize(num_speculative_tokens_);
+    verify_tokens_.resize(num_speculative_tokens_ + 1);
+    verify_argmax_.resize(num_speculative_tokens_ + 1);
+  }
 }
 
 void MtpGenerator::ExtractHiddenPosition(OrtValue* hidden, int position) {
   // hidden is [1, S, H] on the model device; copy row `position` into hidden_slice_ ([1,1,H]).
+  CopyHiddenRow(hidden, position, *hidden_slice_);
+}
+
+void MtpGenerator::CopyHiddenRow(OrtValue* hidden, int position, Tensor& dst) {
+  // hidden is [1, S, H] on the main model device; copy row `position` into dst ([1,1,H]).
   auto src = ByteWrapTensor(*main_model_.p_device_, *hidden);
-  const size_t row_bytes = hidden_slice_->GetByteSpan().size();
+  const size_t row_bytes = dst.GetByteSpan().size();
   auto src_row = src.subspan(static_cast<size_t>(position) * row_bytes, row_bytes);
-  hidden_slice_->GetByteSpan().CopyFrom(src_row);
+  dst.GetByteSpan().CopyFrom(src_row);
+}
+
+int32_t MtpGenerator::DraftHeadStep(int32_t token, bool need_draft) {
+  // The head's `hidden_states` input must already be set by the caller (SetHiddenStates). Append
+  // `token` (the head KV grows by one), capture the head's own post-final-norm output for the next
+  // chained step, and return the greedy draft for the token after `token`.
+  std::array<int32_t, 1> tok{token};
+  mtp_->AppendTokens(cpu_span<const int32_t>(tok));
+  ++head_len_;
+
+  int32_t draft = 0;
+  if (need_draft) {
+    // ArgMax synchronizes the head's logits producer before the feedback D2D copy below.
+    auto logits_span = mtp_->GetLogits();  // fp32, last token, [1, V]
+    if (!mtp_model_.p_device_->ArgMax(logits_span.Span().data(), Ort::TypeToTensorType<float>, 1, vocab_size_, &draft)) {
+      auto logits = logits_span.CopyDeviceToCpu();  // host fallback
+      draft = ArgmaxRow(logits.data(), vocab_size_);
+    }
+  }
+
+  // Capture the head's recurrent feedback hidden (hidden_states_out, the single processed row).
+  OrtValue* head_hidden = mtp_->state_->GetOutput("hidden_states_out");
+  if (head_hidden == nullptr) {
+    throw std::runtime_error(
+        "MtpGenerator: multi-token speculation requires the MTP head exported with "
+        "mtp_emit_hidden=true (missing 'hidden_states_out' output).");
+  }
+  const size_t row_bytes = head_out_hidden_->GetByteSpan().size();
+  // The head ran a single token, so hidden_states_out is [1,1,H]: take row 0.
+  auto dst = head_out_hidden_->GetByteSpan();
+  if (head_hidden->GetTensorMemoryInfo().GetDeviceType() == OrtMemoryInfoDeviceType_CPU) {
+    // ExtraOutputs are not IO-bound, so ORT may allocate this output on the CPU. Stage it through
+    // the destination's pinned host buffer rather than passing a host pointer to cudaMemcpy D2D.
+    auto dst_cpu = dst.CpuSpan();
+    std::memcpy(dst_cpu.data(), head_hidden->GetTensorRawData(), row_bytes);
+    dst.CopyCpuToDevice();
+  } else {
+    auto src = ByteWrapTensor(*mtp_model_.p_device_, *head_hidden);
+    dst.CopyFrom(src.subspan(0, row_bytes));
+  }
+  return draft;
 }
 
 void MtpGenerator::ArgmaxMainRows(int first_row, int num_rows, int32_t* out) {
   OrtValue* raw = main_->state_->GetOutput(main_model_.config_->model.decoder.outputs.logits.c_str());
   auto info = raw->GetTensorTypeAndShapeInfo();
   const ONNXTensorElementDataType type = info->GetElementType();
+
+  // The CUDA distributed-select Top-K implementation is batch-1 only. The N=1 MTP verify uses
+  // two rows and is covered by its existing tuned path, but N>1 verifies have 3+ rows. Submit
+  // those rows independently so each invocation uses the proven batch-1 path while keeping the
+  // full logits device-resident. This is a compatibility bridge until Top-K has a native batched
+  // argmax path for the large Qwen vocabulary.
+  if (num_rows > 2) {
+    const uint8_t* base = static_cast<const uint8_t*>(raw->GetTensorRawData());
+    const size_t row_bytes = static_cast<size_t>(vocab_size_) * Ort::SizeOf(type);
+    bool all_device = true;
+    for (int row = 0; row < num_rows; ++row) {
+      const void* row_ptr = base + static_cast<size_t>(first_row + row) * row_bytes;
+      if (!main_model_.p_device_->ArgMax(row_ptr, type, 1, vocab_size_, out + row)) {
+        all_device = false;
+        break;
+      }
+    }
+    if (all_device) return;
+  }
 
   // Fast path: argmax the rows on-device with the high-performance Top-K kernel (k=1). Only the
   // small token ids are copied to the host -- the full [1,S,V] logits never leave the GPU.
@@ -148,6 +251,13 @@ void MtpGenerator::GenerateNextToken() {
     return;
   }
 
+  if (num_speculative_tokens_ == 1)
+    GenerateStepSingle(t);
+  else
+    GenerateStepMulti(t);
+}
+
+void MtpGenerator::GenerateStepSingle(int32_t t) {
   // 1. Draft the next token for t. After an accepted step the draft was already computed ahead
   //    (fused into that step's KV-advance as one 2-token MTP forward), so reuse it; otherwise the
   //    MTP head is at the right point and we issue a fresh single-token draft.
@@ -200,6 +310,83 @@ void MtpGenerator::GenerateNextToken() {
     ArgmaxMainRows(0, 1, &next_token_);
     ExtractHiddenPosition(hidden, 0);
     length_ += 1;
+  }
+}
+
+void MtpGenerator::GenerateStepMulti(int32_t t) {
+  const int N = std::min(num_speculative_tokens_, static_cast<int>(max_length_ - length_ - 1));
+  const std::string& hs_name = main_model_.config_->model.decoder.outputs.hidden_states;
+
+  // --- Draft phase: chain the single MTP module N times. ---
+  // Step 0 feeds the main model's hidden (hidden_slice_ holds h paired with t) and appends the
+  // committed token t to the head KV. Steps 1..N-1 feed the head's OWN post-norm hidden
+  // (head_out_hidden_, captured by DraftHeadStep) + the previous draft -- speculative appends.
+  const size_t head_start = head_len_;
+  mtp_->SetHiddenStates(hidden_slice_);
+  drafts_[0] = DraftHeadStep(t);
+  for (int k = 1; k < N; ++k) {
+    mtp_->SetHiddenStates(head_out_hidden_);
+    drafts_[k] = DraftHeadStep(drafts_[k - 1]);
+  }
+
+  // --- Verify [t, d0..d_{N-1}] in a single main forward. ---
+  main_->SnapshotState();
+  verify_tokens_[0] = t;
+  for (int k = 0; k < N; ++k) verify_tokens_[k + 1] = drafts_[k];
+  main_->AppendTokens(cpu_span<const int32_t>(verify_tokens_.data(), N + 1));
+  ++forwards_;
+  ArgmaxMainRows(0, N + 1, verify_argmax_.data());  // main's real token after each verify position
+  OrtValue* vhidden = main_->state_->GetOutput(hs_name.c_str());
+
+  // --- Longest accepted prefix (greedy match against the main model). ---
+  int a = 0;
+  while (a < N && drafts_[a] == verify_argmax_[a]) ++a;
+  trials_ += (a < N) ? static_cast<size_t>(a + 1) : static_cast<size_t>(N);  // conditional trials
+  accepts_ += static_cast<size_t>(a);
+
+  // Commit the a accepted drafts (t was already committed by the caller). Stop at eos/max_length.
+  for (int k = 0; k < a; ++k) {
+    sequence_.push_back(drafts_[k]);
+    if (contains(main_model_.config_->model.eos_token_id, drafts_[k]) ||
+        sequence_.size() >= static_cast<size_t>(max_length_)) {
+      done_ = true;
+      return;  // generation finished; leftover main/head KV is irrelevant
+    }
+  }
+
+  // --- Roll the MTP head KV back to the committed tokens: keep t (fed with its main hidden), drop
+  //     the N-1 speculative drafts, then re-materialize the a accepted drafts with the main model's
+  //     hidden states. This matches the standalone probe / vLLM, which rebuild the draft KV from
+  //     main hiddens each step, and avoids drift from the head's own (speculative) hiddens. ---
+  mtp_->RewindToLength(head_start + 1);
+  head_len_ = head_start + 1;
+  for (int k = 0; k < a; ++k) {
+    CopyHiddenRow(vhidden, k, *refeed_hidden_);  // main hidden that predicted drafts_[k]
+    mtp_->SetHiddenStates(refeed_hidden_);
+    DraftHeadStep(drafts_[k], /*need_draft=*/false);  // re-append with the main hidden (no argmax)
+  }
+
+  // --- Carry state for the next step: next_token_ = the bonus token (main's prediction after the
+  //     accepted prefix) and hidden_slice_ = the main hidden paired with it. Extract from the
+  //     verify output BEFORE any main rewind overwrites the hidden buffer. ---
+  next_token_ = verify_argmax_[a];
+  CopyHiddenRow(vhidden, a, *hidden_slice_);
+
+  // --- Main KV / recurrent state. ---
+  if (a == N) {
+    // All drafts accepted: the verify already committed [t, d0..d_{N-1}] correctly; the bonus token
+    // is drafted fresh next step. Main KV = L + (N+1).
+    length_ += static_cast<size_t>(N) + 1;
+  } else {
+    // Partial/zero accept: the verify over-appended N-a wrong tokens. Restore the recurrent state
+    // to the snapshot at L and re-run only the committed prefix [t, d0..d_{a-1}] (recurrent-safe;
+    // the linear-attn state cannot be partially cropped, so we recompute it).
+    main_->RewindToLength(length_);
+    verify_tokens_[0] = t;
+    for (int k = 0; k < a; ++k) verify_tokens_[k + 1] = drafts_[k];
+    main_->AppendTokens(cpu_span<const int32_t>(verify_tokens_.data(), a + 1));
+    ++forwards_;
+    length_ += static_cast<size_t>(a) + 1;
   }
 }
 

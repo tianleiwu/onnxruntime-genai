@@ -2693,6 +2693,14 @@ class Qwen35MtpHead(Qwen35MoeTextModel):
         self.input_types["hidden_states"] = self.io_dtype
         self.input_shapes["hidden_states"] = ["batch_size", "sequence_length", self.hidden_size]
 
+        # Optionally emit the head's own post-final-norm hidden state as an extra graph
+        # output (`hidden_states_out`). This is what a multi-token (num_speculative_tokens>1)
+        # self-speculative loop feeds back as the `hidden_states` input of the next chained
+        # draft step (the module is recurrent: h_out = norm(layer(fc(embed, h_in))), same as
+        # vLLM's Qwen3.5 MTP). The output name differs from the `hidden_states` INPUT to avoid an
+        # ONNX name collision. Harmless when unused (genai's ExtraOutputs just ignores it).
+        self._emit_hidden_output = str(extra_options.get("mtp_emit_hidden", "false")).lower() in ("1", "true", "yes")
+
     def make_model(self, input_path):
         # Inputs/outputs: standard decoder I/O plus the extra hidden_states input.
         self.make_inputs_and_outputs()
@@ -2717,7 +2725,20 @@ class Qwen35MtpHead(Qwen35MoeTextModel):
         self.make_layernorm(
             1, _RMSNormWeight(self._mtp_norm_weight), skip=True, simple=True, location="final_norm"
         )
+        # Capture the post-final-norm hidden BEFORE lm_head consumes it, so it can be
+        # exported as the recurrent feedback output for multi-token speculation.
+        mtp_norm_output = self.layernorm_attrs["output_0"]
         self.make_lm_head(_LinearWeight(self._lm_head_weight))
+
+        if self._emit_hidden_output:
+            hs_out = "hidden_states_out"
+            self.make_node(
+                "Identity", inputs=[mtp_norm_output], outputs=[hs_out],
+                name="/model/mtp/hidden_states_out/Identity",
+            )
+            hs_val = self.make_value(hs_out, self.io_dtype,
+                                     shape=["batch_size", "sequence_length", self.hidden_size])
+            self.model.graph.outputs.append(hs_val)
 
         self.make_postprocessing_nodes()
 

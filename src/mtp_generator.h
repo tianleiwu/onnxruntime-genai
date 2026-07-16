@@ -56,6 +56,19 @@ struct MtpGenerator {
   int32_t DraftTwo(OrtValue* hidden, int32_t tok0, int32_t tok1);
   // Copy one [1,1,H] position out of a [1,S,H] hidden_states OrtValue into hidden_slice_ (D2D).
   void ExtractHiddenPosition(OrtValue* hidden, int position);
+  // Copy one [1,1,H] row out of a [1,S,H] hidden OrtValue (on `main_model_`'s device) into `dst`.
+  void CopyHiddenRow(OrtValue* hidden, int position, Tensor& dst);
+  // One MTP-head forward on a single token: the head's `hidden_states` input must already be set
+  // (via SetHiddenStates) by the caller. Appends `token` to the head KV, captures the head's own
+  // post-final-norm output (hidden_states_out, last row) into `head_out_hidden_` for the next
+  // chained step, and returns the greedy draft (or 0 if need_draft is false).
+  int32_t DraftHeadStep(int32_t token, bool need_draft = true);
+  // Single-token (num_speculative_tokens == 1) draft/verify step (the original fast path).
+  void GenerateStepSingle(int32_t t);
+  // Multi-token (num_speculative_tokens > 1) chained draft/verify step: chains the single MTP
+  // module N times (feeding its own hidden back), verifies [t, d0..d_{N-1}] in one main forward,
+  // commits the longest accepted prefix + 1 bonus, and rolls the head/main state back losslessly.
+  void GenerateStepMulti(int32_t t);
   // Greedy argmax over `num_rows` consecutive vocab rows of the main model's raw logits output
   // ([1,S,V]), starting at `first_row`, writing the token ids to `out`. Uses the device's
   // on-device Top-K kernel when available (no full-logits host copy); falls back to a host argmax.
@@ -66,15 +79,33 @@ struct MtpGenerator {
 
   std::unique_ptr<Generator> main_;  // main decoder generator
   std::unique_ptr<Generator> mtp_;   // MTP head generator (drafts)
+  // State retains GeneratorParams via shared_from_this, so the head needs a distinct persistent
+  // parameter object. It must use the head's Config and keep graph capture off (head graph replay
+  // corrupts chained drafts; the main model alone captures the verify shapes).
+  std::shared_ptr<GeneratorParams> mtp_params_;
 
   std::shared_ptr<Tensor> hidden_slice_;  // reusable [1,1,hidden] device buffer for the handoff
   std::shared_ptr<Tensor> hidden_slice2_;  // reusable [1,2,hidden] buffer for the batched 2-token draft
+  std::shared_ptr<Tensor> head_out_hidden_;  // [1,1,hidden] capture of the head's own hidden (chain feedback)
+  std::shared_ptr<Tensor> refeed_hidden_;    // [1,1,hidden] scratch for re-feeding accepted drafts (main hidden)
   std::unique_ptr<OrtValue> logits_fp32_;  // reusable fp32 cast of the main model's raw logits
 
   std::vector<int32_t> sequence_;  // committed tokens (batch 0)
   int hidden_size_{};
   int vocab_size_{};
   int max_length_{};
+
+  // Number of speculative draft tokens per step (N). 1 = the original single-token fast path;
+  // >1 chains the single MTP module N times (Qwen3.6 / vLLM-style). Read from the
+  // ORT_MTP_NUM_SPECULATIVE_TOKENS env var at construction (default 1).
+  int num_speculative_tokens_{1};
+  // Head KV length invariant (multi-token path): number of committed generated tokens currently
+  // in the MTP head's KV cache (each fed once with its main hidden). The draft phase temporarily
+  // extends this speculatively, then rolls it back to this value + accepted drafts.
+  size_t head_len_{0};
+  std::vector<int32_t> drafts_;         // scratch: the N chained draft tokens
+  std::vector<int32_t> verify_tokens_;  // scratch: [t, d0..d_{N-1}] for the verify forward
+  std::vector<int32_t> verify_argmax_;  // scratch: main argmax of the N+1 verify rows
 
   // Loop carry state (see the design doc draft/verify invariant):
   int32_t next_token_{};   // token predicted for the current cache length L (not yet committed)
