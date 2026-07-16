@@ -38,16 +38,9 @@ MtpGenerator::MtpGenerator(const Model& main_model, const Model& mtp_model, cons
     const int v = std::atoi(env);
     if (v >= 1) num_speculative_tokens_ = v;
   }
-  if (num_speculative_tokens_ > 1) {
-    throw std::runtime_error(
-        "MtpGenerator: ORT_MTP_NUM_SPECULATIVE_TOKENS > 1 is unsupported for this CUDA graph "
-        "decoder export. Captured verifies of length 3+ are not causal-equivalent, and eager "
-        "decode is unavailable. Use the lossless 1-token MTP path.");
-  }
-
-  // The established MTP path captures the 1-token decode and 2-token verify shapes.
+  // Capture the 1-token decode and the verify shapes up to N+1 tokens.
   auto& main_params = const_cast<GeneratorParams&>(params);
-  main_params.max_graph_capture_length = 2;
+  main_params.max_graph_capture_length = num_speculative_tokens_ + 1;
 
   main_ = CreateGenerator(main_model_, params);
   mtp_params_ = std::make_shared<GeneratorParams>(mtp_model_);
@@ -329,7 +322,12 @@ void MtpGenerator::GenerateStepMulti(int32_t t) {
     drafts_[k] = DraftHeadStep(drafts_[k - 1]);
   }
 
-  // --- Verify [t, d0..d_{N-1}] in a single main forward. ---
+  // --- Verify [t, d0..d_{N-1}] in a single batched main forward (the whole point of MTP: one
+  //     forward validates N+1 tokens). The batched (M=N+1) forward is numerically ~equal but not
+  //     bit-identical to single-token decode (different GEMM tiling for M=1 vs M>1, plus XQA-vs-
+  //     Flash attention), so a greedy argmax can occasionally differ on near-ties. This is the same
+  //     tradeoff the N=1 verify already makes; the reject path below re-runs decode-consistently to
+  //     bound divergence from plain greedy. ---
   main_->SnapshotState();
   verify_tokens_[0] = t;
   for (int k = 0; k < N; ++k) verify_tokens_[k + 1] = drafts_[k];
@@ -356,8 +354,8 @@ void MtpGenerator::GenerateStepMulti(int32_t t) {
 
   // --- Roll the MTP head KV back to the committed tokens: keep t (fed with its main hidden), drop
   //     the N-1 speculative drafts, then re-materialize the a accepted drafts with the main model's
-  //     hidden states. This matches the standalone probe / vLLM, which rebuild the draft KV from
-  //     main hiddens each step, and avoids drift from the head's own (speculative) hiddens. ---
+  //     hidden states. Extract the head-refeed hiddens from the verify output BEFORE any main
+  //     rewind overwrites the hidden buffer. ---
   mtp_->RewindToLength(head_start + 1);
   head_len_ = head_start + 1;
   for (int k = 0; k < a; ++k) {
@@ -366,26 +364,27 @@ void MtpGenerator::GenerateStepMulti(int32_t t) {
     DraftHeadStep(drafts_[k], /*need_draft=*/false);  // re-append with the main hidden (no argmax)
   }
 
-  // --- Carry state for the next step: next_token_ = the bonus token (main's prediction after the
-  //     accepted prefix) and hidden_slice_ = the main hidden paired with it. Extract from the
-  //     verify output BEFORE any main rewind overwrites the hidden buffer. ---
-  next_token_ = verify_argmax_[a];
-  CopyHiddenRow(vhidden, a, *hidden_slice_);
-
-  // --- Main KV / recurrent state. ---
   if (a == N) {
-    // All drafts accepted: the verify already committed [t, d0..d_{N-1}] correctly; the bonus token
-    // is drafted fresh next step. Main KV = L + (N+1).
+    // All drafts accepted: the batched verify already committed [t, d0..d_{N-1}] correctly, so the
+    // main KV / recurrent state is exactly at L + (N+1). The bonus token is main's prediction at the
+    // last verify row (mirrors the N=1 accept path, which likewise commits a batched-forward token).
+    next_token_ = verify_argmax_[a];
+    CopyHiddenRow(vhidden, a, *hidden_slice_);
     length_ += static_cast<size_t>(N) + 1;
   } else {
-    // Partial/zero accept: the verify over-appended N-a wrong tokens. Restore the recurrent state
-    // to the snapshot at L and re-run only the committed prefix [t, d0..d_{a-1}] (recurrent-safe;
-    // the linear-attn state cannot be partially cropped, so we recompute it).
+    // Rejection at position a: the batched verify over-appended N-a wrong tokens and cannot be
+    // partially cropped (the linear-attention recurrent state has no per-token rollback). Restore
+    // the recurrent snapshot at L and re-run only the committed prefix [t, d0..d_{a-1}]. Reading the
+    // bonus + its hidden from THIS forward keeps the carried state consistent with the committed
+    // sequence (the a==0 case degenerates to the exact N=1 single-token decode re-run).
     main_->RewindToLength(length_);
     verify_tokens_[0] = t;
     for (int k = 0; k < a; ++k) verify_tokens_[k + 1] = drafts_[k];
     main_->AppendTokens(cpu_span<const int32_t>(verify_tokens_.data(), a + 1));
     ++forwards_;
+    OrtValue* rhidden = main_->state_->GetOutput(hs_name.c_str());
+    ArgmaxMainRows(a, 1, &next_token_);        // main's token after the committed prefix
+    CopyHiddenRow(rhidden, a, *hidden_slice_);  // hidden paired with the bonus token
     length_ += static_cast<size_t>(a) + 1;
   }
 }
