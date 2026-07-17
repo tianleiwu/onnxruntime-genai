@@ -2795,19 +2795,14 @@ class Model:
         present_conv_all = kwargs.get("present_conv_state_all", None)
         if present_conv_all:
             outputs.append(present_conv_all)
-        attributes = {
-            "ndim": kwargs.get("ndim", 1),
-            "activation": kwargs.get("activation", "silu"),
-        }
-        if kwargs.get("state_all_capacity", 0) > 0:
-            attributes["state_all_capacity"] = kwargs["state_all_capacity"]
         self.make_node(
             "CausalConvWithState",
             inputs=inputs,
             outputs=outputs,
             name=name,
             domain="com.microsoft",
-            **attributes,
+            ndim=kwargs.get("ndim", 1),
+            activation=kwargs.get("activation", "silu"),
         )
         self.make_value(output, self.io_dtype, shape=kwargs["output_shape"])
         self.make_value(present_conv, self.io_dtype, shape=kwargs["present_conv_shape"])
@@ -2830,21 +2825,16 @@ class Model:
         present_recurrent_all = kwargs.get("present_recurrent_state_all", None)
         if present_recurrent_all:
             outputs.append(present_recurrent_all)
-        attributes = {
-            "q_num_heads": kwargs["q_num_heads"],
-            "kv_num_heads": kwargs["kv_num_heads"],
-            "update_rule": kwargs.get("update_rule", "gated_delta"),
-            "scale": kwargs.get("scale", 1.0),
-        }
-        if kwargs.get("state_all_capacity", 0) > 0:
-            attributes["state_all_capacity"] = kwargs["state_all_capacity"]
         self.make_node(
             "LinearAttention",
             inputs=inputs,
             outputs=outputs,
             name=name,
             domain="com.microsoft",
-            **attributes,
+            q_num_heads=kwargs["q_num_heads"],
+            kv_num_heads=kwargs["kv_num_heads"],
+            update_rule=kwargs.get("update_rule", "gated_delta"),
+            scale=kwargs.get("scale", 1.0),
         )
         self.make_value(output, self.io_dtype, shape=kwargs["output_shape"])
         self.make_value(present_recurrent, self.io_dtype, shape=kwargs["present_recurrent_shape"])
