@@ -206,11 +206,11 @@ void RecurrentState::Add() {
 
 void RecurrentState::UpdateAll(int sequence_length) {
   if (!has_state_all_) return;
-  if (state_all_capacity_ > 0 && sequence_length <= state_all_capacity_) {
-    if (fixed_state_all_bound_) return;
-
-    conv_all_shape_[1] = state_all_capacity_;
-    recurrent_all_shape_[1] = state_all_capacity_;
+  if (state_all_capacity_ > 0) {
+    if (sequence_length > state_all_capacity_) {
+      throw std::runtime_error("RecurrentState: sequence length exceeds present_state_all capacity");
+    }
+    if (presents_all_[0]->GetOrtTensor() != nullptr) return;
 
     size_t output_index = output_all_index_;
     const int num_layers = static_cast<int>(layer_indices_.size());
@@ -224,13 +224,7 @@ void RecurrentState::UpdateAll(int sequence_length) {
         state_.outputs_[output_index++] = presents_all_[i * 2 + 1]->GetOrtTensor();
       }
     }
-    fixed_state_all_bound_ = true;
     return;
-  }
-  if (state_all_capacity_ > 0) {
-    fixed_state_all_bound_ = false;
-    conv_all_shape_[1] = sequence_length;
-    recurrent_all_shape_[1] = sequence_length;
   }
   // Only rebuild when the sequence length changes (matches HiddenStatesOutputs). conv_all_shape_[1]
   // and recurrent_all_shape_[1] track together.
