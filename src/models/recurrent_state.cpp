@@ -102,8 +102,9 @@ RecurrentState::RecurrentState(State& state)
   // TODO: Remove WebGPU special case once the ORT WebGPU EP adds a
   // LinearAttention kernel with native past/present buffer sharing support.
   share_buffers_ = model_.p_device_kvcache_->GetType() != DeviceType::WEBGPU;
+  separate_conv_buffers_ = share_buffers_ && GetEnv("ORT_MTP_SEPARATE_CONV_BUFFERS") == "1";
 
-  if (!share_buffers_) {
+  if (!share_buffers_ || separate_conv_buffers_) {
     pasts_.resize(num_layers * 2);
   }
   presents_.reserve(num_layers * 2);
@@ -114,12 +115,14 @@ RecurrentState::RecurrentState(State& state)
     if (!share_buffers_) {
       pasts_[i * 2] = OrtValue::CreateTensor(allocator, conv_shape_, conv_type_);
       pasts_[i * 2 + 1] = OrtValue::CreateTensor(allocator, recurrent_shape_, recurrent_type_);
+    } else if (separate_conv_buffers_) {
+      pasts_[i * 2] = OrtValue::CreateTensor(allocator, conv_shape_, conv_type_);
     }
     presents_.push_back(OrtValue::CreateTensor(allocator, conv_shape_, conv_type_));
     presents_.push_back(OrtValue::CreateTensor(allocator, recurrent_shape_, recurrent_type_));
   }
 
-  if (!share_buffers_) {
+  if (!share_buffers_ || separate_conv_buffers_) {
     ZeroStates(pasts_);
   }
   ZeroStates(presents_);
@@ -171,7 +174,8 @@ void RecurrentState::Add() {
   for (int i = 0; i < num_layers * 2; ++i) {
     // Shared: alias input=output for stable addresses.
     // WebGPU: separate past/present buffers to avoid aliasing violation.
-    state_.inputs_.push_back(share_buffers_ ? presents_[i].get() : pasts_[i].get());
+    const bool use_separate_input = !share_buffers_ || (separate_conv_buffers_ && i % 2 == 0);
+    state_.inputs_.push_back(use_separate_input ? pasts_[i].get() : presents_[i].get());
     state_.input_names_.push_back(input_name_strings_[i].c_str());
     state_.outputs_.push_back(presents_[i].get());
     state_.output_names_.push_back(output_name_strings_[i].c_str());
@@ -241,10 +245,16 @@ void RecurrentState::CropToPosition(size_t position) {
     const size_t slice_bytes = dst.size();
     dst.CopyFrom(all.subspan(position * slice_bytes, slice_bytes));
   }
+  if (separate_conv_buffers_) SyncConvPasts(presents_);
 }
 
 void RecurrentState::Update() {
-  if (layer_indices_.empty() || share_buffers_) return;
+  if (layer_indices_.empty()) return;
+  if (separate_conv_buffers_) {
+    SyncConvPasts(presents_);
+    return;
+  }
+  if (share_buffers_) return;
 
   const int num_layers = static_cast<int>(layer_indices_.size());
   for (int i = 0; i < num_layers * 2; ++i) {
@@ -274,8 +284,11 @@ void RecurrentState::RewindTo(size_t index) {
   }
   // Full reset to length 0.
   snapshot_valid_ = false;
-  if (share_buffers_) {
+  if (share_buffers_ && !separate_conv_buffers_) {
     // Shared buffers: zero in place, addresses stay stable.
+    ZeroStates(presents_);
+  } else if (separate_conv_buffers_) {
+    ZeroStates(pasts_);
     ZeroStates(presents_);
   } else {
     // Zero and rebind all state buffers.
@@ -292,7 +305,7 @@ void RecurrentState::RewindTo(size_t index) {
 void RecurrentState::ZeroStates(std::vector<std::unique_ptr<OrtValue>>& states) {
   auto& device = *model_.p_device_kvcache_;
   for (auto& val : states) {
-    ByteWrapTensor(device, *val).Zero();
+    if (val) ByteWrapTensor(device, *val).Zero();
   }
 }
 
@@ -301,6 +314,13 @@ void RecurrentState::CopyStates(const std::vector<std::unique_ptr<OrtValue>>& sr
   auto& device = *model_.p_device_kvcache_;
   for (size_t i = 0; i < src.size(); ++i) {
     ByteWrapTensor(device, *dst[i]).CopyFrom(ByteWrapTensor(device, *src[i]));
+  }
+}
+
+void RecurrentState::SyncConvPasts(const std::vector<std::unique_ptr<OrtValue>>& src) {
+  auto& device = *model_.p_device_kvcache_;
+  for (size_t i = 0; i < src.size(); i += 2) {
+    ByteWrapTensor(device, *pasts_[i]).CopyFrom(ByteWrapTensor(device, *src[i]));
   }
 }
 
@@ -330,6 +350,7 @@ void RecurrentState::RestoreSnapshot() {
   // Copy back into the live buffers in place so their addresses stay stable
   // (required by CUDA-graph replay, which captures fixed buffer pointers).
   CopyStates(snapshot_, presents_);
+  if (separate_conv_buffers_) SyncConvPasts(snapshot_);
 }
 
 std::unique_ptr<RecurrentState> CreateRecurrentState(State& state) {
