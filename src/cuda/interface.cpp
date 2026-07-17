@@ -204,7 +204,7 @@ struct CudaInterfaceImplBase : DeviceInterface {
       topk_batch_ = num_rows;
       topk_vocab_ = vocab_size;
     }
-    cuda::RunTopK(topk_data_.get(), stream, scores, vocab_size, num_rows, /*k=*/2);
+    cuda::select_sort::RunTopK(topk_data_.get(), stream, scores, vocab_size, num_rows, /*k=*/2);
 
     const size_t result_count = static_cast<size_t>(num_rows) * 2;
     if (!top2_indices_host_ || top2_host_count_ < result_count) {
