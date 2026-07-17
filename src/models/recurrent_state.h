@@ -65,7 +65,6 @@ struct RecurrentState {
 
   // WebGPU cannot alias input/output buffers, so it uses separate past/present\n  // with swap. All other EPs share buffers for stable addresses.
   bool share_buffers_{false};
-  bool fixed_separate_buffers_{false};
   size_t input_index_{~0U};
   size_t output_index_{~0U};
 
