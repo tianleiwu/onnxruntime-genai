@@ -141,11 +141,8 @@ RecurrentState::RecurrentState(State& state)
       bind_recurrent_all_ = false;
     } else if (binding == "recurrent") {
       bind_conv_all_ = false;
-    } else if (binding == "none") {
-      bind_conv_all_ = false;
-      bind_recurrent_all_ = false;
     } else if (!binding.empty() && binding != "all") {
-      throw std::runtime_error("ORT_MTP_STATE_ALL_BINDING must be all, conv, recurrent, or none");
+      throw std::runtime_error("ORT_MTP_STATE_ALL_BINDING must be all, conv, or recurrent");
     }
 
     // Per-position shapes: insert the seq_len axis at position 1 of the live-state shapes.
