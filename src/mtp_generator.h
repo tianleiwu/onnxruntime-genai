@@ -99,6 +99,7 @@ struct MtpGenerator {
   // >1 chains the single MTP module N times (Qwen3.6 / vLLM-style). Read from the
   // ORT_MTP_NUM_SPECULATIVE_TOKENS env var at construction (default 1).
   int num_speculative_tokens_{1};
+  bool decode_consistent_accept_{false};
   // Head KV length invariant (multi-token path): number of committed generated tokens currently
   // in the MTP head's KV cache (each fed once with its main hidden). The draft phase temporarily
   // extends this speculatively, then rolls it back to this value + accepted drafts.
