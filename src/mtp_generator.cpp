@@ -276,23 +276,14 @@ void MtpGenerator::GenerateStepSingle(int32_t t) {
   ArgmaxMainRows(0, 2, verify_argmax);
   if (compare_graph_eager_) {
     const int32_t graph_argmax[2]{verify_argmax[0], verify_argmax[1]};
-    OrtValue* graph_hidden = main_->state_->GetOutput(main_model_.config_->model.decoder.outputs.hidden_states.c_str());
-    auto graph_hidden_cpu = ByteWrapTensor(*main_model_.p_device_, *graph_hidden).CopyDeviceToCpu();
-    std::vector<uint8_t> graph_hidden_bytes(graph_hidden_cpu.begin(), graph_hidden_cpu.end());
     main_->RewindToLength(length_);
     main_->state_->ForceEagerNextRun();
     main_->AppendTokens(cpu_span<const int32_t>(verify));
     ArgmaxMainRows(0, 2, verify_argmax);
     if (graph_argmax[0] != verify_argmax[0] || graph_argmax[1] != verify_argmax[1]) {
-      OrtValue* eager_hidden = main_->state_->GetOutput(main_model_.config_->model.decoder.outputs.hidden_states.c_str());
-      auto eager_hidden_bytes = ByteWrapTensor(*main_model_.p_device_, *eager_hidden).CopyDeviceToCpu();
-      const size_t hidden_byte_mismatches = static_cast<size_t>(std::count_if(
-          graph_hidden_bytes.begin(), graph_hidden_bytes.end(),
-          [&, index = size_t{0}](uint8_t value) mutable { return value != eager_hidden_bytes[index++]; }));
       std::fprintf(stderr,
-                   "EXP-017 length=%zu graph=[%d,%d] eager=[%d,%d] hidden_byte_mismatches=%zu/%zu\n",
-                   length_, graph_argmax[0], graph_argmax[1], verify_argmax[0], verify_argmax[1],
-                   hidden_byte_mismatches, graph_hidden_bytes.size());
+                   "EXP-017 length=%zu graph=[%d,%d] eager=[%d,%d]\n",
+                   length_, graph_argmax[0], graph_argmax[1], verify_argmax[0], verify_argmax[1]);
     }
   }
   const int32_t m = verify_argmax[0];
