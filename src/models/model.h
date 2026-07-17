@@ -63,6 +63,7 @@ struct State {
   void SetActiveAdapter(Adapters* adapters, const std::string& adapter_name);
   void SetRunOption(const char* key, const char* value);
   void SetRunOptions(const Config::RunOptions& config_run_options);
+  void ForceEagerNextRun() { force_eager_next_run_ = true; }
   virtual void SetExtraInputs(const std::vector<ExtraInput>& extra_inputs) {}
 
   void DumpInputs();
@@ -83,6 +84,7 @@ struct State {
   bool first_run_{true};
 
   std::unique_ptr<OrtRunOptions> run_options_;
+  bool force_eager_next_run_{false};
 
  private:
   // CUDA graph annotation id per captured input length. The decode path captures

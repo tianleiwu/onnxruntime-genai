@@ -105,6 +105,11 @@ void State::DumpOutputs() {
 void State::Run(OrtSession& session, bool graph_capture_this_run, int graph_capture_length) {
   DurationTrace trace{"State::Run"};
 
+  if (force_eager_next_run_) {
+    graph_capture_this_run = false;
+    force_eager_next_run_ = false;
+  }
+
   if (params_->use_graph_capture) {
     graph_capture_session_ = &session;
     if (graph_capture_this_run) {
