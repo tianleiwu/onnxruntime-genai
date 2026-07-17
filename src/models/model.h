@@ -40,6 +40,17 @@ struct State {
   // rejected draft, since recurrent state cannot be partially cropped like KV cache.
   virtual void SnapshotState() {}
 
+  // Lossless multi-token MTP crop: when the model emits per-position recurrent state
+  // (emit_recurrent_state_all=true), the accepted prefix can be committed WITHOUT a replay
+  // forward. HasCroppableRecurrentState() reports availability; CropToAccepted() rolls the
+  // attention KV cache + position to `new_length` and crops the recurrent state to the state
+  // AFTER verify token `recurrent_position` (== present_state_all[:, recurrent_position]).
+  virtual bool HasCroppableRecurrentState() const { return false; }
+  virtual void CropToAccepted(size_t new_length, size_t recurrent_position) {
+    (void)new_length;
+    (void)recurrent_position;
+  }
+
   // Stage a hidden_states input value for the next Run (models with a hidden_states input,
   // e.g. the MTP self-speculative head). Default no-op.
   virtual void SetHiddenStates(OrtValue* hidden_states) { (void)hidden_states; }

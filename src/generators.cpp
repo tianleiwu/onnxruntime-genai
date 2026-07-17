@@ -741,6 +741,23 @@ void Generator::SnapshotState() {
   state_->SnapshotState();
 }
 
+bool Generator::CanCropRecurrentState() const {
+  return state_->HasCroppableRecurrentState();
+}
+
+void Generator::CropToAccepted(size_t new_length, size_t recurrent_position) {
+  ThrowErrorIfSessionTerminated(state_->session_terminated_);
+  if (new_length > search_->GetSequenceLength())
+    throw std::runtime_error("CropToAccepted: new_length exceeds current sequence length");
+  search_->RewindTo(new_length);
+  state_->CropToAccepted(new_length, recurrent_position);
+  if (guidance_logits_processor_) {
+    guidance_logits_processor_->Reset();
+  }
+  computed_logits_ = false;
+  last_action_ = Action::rewound;
+}
+
 void Generator::SetHiddenStates(std::shared_ptr<Tensor> hidden_states) {
   ThrowErrorIfSessionTerminated(state_->session_terminated_);
   hidden_states_input_ = std::move(hidden_states);  // keep alive until the feeder copies it
