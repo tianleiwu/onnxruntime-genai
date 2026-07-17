@@ -31,7 +31,7 @@ struct RecurrentState {
   // so they survive CUDA-graph capture. On a partial-accept MTP step the controller crops the
   // live recurrent state to the accepted length by copying present_state_all[:, position] into
   // the live present buffers -- no full-cost main-model replay forward.
-  bool HasStateAll() const { return has_state_all_; }
+  bool HasStateAll() const { return has_state_all_ && bind_conv_all_ && bind_recurrent_all_; }
   void UpdateAll(int sequence_length);  // Resize the per-position buffers to this step's seq_len.
   void CropToPosition(size_t position);  // Copy present_state_all[:, position] -> live present state.
 
@@ -55,6 +55,8 @@ struct RecurrentState {
   // Per-position state outputs (present_state_all), managed as static-buffer outputs so they
   // survive CUDA-graph capture. Interleaved [conv_all_0, recurrent_all_0, ...], one per state.
   bool has_state_all_{false};
+  bool bind_conv_all_{true};
+  bool bind_recurrent_all_{true};
   std::vector<std::string> output_all_name_strings_;
   std::vector<std::unique_ptr<Tensor>> presents_all_;
   std::vector<int64_t> conv_all_shape_;       // [B, seq_len, C, K-1] (seq at axis 1)

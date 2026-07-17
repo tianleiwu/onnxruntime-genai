@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 #include "../generators.h"
+#include "env_utils.h"
 #include "model.h"
 #include "kv_cache.h"  // For ComposeKeyValueName
 #include "recurrent_state.h"
@@ -135,6 +136,15 @@ RecurrentState::RecurrentState(State& state)
   }
 
   if (has_state_all_) {
+    const std::string binding = GetEnv("ORT_MTP_STATE_ALL_BINDING");
+    if (binding == "conv") {
+      bind_recurrent_all_ = false;
+    } else if (binding == "recurrent") {
+      bind_conv_all_ = false;
+    } else if (!binding.empty() && binding != "all") {
+      throw std::runtime_error("ORT_MTP_STATE_ALL_BINDING must be all, conv, or recurrent");
+    }
+
     // Per-position shapes: insert the seq_len axis at position 1 of the live-state shapes.
     conv_all_shape_ = {conv_shape_[0], 0, conv_shape_[1], conv_shape_[2]};
     recurrent_all_shape_ = {recurrent_shape_[0], 0, recurrent_shape_[1], recurrent_shape_[2], recurrent_shape_[3]};
@@ -168,9 +178,15 @@ void RecurrentState::Add() {
   // CUDA-graph capture). Their OrtValue is (re)created per step by UpdateAll(); push nullptr here.
   if (has_state_all_) {
     output_all_index_ = state_.outputs_.size();
-    for (int i = 0; i < num_layers * 2; ++i) {
-      state_.outputs_.push_back(presents_all_[i]->GetOrtTensor());  // nullptr until UpdateAll()
-      state_.output_names_.push_back(output_all_name_strings_[i].c_str());
+    for (int i = 0; i < num_layers; ++i) {
+      if (bind_conv_all_) {
+        state_.outputs_.push_back(presents_all_[i * 2]->GetOrtTensor());  // nullptr until UpdateAll()
+        state_.output_names_.push_back(output_all_name_strings_[i * 2].c_str());
+      }
+      if (bind_recurrent_all_) {
+        state_.outputs_.push_back(presents_all_[i * 2 + 1]->GetOrtTensor());
+        state_.output_names_.push_back(output_all_name_strings_[i * 2 + 1].c_str());
+      }
     }
   }
 }
@@ -193,19 +209,24 @@ void RecurrentState::UpdateAll(int sequence_length) {
   const size_t conv_pos_elems = static_cast<size_t>(conv_all_shape_[2]) * conv_all_shape_[3];
   const size_t rec_pos_elems = static_cast<size_t>(recurrent_all_shape_[2]) * recurrent_all_shape_[3] * recurrent_all_shape_[4];
 
+  size_t output_index = output_all_index_;
   for (int i = 0; i < num_layers; ++i) {
-    const size_t conv_cap = use_static ? static_cast<size_t>(conv_all_shape_[0]) * max_cap * conv_pos_elems * Ort::SizeOf(conv_type_) : 0;
-    presents_all_[i * 2]->CreateTensor(conv_all_shape_, use_static, conv_cap);
-    state_.outputs_[output_all_index_ + i * 2] = presents_all_[i * 2]->GetOrtTensor();
+    if (bind_conv_all_) {
+      const size_t conv_cap = use_static ? static_cast<size_t>(conv_all_shape_[0]) * max_cap * conv_pos_elems * Ort::SizeOf(conv_type_) : 0;
+      presents_all_[i * 2]->CreateTensor(conv_all_shape_, use_static, conv_cap);
+      state_.outputs_[output_index++] = presents_all_[i * 2]->GetOrtTensor();
+    }
 
-    const size_t rec_cap = use_static ? static_cast<size_t>(recurrent_all_shape_[0]) * max_cap * rec_pos_elems * Ort::SizeOf(recurrent_type_) : 0;
-    presents_all_[i * 2 + 1]->CreateTensor(recurrent_all_shape_, use_static, rec_cap);
-    state_.outputs_[output_all_index_ + i * 2 + 1] = presents_all_[i * 2 + 1]->GetOrtTensor();
+    if (bind_recurrent_all_) {
+      const size_t rec_cap = use_static ? static_cast<size_t>(recurrent_all_shape_[0]) * max_cap * rec_pos_elems * Ort::SizeOf(recurrent_type_) : 0;
+      presents_all_[i * 2 + 1]->CreateTensor(recurrent_all_shape_, use_static, rec_cap);
+      state_.outputs_[output_index++] = presents_all_[i * 2 + 1]->GetOrtTensor();
+    }
   }
 }
 
 void RecurrentState::CropToPosition(size_t position) {
-  if (!has_state_all_)
+  if (!HasStateAll())
     throw std::runtime_error("RecurrentState::CropToPosition requires the model exported with emit_recurrent_state_all=true");
   // Copy present_state_all[:, position] (the recurrent/conv state AFTER token `position` of the
   // last forward) into the live present buffers. Assumes batch_size == 1 (MTP is batch 1): each
