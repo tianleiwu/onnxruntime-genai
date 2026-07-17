@@ -36,6 +36,7 @@ struct RecurrentState {
   void CropToPosition(size_t position);  // Copy present_state_all[:, position] -> live present state.
 
   bool IsEmpty() const { return layer_indices_.empty(); }
+  int GraphCaptureVariant() const { return graph_buffer_variant_; }
 
  private:
   void ZeroStates(std::vector<std::unique_ptr<OrtValue>>& states);
@@ -65,6 +66,8 @@ struct RecurrentState {
 
   // WebGPU cannot alias input/output buffers, so it uses separate past/present\n  // with swap. All other EPs share buffers for stable addresses.
   bool share_buffers_{false};
+  bool graph_double_buffer_{false};
+  int graph_buffer_variant_{0};
   size_t input_index_{~0U};
   size_t output_index_{~0U};
 

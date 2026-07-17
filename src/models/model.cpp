@@ -62,12 +62,13 @@ State::State(const GeneratorParams& params, const Model& model)
       extra_outputs_{*this} {
   // Generate a random id for graph capture of the default (1-token) decode shape.
   if (params_->use_graph_capture) {
-    graph_ids_[1] = GraphIdForLength(1);
+    GraphIdForLength(1, 0);
   }
 }
 
-std::string State::GraphIdForLength(int graph_capture_length) {
-  auto it = graph_ids_.find(graph_capture_length);
+std::string State::GraphIdForLength(int graph_capture_length, int graph_capture_variant) {
+  const int graph_key = graph_capture_length * 2 + graph_capture_variant;
+  auto it = graph_ids_.find(graph_key);
   if (it != graph_ids_.end()) {
     return it->second;
   }
@@ -76,7 +77,7 @@ std::string State::GraphIdForLength(int graph_capture_length) {
   std::mt19937 gen(rd());
   std::uniform_int_distribution<> dis(1, INT_MAX);
   std::string id = std::to_string(dis(gen));
-  graph_ids_[graph_capture_length] = id;
+  graph_ids_[graph_key] = id;
   return id;
 }
 
@@ -102,13 +103,14 @@ void State::DumpOutputs() {
   }
 }
 
-void State::Run(OrtSession& session, bool graph_capture_this_run, int graph_capture_length) {
+void State::Run(OrtSession& session, bool graph_capture_this_run, int graph_capture_length,
+                int graph_capture_variant) {
   DurationTrace trace{"State::Run"};
 
   if (params_->use_graph_capture) {
     graph_capture_session_ = &session;
     if (graph_capture_this_run) {
-      run_options_->AddConfigEntry("gpu_graph_id", GraphIdForLength(graph_capture_length).c_str());
+      run_options_->AddConfigEntry("gpu_graph_id", GraphIdForLength(graph_capture_length, graph_capture_variant).c_str());
     } else {
       run_options_->AddConfigEntry("gpu_graph_id", "-1");
     }

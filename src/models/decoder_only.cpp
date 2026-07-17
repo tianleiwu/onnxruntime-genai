@@ -65,7 +65,8 @@ DeviceSpan<float> DecoderOnly_State::Run(int total_length, DeviceSpan<int32_t>& 
     // each captured length getting its own annotation id / static buffers.
     int seq_len = static_cast<int>(input_ids_.GetShape()[1]);
     bool graph_capture_this_run = params_->use_graph_capture && seq_len >= 1 && seq_len <= params_->max_graph_capture_length;
-    State::Run(*model_.session_decoder_, graph_capture_this_run, seq_len);
+    const int graph_capture_variant = recurrent_state_ ? recurrent_state_->GraphCaptureVariant() : 0;
+    State::Run(*model_.session_decoder_, graph_capture_this_run, seq_len, graph_capture_variant);
 
     return logits_.Get();
   }
