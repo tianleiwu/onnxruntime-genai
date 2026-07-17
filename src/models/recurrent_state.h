@@ -24,17 +24,6 @@ struct RecurrentState {
   void Snapshot();
   void RestoreSnapshot();
 
-  // Per-position recurrent-state cropping (lossless multi-token MTP). When the model is
-  // exported with `emit_recurrent_state_all=true`, each LinearAttention / CausalConvWithState
-  // node emits a 3rd output holding the state AFTER every token of the forward
-  // ([B, seq_len, ...]). These are managed as static-buffer outputs (like HiddenStatesOutputs)
-  // so they survive CUDA-graph capture. On a partial-accept MTP step the controller crops the
-  // live recurrent state to the accepted length by copying present_state_all[:, position] into
-  // the live present buffers -- no full-cost main-model replay forward.
-  bool HasStateAll() const { return has_state_all_; }
-  void UpdateAll(int sequence_length);  // Resize the per-position buffers to this step's seq_len.
-  void CropToPosition(size_t position);  // Copy present_state_all[:, position] -> live present state.
-
   bool IsEmpty() const { return layer_indices_.empty(); }
 
  private:
@@ -51,15 +40,6 @@ struct RecurrentState {
   std::vector<std::unique_ptr<OrtValue>> presents_;
   std::vector<std::unique_ptr<OrtValue>> snapshot_;  // Lazily-allocated copy of the live state for speculative rollback.
   bool snapshot_valid_{false};                       // Whether snapshot_ holds a valid captured state.
-
-  // Per-position state outputs (present_state_all), managed as static-buffer outputs so they
-  // survive CUDA-graph capture. Interleaved [conv_all_0, recurrent_all_0, ...], one per state.
-  bool has_state_all_{false};
-  std::vector<std::string> output_all_name_strings_;
-  std::vector<std::unique_ptr<Tensor>> presents_all_;
-  std::vector<int64_t> conv_all_shape_;       // [B, seq_len, C, K-1] (seq at axis 1)
-  std::vector<int64_t> recurrent_all_shape_;  // [B, seq_len, H_kv, d_k, d_v]
-  size_t output_all_index_{~0U};
 
   // WebGPU cannot alias input/output buffers, so it uses separate past/present\n  // with swap. All other EPs share buffers for stable addresses.
   bool share_buffers_{false};

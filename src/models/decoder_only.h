@@ -29,9 +29,6 @@ struct DecoderOnly_State : State {
 
   void SnapshotState() override;
 
-  bool HasCroppableRecurrentState() const override;
-  void CropToAccepted(size_t new_length, size_t recurrent_position) override;
-
   // Stage the hidden_states values for the next Run (for models with a hidden_states input,
   // e.g. the MTP self-speculative head). No-op if the model has no hidden_states input.
   void SetHiddenStates(OrtValue* hidden_states) override;

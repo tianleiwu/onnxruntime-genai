@@ -2791,10 +2791,6 @@ class Model:
         output = f"{name}/output_0"
         present_conv = kwargs["present_conv_state"]
         outputs = [output, present_conv]
-        # Optional per-position carry state output(2): [B, seq_len, C, K-1].
-        present_conv_all = kwargs.get("present_conv_state_all", None)
-        if present_conv_all:
-            outputs.append(present_conv_all)
         self.make_node(
             "CausalConvWithState",
             inputs=inputs,
@@ -2806,8 +2802,6 @@ class Model:
         )
         self.make_value(output, self.io_dtype, shape=kwargs["output_shape"])
         self.make_value(present_conv, self.io_dtype, shape=kwargs["present_conv_shape"])
-        if present_conv_all:
-            self.make_value(present_conv_all, self.io_dtype, shape=kwargs["present_conv_all_shape"])
 
     def make_linear_attention(self, name, **kwargs):
         inputs = [
@@ -2821,10 +2815,6 @@ class Model:
         output = f"{name}/output_0"
         present_recurrent = kwargs["present_recurrent_state"]
         outputs = [output, present_recurrent]
-        # Optional per-position recurrent state output(2): [B, seq_len, H_kv, d_k, d_v].
-        present_recurrent_all = kwargs.get("present_recurrent_state_all", None)
-        if present_recurrent_all:
-            outputs.append(present_recurrent_all)
         self.make_node(
             "LinearAttention",
             inputs=inputs,
@@ -2838,8 +2828,6 @@ class Model:
         )
         self.make_value(output, self.io_dtype, shape=kwargs["output_shape"])
         self.make_value(present_recurrent, self.io_dtype, shape=kwargs["present_recurrent_shape"])
-        if present_recurrent_all:
-            self.make_value(present_recurrent_all, self.io_dtype, shape=kwargs["present_recurrent_all_shape"])
 
     def make_sparse_attention(self, name, **kwargs):
         inputs = [

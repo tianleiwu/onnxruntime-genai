@@ -109,10 +109,6 @@ struct Generator : LeakChecked<Generator> {
   void GenerateNextToken();
   void RewindToLength(size_t new_length);  // Rewind state to new_length
   void SnapshotState();                     // Snapshot recurrent state for speculative rollback (e.g. MTP)
-  // Lossless multi-token MTP: commit the accepted prefix without a replay forward by cropping the
-  // KV cache + position to new_length and the recurrent state to present_state_all[:, recurrent_position].
-  bool CanCropRecurrentState() const;
-  void CropToAccepted(size_t new_length, size_t recurrent_position);
   void SetHiddenStates(std::shared_ptr<Tensor> hidden_states);  // Stage hidden_states input for next step (MTP head)
   DeviceSpan<float> GetLogits();
   void SetLogits(DeviceSpan<float> logits);
