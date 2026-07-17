@@ -73,6 +73,7 @@ struct MtpGenerator {
   // ([1,S,V]), starting at `first_row`, writing the token ids to `out`. Uses the device's
   // on-device Top-K kernel when available (no full-logits host copy); falls back to a host argmax.
   void ArgmaxMainRows(int first_row, int num_rows, int32_t* out);
+  bool Top2MainRows(int first_row, int num_rows, int32_t* out, float* margins);
 
   const Model& main_model_;
   const Model& mtp_model_;
@@ -99,6 +100,7 @@ struct MtpGenerator {
   // >1 chains the single MTP module N times (Qwen3.6 / vLLM-style). Read from the
   // ORT_MTP_NUM_SPECULATIVE_TOKENS env var at construction (default 1).
   int num_speculative_tokens_{1};
+  float verify_margin_threshold_{-1.0f};
   // Head KV length invariant (multi-token path): number of committed generated tokens currently
   // in the MTP head's KV cache (each fed once with its main hidden). The draft phase temporarily
   // extends this speculatively, then rolls it back to this value + accepted drafts.
