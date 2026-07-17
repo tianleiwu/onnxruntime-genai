@@ -38,9 +38,6 @@ MtpGenerator::MtpGenerator(const Model& main_model, const Model& mtp_model, cons
     const int v = std::atoi(env);
     if (v >= 1) num_speculative_tokens_ = v;
   }
-  if (const char* env = std::getenv("ORT_MTP_DECODE_CONSISTENT_ACCEPT")) {
-    decode_consistent_accept_ = std::atoi(env) != 0;
-  }
   // Capture the 1-token decode and the verify shapes up to N+1 tokens.
   auto& main_params = const_cast<GeneratorParams&>(params);
   main_params.max_graph_capture_length = num_speculative_tokens_ + 1;
@@ -284,27 +281,6 @@ void MtpGenerator::GenerateStepSingle(int32_t t) {
     sequence_.push_back(d);
     if (sequence_.size() >= static_cast<size_t>(max_length_)) {
       done_ = true;
-      return;
-    }
-    if (decode_consistent_accept_) {
-      // Diagnostic lossless path: M=2 verification can choose a different greedy bonus than
-      // sequential M=1 decode on a near-tie. Restore and replay both committed tokens separately.
-      main_->RewindToLength(length_);
-      std::array<int32_t, 1> replay_t{t};
-      main_->AppendTokens(cpu_span<const int32_t>(replay_t));
-      ++forwards_;
-      OrtValue* hidden_t = main_->state_->GetOutput(main_model_.config_->model.decoder.outputs.hidden_states.c_str());
-      ExtractHiddenPosition(hidden_t, 0);
-      DraftNextToken(nullptr, d, /*need_draft=*/false);
-
-      std::array<int32_t, 1> replay_d{d};
-      main_->AppendTokens(cpu_span<const int32_t>(replay_d));
-      ++forwards_;
-      OrtValue* hidden_d = main_->state_->GetOutput(main_model_.config_->model.decoder.outputs.hidden_states.c_str());
-      ArgmaxMainRows(0, 1, &next_token_);
-      ExtractHiddenPosition(hidden_d, 0);
-      has_pending_draft_ = false;
-      length_ += 2;
       return;
     }
     OrtValue* hidden = main_->state_->GetOutput(main_model_.config_->model.decoder.outputs.hidden_states.c_str());
