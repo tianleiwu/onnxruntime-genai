@@ -8,7 +8,6 @@
 #include "mtp_generator.h"
 
 #include <cstdlib>
-#include <cstdio>
 #include <cstring>
 
 namespace Generators {
@@ -39,7 +38,6 @@ MtpGenerator::MtpGenerator(const Model& main_model, const Model& mtp_model, cons
     const int v = std::atoi(env);
     if (v >= 1) num_speculative_tokens_ = v;
   }
-  compare_graph_eager_ = std::getenv("ORT_MTP_COMPARE_GRAPH_EAGER") != nullptr;
   // Capture the 1-token decode and the verify shapes up to N+1 tokens.
   auto& main_params = const_cast<GeneratorParams&>(params);
   main_params.max_graph_capture_length = num_speculative_tokens_ + 1;
@@ -274,18 +272,6 @@ void MtpGenerator::GenerateStepSingle(int32_t t) {
   // row 1 = the free prediction harvested when the draft is accepted.
   int32_t verify_argmax[2];
   ArgmaxMainRows(0, 2, verify_argmax);
-  if (compare_graph_eager_) {
-    const int32_t graph_argmax[2]{verify_argmax[0], verify_argmax[1]};
-    main_->RewindToLength(length_);
-    main_->state_->ForceEagerNextRun();
-    main_->AppendTokens(cpu_span<const int32_t>(verify));
-    ArgmaxMainRows(0, 2, verify_argmax);
-    if (graph_argmax[0] != verify_argmax[0] || graph_argmax[1] != verify_argmax[1]) {
-      std::fprintf(stderr,
-                   "EXP-017 length=%zu graph=[%d,%d] eager=[%d,%d]\n",
-                   length_, graph_argmax[0], graph_argmax[1], verify_argmax[0], verify_argmax[1]);
-    }
-  }
   const int32_t m = verify_argmax[0];
   ++trials_;
 
