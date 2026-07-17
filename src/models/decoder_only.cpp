@@ -115,6 +115,21 @@ void DecoderOnly_State::SnapshotState() {
     recurrent_state_->Snapshot();
 }
 
+bool DecoderOnly_State::HasCroppableRecurrentState() const {
+  return recurrent_state_ && recurrent_state_->HasStateAll();
+}
+
+void DecoderOnly_State::CropToAccepted(size_t new_length, size_t recurrent_position) {
+  // Roll the attention KV cache + position back to the committed length, and crop the recurrent
+  // state to the state AFTER verify token `recurrent_position` (no replay forward). Used by
+  // lossless multi-token MTP partial accept.
+  position_inputs_->RewindTo(new_length);
+  if (kv_cache_)
+    kv_cache_->RewindTo(new_length);
+  if (recurrent_state_)
+    recurrent_state_->CropToPosition(recurrent_position);
+}
+
 void DecoderOnly_State::UpdateInputsOutputs(DeviceSpan<int32_t>& next_tokens, DeviceSpan<int32_t> beam_indices, int total_length) {
   input_ids_.Update(next_tokens);
   size_t new_length = static_cast<size_t>(input_ids_.GetShape()[1]);
@@ -147,6 +162,8 @@ void DecoderOnly_State::UpdateInputsOutputs(DeviceSpan<int32_t>& next_tokens, De
     hidden_states_->Update(static_cast<int>(new_length));
   if (hidden_states_output_)
     hidden_states_output_->Update(static_cast<int>(new_length));
+  if (recurrent_state_)
+    recurrent_state_->UpdateAll(static_cast<int>(new_length));
   logits_.Update(next_tokens, new_length);
 }
 
