@@ -40,7 +40,6 @@ struct RecurrentState {
  private:
   void ZeroStates(std::vector<std::unique_ptr<OrtValue>>& states);
   void CopyStates(const std::vector<std::unique_ptr<OrtValue>>& src, std::vector<std::unique_ptr<OrtValue>>& dst);
-  void SyncConvPasts(const std::vector<std::unique_ptr<OrtValue>>& src);
 
   State& state_;
   const Model& model_{state_.model_};
@@ -66,7 +65,6 @@ struct RecurrentState {
 
   // WebGPU cannot alias input/output buffers, so it uses separate past/present\n  // with swap. All other EPs share buffers for stable addresses.
   bool share_buffers_{false};
-  bool separate_conv_buffers_{false};
   size_t input_index_{~0U};
   size_t output_index_{~0U};
 
