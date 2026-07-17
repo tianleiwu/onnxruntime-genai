@@ -157,6 +157,8 @@ struct DeviceInterface {
   // implementation, in which case the caller falls back to a host-side argmax.
   // NOTE: keep this at the end of the struct to avoid shifting the vtable layout (ABI stability).
   virtual bool ArgMax(const void* /*logits*/, ONNXTensorElementDataType /*logits_type*/, int /*num_rows*/, int /*vocab_size*/, int32_t* /*out_tokens*/) { return false; }
+  virtual bool Top2(const void* /*logits*/, ONNXTensorElementDataType /*logits_type*/, int /*num_rows*/, int /*vocab_size*/,
+                    int32_t* /*out_tokens*/, float* /*out_scores*/) { return false; }
 };
 
 // A shared_ptr based type that we expose through our C API should inherit from this type.

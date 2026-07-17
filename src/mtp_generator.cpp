@@ -144,6 +144,23 @@ void MtpGenerator::ArgmaxMainRows(int first_row, int num_rows, int32_t* out) {
   auto info = raw->GetTensorTypeAndShapeInfo();
   const ONNXTensorElementDataType type = info->GetElementType();
 
+  if (std::getenv("ORT_MTP_LOG_TOP2_MARGINS") != nullptr) {
+    std::vector<int32_t> top2_tokens(static_cast<size_t>(num_rows) * 2);
+    std::vector<float> top2_scores(static_cast<size_t>(num_rows) * 2);
+    const uint8_t* base = static_cast<const uint8_t*>(raw->GetTensorRawData());
+    const void* rows = base + static_cast<size_t>(first_row) * vocab_size_ * Ort::SizeOf(type);
+    if (main_model_.p_device_->Top2(rows, type, num_rows, vocab_size_, top2_tokens.data(), top2_scores.data())) {
+      for (int row = 0; row < num_rows; ++row) {
+        std::cout << "MTP_TOP2 row=" << first_row + row
+                  << " top1=" << top2_tokens[row * 2]
+                  << " top2=" << top2_tokens[row * 2 + 1]
+                  << " margin=" << top2_scores[row * 2] - top2_scores[row * 2 + 1] << std::endl;
+        out[row] = top2_tokens[row * 2];
+      }
+      return;
+    }
+  }
+
   // The CUDA distributed-select Top-K implementation is batch-1 only. The N=1 MTP verify uses
   // two rows and is covered by its existing tuned path, but N>1 verifies have 3+ rows. Submit
   // those rows independently so each invocation uses the proven batch-1 path while keeping the
