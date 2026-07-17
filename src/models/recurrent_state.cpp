@@ -148,9 +148,19 @@ RecurrentState::RecurrentState(State& state)
       throw std::runtime_error("ORT_MTP_STATE_ALL_BINDING must be all, conv, recurrent, or none");
     }
 
-    // Per-position shapes: insert the seq_len axis at position 1 of the live-state shapes.
-    conv_all_shape_ = {conv_shape_[0], 0, conv_shape_[1], conv_shape_[2]};
-    recurrent_all_shape_ = {recurrent_shape_[0], 0, recurrent_shape_[1], recurrent_shape_[2], recurrent_shape_[3]};
+    conv_all_shape_ = fix_batch_dim(model_.session_info_.GetOutputShape(
+        ComposeKeyValueName(present_conv_all_template, layer_indices_[0])));
+    recurrent_all_shape_ = fix_batch_dim(model_.session_info_.GetOutputShape(
+      ComposeKeyValueName(present_recurrent_all_template, layer_indices_[0])));
+    if (conv_all_shape_.size() != 4 || recurrent_all_shape_.size() != 5) {
+      throw std::runtime_error("RecurrentState: invalid present_state_all rank");
+    }
+    if (conv_all_shape_[1] > 0 || recurrent_all_shape_[1] > 0) {
+      if (conv_all_shape_[1] <= 0 || conv_all_shape_[1] != recurrent_all_shape_[1]) {
+        throw std::runtime_error("RecurrentState: inconsistent fixed present_state_all capacity");
+      }
+      state_all_capacity_ = conv_all_shape_[1];
+    }
     presents_all_.reserve(num_layers * 2);
     for (int i = 0; i < num_layers; ++i) {
       output_all_name_strings_.push_back(ComposeKeyValueName(present_conv_all_template, layer_indices_[i]));
@@ -196,6 +206,26 @@ void RecurrentState::Add() {
 
 void RecurrentState::UpdateAll(int sequence_length) {
   if (!has_state_all_) return;
+  if (state_all_capacity_ > 0) {
+    if (sequence_length > state_all_capacity_) {
+      throw std::runtime_error("RecurrentState: sequence length exceeds present_state_all capacity");
+    }
+    if (presents_all_[0]->GetOrtTensor() != nullptr) return;
+
+    size_t output_index = output_all_index_;
+    const int num_layers = static_cast<int>(layer_indices_.size());
+    for (int i = 0; i < num_layers; ++i) {
+      if (bind_conv_all_) {
+        presents_all_[i * 2]->CreateTensor(conv_all_shape_, true);
+        state_.outputs_[output_index++] = presents_all_[i * 2]->GetOrtTensor();
+      }
+      if (bind_recurrent_all_) {
+        presents_all_[i * 2 + 1]->CreateTensor(recurrent_all_shape_, true);
+        state_.outputs_[output_index++] = presents_all_[i * 2 + 1]->GetOrtTensor();
+      }
+    }
+    return;
+  }
   // Only rebuild when the sequence length changes (matches HiddenStatesOutputs). conv_all_shape_[1]
   // and recurrent_all_shape_[1] track together.
   if (static_cast<int64_t>(sequence_length) == conv_all_shape_[1]) return;

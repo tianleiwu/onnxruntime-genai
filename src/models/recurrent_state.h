@@ -61,6 +61,7 @@ struct RecurrentState {
   std::vector<std::unique_ptr<Tensor>> presents_all_;
   std::vector<int64_t> conv_all_shape_;       // [B, seq_len, C, K-1] (seq at axis 1)
   std::vector<int64_t> recurrent_all_shape_;  // [B, seq_len, H_kv, d_k, d_v]
+  int64_t state_all_capacity_{0};
   size_t output_all_index_{~0U};
 
   // WebGPU cannot alias input/output buffers, so it uses separate past/present\n  // with swap. All other EPs share buffers for stable addresses.

@@ -1067,6 +1067,9 @@ class Qwen35TextModel(Model):
         self._emit_recurrent_state_all = str(
             extra_options.get("emit_recurrent_state_all", "false")
         ).lower() in ("1", "true", "yes")
+        self._recurrent_state_all_capacity = int(extra_options.get("recurrent_state_all_capacity", 0))
+        if self._recurrent_state_all_capacity < 0:
+            raise ValueError("recurrent_state_all_capacity must be non-negative")
 
         # Replace standard KV cache I/O with hybrid cache I/O
         self._setup_hybrid_cache_io()
@@ -1139,7 +1142,7 @@ class Qwen35TextModel(Model):
                     self.output_types[f"present_state.{i}.conv_all"] = state_dtype
                     self.output_shapes[f"present_state.{i}.conv_all"] = [
                         "batch_size",
-                        "sequence_length",
+                        self._recurrent_state_all_capacity or "sequence_length",
                         self.linear_conv_dim,
                         self.linear_conv_kernel_dim - 1,
                     ]
@@ -1148,7 +1151,7 @@ class Qwen35TextModel(Model):
                     self.output_types[f"present_state.{i}.recurrent_all"] = state_dtype
                     self.output_shapes[f"present_state.{i}.recurrent_all"] = [
                         "batch_size",
-                        "sequence_length",
+                        self._recurrent_state_all_capacity or "sequence_length",
                         self.linear_num_value_heads,
                         self.linear_key_head_dim,
                         self.linear_value_head_dim,
@@ -1720,7 +1723,8 @@ class Qwen35TextModel(Model):
             output_shape=["batch_size", conv_dim, "sequence_length"],
             present_conv_shape=["batch_size", conv_dim, kernel_size - 1],
             present_conv_state_all=(f"present.{layer_id}.conv_state_all" if getattr(self, "_emit_recurrent_state_all", False) else None),
-            present_conv_all_shape=["batch_size", "sequence_length", conv_dim, kernel_size - 1],
+            present_conv_all_shape=["batch_size", self._recurrent_state_all_capacity or "sequence_length", conv_dim, kernel_size - 1],
+            state_all_capacity=self._recurrent_state_all_capacity,
         )
         silu_output = f"{conv_op_name}/output_0"
 
@@ -1764,7 +1768,8 @@ class Qwen35TextModel(Model):
             output_shape=["batch_size", "sequence_length", v_dim],
             present_recurrent_shape=["batch_size", n_kv, hk, hv],
             present_recurrent_state_all=(f"present.{layer_id}.recurrent_state_all" if getattr(self, "_emit_recurrent_state_all", False) else None),
-            present_recurrent_all_shape=["batch_size", "sequence_length", n_kv, hk, hv],
+            present_recurrent_all_shape=["batch_size", self._recurrent_state_all_capacity or "sequence_length", n_kv, hk, hv],
+            state_all_capacity=self._recurrent_state_all_capacity,
         )
         la_output = f"{la_op_name}/output_0"
 
