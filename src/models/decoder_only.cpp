@@ -1,6 +1,8 @@
 #include "../generators.h"
 #include "decoder_only.h"
 
+#include <cstdlib>
+
 namespace Generators {
 DecoderOnly_Model::DecoderOnly_Model(std::unique_ptr<Config> config, OrtEnv& ort_env)
     : Model{std::move(config)} {
@@ -65,6 +67,9 @@ DeviceSpan<float> DecoderOnly_State::Run(int total_length, DeviceSpan<int32_t>& 
     // each captured length getting its own annotation id / static buffers.
     int seq_len = static_cast<int>(input_ids_.GetShape()[1]);
     bool graph_capture_this_run = params_->use_graph_capture && seq_len >= 1 && seq_len <= params_->max_graph_capture_length;
+    if (std::getenv("ORT_MTP_SKIP_GRAPH_REPLAY") != nullptr) {
+      graph_capture_this_run = false;
+    }
     State::Run(*model_.session_decoder_, graph_capture_this_run, seq_len);
 
     return logits_.Get();
