@@ -38,9 +38,6 @@ MtpGenerator::MtpGenerator(const Model& main_model, const Model& mtp_model, cons
     const int v = std::atoi(env);
     if (v >= 1) num_speculative_tokens_ = v;
   }
-  if (const char* env = std::getenv("ORT_MTP_VERIFY_MARGIN_THRESHOLD")) {
-    verify_margin_threshold_ = std::strtof(env, nullptr);
-  }
   // Capture the 1-token decode and the verify shapes up to N+1 tokens.
   auto& main_params = const_cast<GeneratorParams&>(params);
   main_params.max_graph_capture_length = num_speculative_tokens_ + 1;
@@ -199,22 +196,6 @@ void MtpGenerator::ArgmaxMainRows(int first_row, int num_rows, int32_t* out) {
     out[r] = ArgmaxRow(data + static_cast<size_t>(first_row + r) * vocab_size_, vocab_size_);
 }
 
-bool MtpGenerator::Top2MainRows(int first_row, int num_rows, int32_t* out, float* margins) {
-  OrtValue* raw = main_->state_->GetOutput(main_model_.config_->model.decoder.outputs.logits.c_str());
-  auto info = raw->GetTensorTypeAndShapeInfo();
-  const ONNXTensorElementDataType type = info->GetElementType();
-  const uint8_t* base = static_cast<const uint8_t*>(raw->GetTensorRawData());
-  const void* rows = base + static_cast<size_t>(first_row) * vocab_size_ * Ort::SizeOf(type);
-  std::vector<int32_t> tokens(static_cast<size_t>(num_rows) * 2);
-  std::vector<float> scores(static_cast<size_t>(num_rows) * 2);
-  if (!main_model_.p_device_->Top2(rows, type, num_rows, vocab_size_, tokens.data(), scores.data())) return false;
-  for (int row = 0; row < num_rows; ++row) {
-    out[row] = tokens[row * 2];
-    margins[row] = scores[row * 2] - scores[row * 2 + 1];
-  }
-  return true;
-}
-
 int32_t MtpGenerator::DraftNextToken(OrtValue* /*unused*/, int32_t token, bool need_draft) {
   // hidden_slice_ already holds the hidden state paired with `token`. Feed (hidden, token) to the
   // MTP head; its KV cache accumulates, so this is an O(1) incremental draft step.
@@ -307,13 +288,11 @@ void MtpGenerator::GenerateStepSingle(int32_t t) {
   // Argmax both verify rows on-device in one launch: row 0 = main's real token after t,
   // row 1 = the free prediction harvested when the draft is accepted.
   int32_t verify_argmax[2];
-  float verify_margins[2]{};
-  const bool guarded = verify_margin_threshold_ >= 0.0f && Top2MainRows(0, 2, verify_argmax, verify_margins);
-  if (!guarded) ArgmaxMainRows(0, 2, verify_argmax);
+  ArgmaxMainRows(0, 2, verify_argmax);
   const int32_t m = verify_argmax[0];
   ++trials_;
 
-  if (d == m && (!guarded || verify_margins[0] >= verify_margin_threshold_)) {
+  if (d == m) {
     // 2a. Accept: t and d are both correct. Commit d and harvest the free prediction at row 1.
     ++accepts_;
     sequence_.push_back(d);
@@ -322,20 +301,6 @@ void MtpGenerator::GenerateStepSingle(int32_t t) {
       return;
     }
     OrtValue* hidden = main_->state_->GetOutput(main_model_.config_->model.decoder.outputs.hidden_states.c_str());
-    if (guarded && verify_margins[1] < verify_margin_threshold_) {
-      has_pending_draft_ = false;
-      main_->RewindToLength(length_);
-      for (int32_t token : {t, d}) {
-        std::array<int32_t, 1> replay{token};
-        main_->AppendTokens(cpu_span<const int32_t>(replay));
-        ++forwards_;
-      }
-      OrtValue* replay_hidden = main_->state_->GetOutput(main_model_.config_->model.decoder.outputs.hidden_states.c_str());
-      ArgmaxMainRows(0, 1, &next_token_);
-      ExtractHiddenPosition(replay_hidden, 0);
-      length_ += 2;
-      return;
-    }
     // Next token to commit is argmax(logits@L+1) (harvested above).
     next_token_ = verify_argmax[1];
     // Fuse the post-accept KV-advance (hidden@L, d) and the next step's draft (hidden@L+1,
@@ -385,16 +350,12 @@ void MtpGenerator::GenerateStepMulti(int32_t t) {
   for (int k = 0; k < N; ++k) verify_tokens_[k + 1] = drafts_[k];
   main_->AppendTokens(cpu_span<const int32_t>(verify_tokens_.data(), N + 1));
   ++forwards_;
-  std::vector<float> verify_margins(static_cast<size_t>(N) + 1);
-  const bool guarded = verify_margin_threshold_ >= 0.0f &&
-                       Top2MainRows(0, N + 1, verify_argmax_.data(), verify_margins.data());
-  if (!guarded) ArgmaxMainRows(0, N + 1, verify_argmax_.data());
+  ArgmaxMainRows(0, N + 1, verify_argmax_.data());  // main's real token after each verify position
   OrtValue* vhidden = main_->state_->GetOutput(hs_name.c_str());
 
   // --- Longest accepted prefix (greedy match against the main model). ---
   int a = 0;
-    while (a < N && drafts_[a] == verify_argmax_[a] &&
-      (!guarded || verify_margins[a] >= verify_margin_threshold_)) ++a;
+  while (a < N && drafts_[a] == verify_argmax_[a]) ++a;
   trials_ += (a < N) ? static_cast<size_t>(a + 1) : static_cast<size_t>(N);  // conditional trials
   accepts_ += static_cast<size_t>(a);
 
@@ -420,20 +381,14 @@ void MtpGenerator::GenerateStepMulti(int32_t t) {
     DraftHeadStep(drafts_[k], /*need_draft=*/false);  // re-append with the main hidden (no argmax)
   }
 
-  const bool ambiguous_bonus = guarded && verify_margins[a] < verify_margin_threshold_;
-  if (!ambiguous_bonus && a == N) {
+  if (a == N) {
     // All drafts accepted: the batched verify already committed [t, d0..d_{N-1}] correctly, so the
     // main KV / recurrent state is exactly at L + (N+1). The bonus token is main's prediction at the
     // last verify row (mirrors the N=1 accept path, which likewise commits a batched-forward token).
     next_token_ = verify_argmax_[a];
     CopyHiddenRow(vhidden, a, *hidden_slice_);
     length_ += static_cast<size_t>(N) + 1;
-  } else if (!ambiguous_bonus && main_->CanCropRecurrentState()) {
-    main_->CropToAccepted(length_ + static_cast<size_t>(a) + 1, static_cast<size_t>(a));
-    next_token_ = verify_argmax_[a];
-    CopyHiddenRow(vhidden, a, *hidden_slice_);
-    length_ += static_cast<size_t>(a) + 1;
-  } else if (main_->CanCropRecurrentState() && a >= 1 && !guarded) {
+  } else if (main_->CanCropRecurrentState() && a >= 1) {
     // Partial accept (a>=1), LOSSLESS CROP fast-path (model exported with emit_recurrent_state_all).
     // The batched verify's row a is an EARLY row of a wide (M=N+1) forward, whose argmax is NOT
     // decode-consistent (only the LAST row of a forward matches a 1-token decode; §13.1). So we
@@ -462,19 +417,11 @@ void MtpGenerator::GenerateStepMulti(int32_t t) {
     main_->RewindToLength(length_);
     verify_tokens_[0] = t;
     for (int k = 0; k < a; ++k) verify_tokens_[k + 1] = drafts_[k];
-    if (guarded) {
-      for (int k = 0; k <= a; ++k) {
-        std::array<int32_t, 1> replay{verify_tokens_[k]};
-        main_->AppendTokens(cpu_span<const int32_t>(replay));
-        ++forwards_;
-      }
-    } else {
-      main_->AppendTokens(cpu_span<const int32_t>(verify_tokens_.data(), a + 1));
-      ++forwards_;
-    }
+    main_->AppendTokens(cpu_span<const int32_t>(verify_tokens_.data(), a + 1));
+    ++forwards_;
     OrtValue* rhidden = main_->state_->GetOutput(hs_name.c_str());
-    ArgmaxMainRows(guarded ? 0 : a, 1, &next_token_);        // main's token after the committed prefix
-    CopyHiddenRow(rhidden, guarded ? 0 : a, *hidden_slice_);  // hidden paired with the bonus token
+    ArgmaxMainRows(a, 1, &next_token_);        // main's token after the committed prefix
+    CopyHiddenRow(rhidden, a, *hidden_slice_);  // hidden paired with the bonus token
     length_ += static_cast<size_t>(a) + 1;
   }
 }
