@@ -101,7 +101,8 @@ RecurrentState::RecurrentState(State& state)
   // for stable addresses (required by TRT-RTX graph replay, beneficial elsewhere).
   // TODO: Remove WebGPU special case once the ORT WebGPU EP adds a
   // LinearAttention kernel with native past/present buffer sharing support.
-  share_buffers_ = model_.p_device_kvcache_->GetType() != DeviceType::WEBGPU;
+  fixed_separate_buffers_ = GetEnv("ORT_MTP_SEPARATE_RECURRENT_BUFFERS") == "1";
+  share_buffers_ = model_.p_device_kvcache_->GetType() != DeviceType::WEBGPU && !fixed_separate_buffers_;
 
   if (!share_buffers_) {
     pasts_.resize(num_layers * 2);
@@ -245,6 +246,11 @@ void RecurrentState::CropToPosition(size_t position) {
 
 void RecurrentState::Update() {
   if (layer_indices_.empty() || share_buffers_) return;
+
+  if (fixed_separate_buffers_) {
+    CopyStates(presents_, pasts_);
+    return;
+  }
 
   const int num_layers = static_cast<int>(layer_indices_.size());
   for (int i = 0; i < num_layers * 2; ++i) {
