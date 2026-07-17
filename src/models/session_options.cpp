@@ -4,7 +4,6 @@
 #include "session_options.h"
 
 #include <algorithm>
-#include <cstdlib>
 #include <functional>
 #include <unordered_map>
 
@@ -106,9 +105,6 @@ bool AppendExecutionProviderV2(
     const Config::ProviderOptions& provider_options,
     DeviceType device_type,
     const std::string& ep_name) {
-  if (device_type == DeviceType::CUDA && std::getenv("ORT_GENAI_FORCE_CUDA_V1") != nullptr) {
-    return false;
-  }
   auto ep_devices_ptrs = FindRegisteredEpDevices(ep_name);
   if (ep_devices_ptrs.empty()) return false;  // Not registered
 
