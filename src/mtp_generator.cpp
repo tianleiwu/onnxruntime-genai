@@ -371,11 +371,6 @@ void MtpGenerator::GenerateStepMulti(int32_t t) {
     next_token_ = verify_argmax_[a];
     CopyHiddenRow(vhidden, a, *hidden_slice_);
     length_ += static_cast<size_t>(N) + 1;
-  } else if (std::getenv("ORT_MTP_DIRECT_ARENA_COMMIT") != nullptr && main_->CanCropRecurrentState()) {
-    main_->CropToAccepted(length_ + static_cast<size_t>(a) + 1, static_cast<size_t>(a));
-    next_token_ = verify_argmax_[a];
-    CopyHiddenRow(vhidden, a, *hidden_slice_);
-    length_ += static_cast<size_t>(a) + 1;
   } else if (main_->CanCropRecurrentState() && a >= 1) {
     // Partial accept (a>=1), LOSSLESS CROP fast-path (model exported with emit_recurrent_state_all).
     // The batched verify's row a is an EARLY row of a wide (M=N+1) forward, whose argmax is NOT
