@@ -768,12 +768,27 @@ void MtpGenerator::GenerateStepMultiSample(int32_t t) {
     next_token_ = SampleSparse(target_idx_[N], target_prob_[N], rng_);
     CopyHiddenRow(vhidden, N, *hidden_slice_);  // hidden that predicted the bonus token
     length_ += static_cast<size_t>(N) + 1;
+  } else if (main_->CanCropRecurrentState()) {
+    // Rejected at position a, LOSSLESS-CROP fast path (model exported with emit_recurrent_state_all):
+    // skip the full re-run main forward (~25% of N=3 step time). The batched verify already advanced
+    // the recurrent state through every token (present_state_all[:, a] = state AFTER the committed
+    // prefix [t, d0..d_{a-1}]) and computed row a's hidden -- which is exactly the hidden that
+    // predicts the correction (a causal hidden is independent of the rejected drafts that follow it,
+    // so verify row a == the re-run's row a). So crop the KV + recurrent state to L+a+1 and pair the
+    // already-sampled correction with verify row a. Unlike the GREEDY path (which needs a decode-
+    // consistent argmax bonus and therefore re-runs losslessly), rejection sampling corrects the
+    // OUTPUT distribution regardless of the wide-verify state's small (~0.25 fp16) drift from
+    // sequential decode -- and the accept-all sampling branch above already carries the wide-verify
+    // recurrent numerics forward -- so the crop is distribution-safe here and avoids the replay.
+    main_->CropToAccepted(length_ + static_cast<size_t>(a) + 1, static_cast<size_t>(a));
+    next_token_ = correction;
+    CopyHiddenRow(vhidden, a, *hidden_slice_);  // verify row a: hidden that predicts the correction
+    length_ += static_cast<size_t>(a) + 1;
   } else {
-    // Rejected at position a: the batched verify over-appended N-a wrong tokens and cannot be
-    // partially cropped (the linear-attention recurrent state has no per-token rollback). Restore
-    // the recurrent snapshot at L and re-run only the committed prefix [t, d0..d_{a-1}] so the
-    // carried recurrent/KV state is decode-consistent; pair the sampled correction (already drawn
-    // from the batched verify's residual) with the re-run's hidden at row a.
+    // Fallback (model without emit_recurrent_state_all): the recurrent state cannot be cropped, so
+    // restore the snapshot at L and re-run only the committed prefix [t, d0..d_{a-1}] so the carried
+    // recurrent/KV state is decode-consistent; pair the sampled correction (already drawn from the
+    // batched verify's residual) with the re-run's hidden at row a.
     main_->RewindToLength(length_);
     verify_tokens_[0] = t;
     for (int k = 0; k < a; ++k) verify_tokens_[k + 1] = drafts_[k];
