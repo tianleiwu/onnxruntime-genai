@@ -225,6 +225,54 @@ struct CudaInterfaceImplBase : DeviceInterface {
     return true;
   }
 
+  bool TopKScores(const void* logits, ONNXTensorElementDataType logits_type, int num_rows, int vocab_size,
+                  int k, int32_t* out_tokens, float* out_scores) override {
+    if (num_rows <= 0 || vocab_size <= 1 || k <= 0) return false;
+    k = std::min(k, vocab_size);
+
+    cudaStream_t stream = GetStream();
+    const float* scores = nullptr;
+    const size_t element_count = static_cast<size_t>(num_rows) * vocab_size;
+    if (logits_type == Ort::TypeToTensorType<float>) {
+      scores = reinterpret_cast<const float*>(logits);
+    } else if (logits_type == Ort::TypeToTensorType<Ort::Float16_t>) {
+      if (argmax_fp32_count_ < element_count) {
+        argmax_fp32_ = CudaMallocArray<float>(element_count);
+        argmax_fp32_count_ = element_count;
+      }
+      cuda::LaunchFp16ToFp32(reinterpret_cast<const uint16_t*>(logits), argmax_fp32_.get(), static_cast<int>(element_count), stream);
+      scores = argmax_fp32_.get();
+    } else {
+      return false;
+    }
+
+    if (!topk_data_ || topk_batch_ < num_rows || topk_vocab_ != vocab_size) {
+      topk_data_ = std::make_unique<cuda::TopkData>(num_rows, vocab_size, stream);
+      topk_batch_ = num_rows;
+      topk_vocab_ = vocab_size;
+    }
+    // select_sort writes exactly k sorted-descending (index, score) pairs per row (stride k).
+    cuda::select_sort::RunTopK(topk_data_.get(), stream, scores, vocab_size, num_rows, k);
+
+    const size_t result_count = static_cast<size_t>(num_rows) * k;
+    if (!topk_indices_host_ || topk_host_count_ < result_count) {
+      topk_indices_host_ = CudaMallocHostArray<int32_t>(result_count);
+      topk_scores_host_ = CudaMallocHostArray<float>(result_count);
+      topk_host_count_ = result_count;
+    }
+    const size_t source_pitch = static_cast<size_t>(topk_data_->topk_stride);
+    CUDA_CHECK(cudaMemcpy2DAsync(topk_indices_host_.get(), static_cast<size_t>(k) * sizeof(int32_t),
+                                 topk_data_->topk_indices, source_pitch * sizeof(int32_t),
+                                 static_cast<size_t>(k) * sizeof(int32_t), num_rows, cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpy2DAsync(topk_scores_host_.get(), static_cast<size_t>(k) * sizeof(float),
+                                 topk_data_->topk_scores, source_pitch * sizeof(float),
+                                 static_cast<size_t>(k) * sizeof(float), num_rows, cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    std::memcpy(out_tokens, topk_indices_host_.get(), result_count * sizeof(int32_t));
+    std::memcpy(out_scores, topk_scores_host_.get(), result_count * sizeof(float));
+    return true;
+  }
+
   bool UpdatePositionIds(void* position_ids, int batch_beam_size, int total_length, int new_kv_length, ONNXTensorElementDataType type) override {
     if (type == Ort::TypeToTensorType<int32_t>)
       cuda::Launch_UpdatePositionIds(static_cast<int32_t*>(position_ids), batch_beam_size, total_length, new_kv_length, GetStream());
@@ -284,6 +332,9 @@ struct CudaInterfaceImplBase : DeviceInterface {
   cuda_host_unique_ptr<int32_t> top2_indices_host_;
   cuda_host_unique_ptr<float> top2_scores_host_;
   size_t top2_host_count_{0};
+  cuda_host_unique_ptr<int32_t> topk_indices_host_;  // pinned host buffer for the top-k index copy
+  cuda_host_unique_ptr<float> topk_scores_host_;     // pinned host buffer for the top-k score copy
+  size_t topk_host_count_{0};
 };
 
 struct CudaInterfaceImpl final : CudaInterfaceImplBase {

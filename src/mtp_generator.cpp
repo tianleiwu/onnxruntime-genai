@@ -6,9 +6,12 @@
 #include "constrained_logits_processor.h"
 #include "models/model.h"
 #include "mtp_generator.h"
+#include "speculative_sampling.h"
 
 #include <cstdlib>
 #include <cstring>
+#include <cmath>
+#include <random>
 
 namespace Generators {
 
@@ -24,6 +27,29 @@ int32_t ArgmaxRow(const float* row, int vocab_size) {
     }
   }
   return best;
+}
+
+// Probability that a truncated target distribution (sparse: kept ids + renormalized probs) assigns
+// to `token`; 0 if the token fell outside the kept nucleus.
+float SparseProbability(const std::vector<int32_t>& idx, const std::vector<float>& prob, int32_t token) {
+  for (size_t i = 0; i < idx.size(); ++i)
+    if (idx[i] == token) return prob[i];
+  return 0.0f;
+}
+
+// Expand a sparse truncated distribution (kept ids + probs) into a full-vocab dense vector.
+void DensifyRow(const std::vector<int32_t>& idx, const std::vector<float>& prob, int vocab_size,
+                std::vector<float>& dense) {
+  dense.assign(static_cast<size_t>(vocab_size), 0.0f);
+  for (size_t i = 0; i < idx.size(); ++i)
+    dense[static_cast<size_t>(idx[i])] = prob[i];
+}
+
+// Draw a token from a sparse truncated distribution (kept ids + renormalized probs). Cheap: the
+// kept set is only ~top_k tokens, so this avoids any full-vocab (150K+) work on the hot path.
+int32_t SampleSparse(const std::vector<int32_t>& idx, const std::vector<float>& prob, std::mt19937& rng) {
+  std::discrete_distribution<int> dist(prob.begin(), prob.end());
+  return idx[static_cast<size_t>(dist(rng))];
 }
 }  // namespace
 
@@ -53,6 +79,24 @@ MtpGenerator::MtpGenerator(const Model& main_model, const Model& mtp_model, cons
   vocab_size_ = main_model_.config_->model.vocab_size;
   max_length_ = params.search.max_length;
 
+  // Speculative sampling: when the caller requests randomized sampling (do_sample) with a positive
+  // temperature, drafts are sampled from their truncated distribution and accepted via the
+  // Leviathan/Chen rejection test, so MTP draws from the same distribution as plain top-k/top-p
+  // decoding (see GenerateStepMultiSample). Greedy (do_sample=false or temperature==0) keeps the
+  // original argmax accept path.
+  sampling_ = params.search.do_sample && params.search.temperature > 0.0f;
+  top_k_ = params.search.top_k;
+  top_p_ = params.search.top_p;
+  temperature_ = params.search.temperature;
+  if (sampling_) {
+    if (params.search.random_seed == -1) {
+      std::random_device rd;
+      rng_.seed(rd());
+    } else {
+      rng_.seed(static_cast<uint32_t>(params.search.random_seed));
+    }
+  }
+
   // Reusable [1, 1, hidden] device buffer for the on-device hidden-state handoff.
   hidden_slice_ = std::make_shared<Tensor>(
       main_model_.p_device_inputs_,
@@ -70,7 +114,8 @@ MtpGenerator::MtpGenerator(const Model& main_model, const Model& mtp_model, cons
 
   // Multi-token (N>1) scratch: the head's own hidden output (chain feedback) and a re-feed buffer
   // used to re-materialize accepted drafts in the head KV with the main model's hidden states.
-  if (num_speculative_tokens_ > 1) {
+  // Speculative sampling (any N, including N=1) uses the same chained draft/verify machinery.
+  if (num_speculative_tokens_ > 1 || sampling_) {
     head_out_hidden_ = std::make_shared<Tensor>(
       mtp_model_.p_device_inputs_,
       mtp_model_.session_info_.GetInputDataType(mtp_model_.config_->model.decoder.inputs.hidden_states));
@@ -82,6 +127,21 @@ MtpGenerator::MtpGenerator(const Model& main_model, const Model& mtp_model, cons
     drafts_.resize(num_speculative_tokens_);
     verify_tokens_.resize(num_speculative_tokens_ + 1);
     verify_argmax_.resize(num_speculative_tokens_ + 1);
+  }
+  if (sampling_) {
+    draft_idx_.resize(num_speculative_tokens_);
+    draft_prob_.resize(num_speculative_tokens_);
+    target_idx_.resize(num_speculative_tokens_ + 1);
+    target_prob_.resize(num_speculative_tokens_ + 1);
+    // Per-size [1,j,H] hidden buffers (j=1..N) for the batched head refeed (one forward instead of a).
+    refeed_multi_.resize(static_cast<size_t>(num_speculative_tokens_) + 1);
+    for (int j = 1; j <= num_speculative_tokens_; ++j) {
+      refeed_multi_[j] = std::make_shared<Tensor>(
+        mtp_model_.p_device_inputs_,
+        mtp_model_.session_info_.GetInputDataType(mtp_model_.config_->model.decoder.inputs.hidden_states));
+      const std::array<int64_t, 3> sh{1, j, hidden_size_};
+      refeed_multi_[j]->CreateTensor(sh);
+    }
   }
 }
 
@@ -117,6 +177,13 @@ int32_t MtpGenerator::DraftHeadStep(int32_t token, bool need_draft) {
   }
 
   // Capture the head's recurrent feedback hidden (hidden_states_out, the single processed row).
+  CaptureHeadFeedbackHidden();
+  return draft;
+}
+
+void MtpGenerator::CaptureHeadFeedbackHidden() {
+  // Capture the head's own post-final-norm output (hidden_states_out, the single processed row)
+  // into head_out_hidden_ for the next chained draft step.
   OrtValue* head_hidden = mtp_->state_->GetOutput("hidden_states_out");
   if (head_hidden == nullptr) {
     throw std::runtime_error(
@@ -136,7 +203,92 @@ int32_t MtpGenerator::DraftHeadStep(int32_t token, bool need_draft) {
     auto src = ByteWrapTensor(*mtp_model_.p_device_, *head_hidden);
     dst.CopyFrom(src.subspan(0, row_bytes));
   }
+}
+
+int32_t MtpGenerator::DraftHeadStepSample(int32_t token, int k) {
+  // Same KV-advance + hidden-feedback capture as DraftHeadStep, but the draft is SAMPLED from its
+  // truncated distribution q (top_k/top_p/temperature). The sparse q (kept ids + renormalized
+  // probs) is stored in draft_idx_[k]/draft_prob_[k] so the verify step can compute the
+  // min(1, p(d)/q(d)) acceptance test with a cheap sparse probability lookup.
+  std::array<int32_t, 1> tok{token};
+  mtp_->AppendTokens(cpu_span<const int32_t>(tok));
+  ++head_len_;
+
+  auto logits_span = mtp_->GetLogits();  // fp32, last token, [1, V]
+  const int fp32_type = static_cast<int>(Ort::TypeToTensorType<float>);
+  if (TopKScoresRows(logits_span.Span().data(), fp32_type, 1, *mtp_model_.p_device_)) {
+    SparseFromTopKRow(0, draft_idx_[k], draft_prob_[k]);
+  } else {
+    auto cpu = logits_span.CopyDeviceToCpu();
+    ComputeSampledCategorical(std::span<const float>(cpu.data(), static_cast<size_t>(vocab_size_)),
+                              top_k_, top_p_, temperature_, sampled_scratch_);
+    draft_idx_[k] = sampled_scratch_.indices;
+    draft_prob_[k] = sampled_scratch_.probs;
+  }
+  int32_t draft = SampleSparse(draft_idx_[k], draft_prob_[k], rng_);
+
+  CaptureHeadFeedbackHidden();
   return draft;
+}
+
+const float* MtpGenerator::MainLogitsRowsCpu(int first_row, int num_rows) {
+  OrtValue* raw = main_->state_->GetOutput(main_model_.config_->model.decoder.outputs.logits.c_str());
+  // Cast to fp32 on device (cheap kernel), then copy only the requested rows to the host.
+  Cast(*raw, logits_fp32_, *main_model_.p_device_, Ort::TypeToTensorType<float>);
+  auto span = ByteWrapTensor(*main_model_.p_device_, *logits_fp32_);
+  const size_t row_bytes = static_cast<size_t>(vocab_size_) * sizeof(float);
+  auto rows = span.subspan(static_cast<size_t>(first_row) * row_bytes,
+                           static_cast<size_t>(num_rows) * row_bytes);
+  auto cpu = rows.CopyDeviceToCpu();
+  const float* data = reinterpret_cast<const float*>(cpu.data());
+  main_logits_cpu_.assign(data, data + static_cast<size_t>(num_rows) * vocab_size_);
+  return main_logits_cpu_.data();
+}
+
+bool MtpGenerator::TopKScoresRows(const void* logits, int onnx_type, int num_rows, DeviceInterface& dev) {
+  topk_k_ = std::min(top_k_, vocab_size_);
+  const size_t need = static_cast<size_t>(num_rows) * topk_k_;
+  topk_tok_scratch_.resize(need);
+  topk_score_scratch_.resize(need);
+  return dev.TopKScores(logits, static_cast<ONNXTensorElementDataType>(onnx_type), num_rows, vocab_size_,
+                        topk_k_, topk_tok_scratch_.data(), topk_score_scratch_.data());
+}
+
+void MtpGenerator::SparseFromTopKRow(int row, std::vector<int32_t>& idx, std::vector<float>& prob) {
+  // The device returns the k top scores sorted descending; apply temperature softmax over them and
+  // a top-p nucleus cutoff -- identical to ComputeSampledCategorical's top-k branch, but over only
+  // the k values that left the GPU (no full-vocab host work).
+  const int k = topk_k_;
+  const int32_t* toks = topk_tok_scratch_.data() + static_cast<size_t>(row) * k;
+  const float* scs = topk_score_scratch_.data() + static_cast<size_t>(row) * k;
+  const float inv_temp = 1.0f / temperature_;
+  topk_prob_scratch_.resize(static_cast<size_t>(k));
+  const float maxs = scs[0];
+  float sum = 0.0f;
+  for (int j = 0; j < k; ++j) {
+    const float e = std::exp((scs[j] - maxs) * inv_temp);
+    topk_prob_scratch_[j] = e;
+    sum += e;
+  }
+  const float invs = sum > 0.0f ? 1.0f / sum : 0.0f;
+  for (int j = 0; j < k; ++j) topk_prob_scratch_[j] *= invs;
+  int keep = k;
+  if (top_p_ > 0.0f && top_p_ < 1.0f) {
+    float cum = 0.0f;
+    for (int j = 0; j < k; ++j) {
+      cum += topk_prob_scratch_[j];
+      if (cum >= top_p_) {
+        keep = j + 1;
+        break;
+      }
+    }
+  }
+  float ks = 0.0f;
+  for (int j = 0; j < keep; ++j) ks += topk_prob_scratch_[j];
+  const float ki = ks > 0.0f ? 1.0f / ks : 0.0f;
+  idx.assign(toks, toks + keep);
+  prob.resize(static_cast<size_t>(keep));
+  for (int j = 0; j < keep; ++j) prob[j] = topk_prob_scratch_[j] * ki;
 }
 
 void MtpGenerator::ArgmaxMainRows(int first_row, int num_rows, int32_t* out) {
@@ -244,7 +396,30 @@ void MtpGenerator::AppendTokens(cpu_span<const int32_t> input_ids) {
   OrtValue* hidden = main_->state_->GetOutput(main_model_.config_->model.decoder.outputs.hidden_states.c_str());
   const int last = static_cast<int>(input_ids.size()) - 1;
   ExtractHiddenPosition(hidden, last);             // h for the token we are about to predict
-  ArgmaxMainRows(last, 1, &next_token_);           // token predicted for position length_
+  if (sampling_) {
+    // Sample the first generated token from the truncated target distribution at the last prompt
+    // position. Use the on-device top-k over just that row (no full-vocab cast/copy of prefill logits).
+    OrtValue* raw = main_->state_->GetOutput(main_model_.config_->model.decoder.outputs.logits.c_str());
+    auto info = raw->GetTensorTypeAndShapeInfo();
+    const int rtype = static_cast<int>(info->GetElementType());
+    const size_t elem = Ort::SizeOf(info->GetElementType());
+    const uint8_t* base = static_cast<const uint8_t*>(raw->GetTensorRawData());
+    const void* row_ptr = base + static_cast<size_t>(last) * vocab_size_ * elem;
+    std::vector<int32_t> idx;
+    std::vector<float> prob;
+    if (TopKScoresRows(row_ptr, rtype, 1, *main_model_.p_device_)) {
+      SparseFromTopKRow(0, idx, prob);
+    } else {
+      const float* rowf = MainLogitsRowsCpu(last, 1);
+      ComputeSampledCategorical(std::span<const float>(rowf, static_cast<size_t>(vocab_size_)),
+                                top_k_, top_p_, temperature_, sampled_scratch_);
+      idx = sampled_scratch_.indices;
+      prob = sampled_scratch_.probs;
+    }
+    next_token_ = SampleSparse(idx, prob, rng_);
+  } else {
+    ArgmaxMainRows(last, 1, &next_token_);         // token predicted for position length_
+  }
   has_pending_draft_ = false;
   primed_ = true;
 }
@@ -261,7 +436,9 @@ void MtpGenerator::GenerateNextToken() {
     return;
   }
 
-  if (num_speculative_tokens_ == 1)
+  if (sampling_)
+    GenerateStepMultiSample(t);
+  else if (num_speculative_tokens_ == 1)
     GenerateStepSingle(t);
   else
     GenerateStepMulti(t);
@@ -427,6 +604,132 @@ void MtpGenerator::GenerateStepMulti(int32_t t) {
     OrtValue* rhidden = main_->state_->GetOutput(hs_name.c_str());
     ArgmaxMainRows(a, 1, &next_token_);        // main's token after the committed prefix
     CopyHiddenRow(rhidden, a, *hidden_slice_);  // hidden paired with the bonus token
+    length_ += static_cast<size_t>(a) + 1;
+  }
+}
+
+void MtpGenerator::GenerateStepMultiSample(int32_t t) {
+  const int N = std::min(num_speculative_tokens_, static_cast<int>(max_length_ - length_ - 1));
+  const std::string& hs_name = main_model_.config_->model.decoder.outputs.hidden_states;
+
+  // --- Draft phase: chain the single MTP module N times, SAMPLING each draft d_k from its
+  //     truncated distribution q_k (top_k/top_p/temperature) and recording q_k for the accept test.
+  const size_t head_start = head_len_;
+  mtp_->SetHiddenStates(hidden_slice_);
+  drafts_[0] = DraftHeadStepSample(t, 0);
+  for (int k = 1; k < N; ++k) {
+    mtp_->SetHiddenStates(head_out_hidden_);
+    drafts_[k] = DraftHeadStepSample(drafts_[k - 1], k);
+  }
+
+  // --- Verify [t, d0..d_{N-1}] in a single batched main forward. ---
+  main_->SnapshotState();
+  verify_tokens_[0] = t;
+  for (int k = 0; k < N; ++k) verify_tokens_[k + 1] = drafts_[k];
+  main_->AppendTokens(cpu_span<const int32_t>(verify_tokens_.data(), N + 1));
+  ++forwards_;
+  OrtValue* vhidden = main_->state_->GetOutput(hs_name.c_str());
+
+  // Build each verify row's truncated target distribution p_k. Row k is the target's prediction for
+  // the position after [t, d0..d_{k-1}] -- it judges draft d_k (row N is the bonus position).
+  // Prefer the on-device top-k (only k*(N+1) values leave the GPU); fall back to a host cast+copy.
+  OrtValue* raw_logits = main_->state_->GetOutput(main_model_.config_->model.decoder.outputs.logits.c_str());
+  const int rtype = static_cast<int>(raw_logits->GetTensorTypeAndShapeInfo()->GetElementType());
+  if (TopKScoresRows(raw_logits->GetTensorRawData(), rtype, N + 1, *main_model_.p_device_)) {
+    for (int kk = 0; kk <= N; ++kk) SparseFromTopKRow(kk, target_idx_[kk], target_prob_[kk]);
+  } else {
+    const float* logits = MainLogitsRowsCpu(0, N + 1);
+    for (int kk = 0; kk <= N; ++kk) {
+      ComputeSampledCategorical(
+          std::span<const float>(logits + static_cast<size_t>(kk) * vocab_size_, static_cast<size_t>(vocab_size_)),
+          top_k_, top_p_, temperature_, sampled_scratch_);
+      target_idx_[kk] = sampled_scratch_.indices;
+      target_prob_[kk] = sampled_scratch_.probs;
+    }
+  }
+
+  // --- Speculative-sampling accept/reject over the N drafts. Accept d_a with probability
+  //     min(1, p_a(d_a)/q_a(d_a)); on the first rejection draw a correction from the residual
+  //     norm(max(0, p_a - q_a)). `a` is the number of accepted drafts. ---
+  std::uniform_real_distribution<float> uni(0.0f, 1.0f);
+  int a = 0;
+  int32_t correction = -1;
+  bool rejected = false;
+  for (; a < N; ++a) {
+    const int32_t d = drafts_[a];
+    const float p_t = SparseProbability(target_idx_[a], target_prob_[a], d);
+    const float p_d = SparseProbability(draft_idx_[a], draft_prob_[a], d);
+    if (uni(rng_) < ComputeAcceptProb(p_t, p_d))
+      continue;  // accept d_a
+    // Reject at position a: sample the correction from the normalized residual max(0, p_a - q_a).
+    // Densify only here (the rare reject path), never on the hot per-draft accept path.
+    DensifyRow(target_idx_[a], target_prob_[a], vocab_size_, dense_target_);
+    DensifyRow(draft_idx_[a], draft_prob_[a], vocab_size_, dense_draft_);
+    if (correction_buf_.empty()) correction_buf_.assign(static_cast<size_t>(vocab_size_), 0.0f);
+    BuildCorrectionDistribution(std::span<const float>(dense_target_.data(), static_cast<size_t>(vocab_size_)),
+                                std::span<const float>(dense_draft_.data(), static_cast<size_t>(vocab_size_)),
+                                std::span<float>(correction_buf_.data(), static_cast<size_t>(vocab_size_)));
+    std::discrete_distribution<int> dist(correction_buf_.begin(), correction_buf_.end());
+    correction = static_cast<int32_t>(dist(rng_));
+    rejected = true;
+    break;
+  }
+
+  trials_ += rejected ? static_cast<size_t>(a + 1) : static_cast<size_t>(N);
+  accepts_ += static_cast<size_t>(a);
+
+  // Commit the a accepted drafts (t was already committed by the caller). Stop at eos/max_length.
+  for (int k = 0; k < a; ++k) {
+    sequence_.push_back(drafts_[k]);
+    if (contains(main_model_.config_->model.eos_token_id, drafts_[k]) ||
+        sequence_.size() >= static_cast<size_t>(max_length_)) {
+      done_ = true;
+      return;
+    }
+  }
+
+  // --- Roll the MTP head KV back to the committed tokens: keep t, drop the N-1 speculative drafts,
+  //     then re-materialize the a accepted drafts with the main model's hidden states in ONE batched
+  //     head forward (instead of a separate forward per token). Read the head-refeed hiddens from
+  //     the verify output BEFORE any main rewind overwrites the buffer. Under sampling the head KV
+  //     only shapes the DRAFT distribution q; rejection sampling still corrects the output to p, so
+  //     the batched (M=a) refeed does not change the output distribution. ---
+  mtp_->RewindToLength(head_start + 1);
+  head_len_ = head_start + 1;
+  if (a > 0) {
+    Tensor& hbuf = *refeed_multi_[a];
+    const size_t row_bytes = refeed_hidden_->GetByteSpan().size();
+    auto dst = hbuf.GetByteSpan();
+    auto src = ByteWrapTensor(*main_model_.p_device_, *vhidden);
+    for (int k = 0; k < a; ++k)
+      dst.subspan(static_cast<size_t>(k) * row_bytes, row_bytes)
+          .CopyFrom(src.subspan(static_cast<size_t>(k) * row_bytes, row_bytes));
+    mtp_->SetHiddenStates(refeed_multi_[a]);
+    mtp_->AppendTokens(cpu_span<const int32_t>(drafts_.data(), a));  // d0..d_{a-1} with main hiddens
+    head_len_ = head_start + 1 + static_cast<size_t>(a);
+  }
+
+  if (!rejected) {
+    // Every draft accepted: the batched verify already committed [t, d0..d_{N-1}] correctly, so the
+    // main KV / recurrent state is exactly at L + (N+1). Draw the bonus token from the target's
+    // next-position distribution p_N (verify row N), sampled directly from its sparse support.
+    next_token_ = SampleSparse(target_idx_[N], target_prob_[N], rng_);
+    CopyHiddenRow(vhidden, N, *hidden_slice_);  // hidden that predicted the bonus token
+    length_ += static_cast<size_t>(N) + 1;
+  } else {
+    // Rejected at position a: the batched verify over-appended N-a wrong tokens and cannot be
+    // partially cropped (the linear-attention recurrent state has no per-token rollback). Restore
+    // the recurrent snapshot at L and re-run only the committed prefix [t, d0..d_{a-1}] so the
+    // carried recurrent/KV state is decode-consistent; pair the sampled correction (already drawn
+    // from the batched verify's residual) with the re-run's hidden at row a.
+    main_->RewindToLength(length_);
+    verify_tokens_[0] = t;
+    for (int k = 0; k < a; ++k) verify_tokens_[k + 1] = drafts_[k];
+    main_->AppendTokens(cpu_span<const int32_t>(verify_tokens_.data(), a + 1));
+    ++forwards_;
+    OrtValue* rhidden = main_->state_->GetOutput(hs_name.c_str());
+    next_token_ = correction;
+    CopyHiddenRow(rhidden, a, *hidden_slice_);  // hidden paired with the correction token
     length_ += static_cast<size_t>(a) + 1;
   }
 }

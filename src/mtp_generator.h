@@ -3,7 +3,10 @@
 #pragma once
 
 #include <memory>
+#include <random>
 #include <vector>
+
+#include "sampling_distribution.h"
 
 namespace Generators {
 
@@ -11,6 +14,7 @@ struct Model;
 struct Generator;
 struct GeneratorParams;
 struct Tensor;
+struct DeviceInterface;
 
 // In-engine Multi-Token-Prediction (MTP) self-speculative decoder for Qwen3.6-style models.
 //
@@ -69,6 +73,31 @@ struct MtpGenerator {
   // module N times (feeding its own hidden back), verifies [t, d0..d_{N-1}] in one main forward,
   // commits the longest accepted prefix + 1 bonus, and rolls the head/main state back losslessly.
   void GenerateStepMulti(int32_t t);
+  // Speculative-sampling variant of the chained step (do_sample=true). Instead of greedy argmax
+  // accept, each draft d_i is sampled from its truncated draft distribution q_i and accepted with
+  // probability min(1, p_i(d_i)/q_i(d_i)) against the target's truncated distribution p_i; on the
+  // first rejection the token is redrawn from the residual norm(max(0, p_i - q_i)); if every draft
+  // is accepted a bonus is drawn from the target's next-position distribution. This makes MTP
+  // draw from the same distribution as plain top-k/top-p sampling (distribution-lossless), so
+  // near-tie kernel/CUDA-graph numeric flips become valid draws rather than mismatches.
+  void GenerateStepMultiSample(int32_t t);
+  // One head forward that samples the draft from its truncated distribution q (top_k/top_p/
+  // temperature), storing the sparse q (kept ids + probs) into draft_idx_[k]/draft_prob_[k] for
+  // the accept test; otherwise identical to DraftHeadStep.
+  int32_t DraftHeadStepSample(int32_t token, int k);
+  // Capture the head's own post-final-norm hidden (hidden_states_out, last row) into
+  // head_out_hidden_ for the next chained draft step. Shared by DraftHeadStep{,Sample}.
+  void CaptureHeadFeedbackHidden();
+  // Cast the main model's raw logits to fp32 (device) and copy num_rows rows starting at first_row
+  // into main_logits_cpu_ (host, fp32, row-major [num_rows, vocab]). Returns main_logits_cpu_.data().
+  const float* MainLogitsRowsCpu(int first_row, int num_rows);
+  // On-device top-k of `logits` (device ptr, [num_rows, vocab], element type `onnx_type` passed as
+  // int) into topk_tok_scratch_/topk_score_scratch_ (only k*num_rows values leave the GPU). Returns
+  // false if the device has no TopKScores impl (caller falls back to the host ComputeSampledCategorical).
+  bool TopKScoresRows(const void* logits, int onnx_type, int num_rows, DeviceInterface& dev);
+  // Build one row's truncated (top_k/top_p/temperature) sparse distribution from the device top-k
+  // scratch: softmax with temperature over the k sorted scores, then a top-p nucleus cutoff.
+  void SparseFromTopKRow(int row, std::vector<int32_t>& idx, std::vector<float>& prob);
   // Greedy argmax over `num_rows` consecutive vocab rows of the main model's raw logits output
   // ([1,S,V]), starting at `first_row`, writing the token ids to `out`. Uses the device's
   // on-device Top-K kernel when available (no full-logits host copy); falls back to a host argmax.
@@ -88,6 +117,9 @@ struct MtpGenerator {
   std::shared_ptr<Tensor> hidden_slice2_;  // reusable [1,2,hidden] buffer for the batched 2-token draft
   std::shared_ptr<Tensor> head_out_hidden_;  // [1,1,hidden] capture of the head's own hidden (chain feedback)
   std::shared_ptr<Tensor> refeed_hidden_;    // [1,1,hidden] scratch for re-feeding accepted drafts (main hidden)
+  // Per-size [1,j,hidden] hidden buffers (j=1..N) used to re-materialize the accepted drafts in the
+  // head KV in ONE batched head forward instead of one forward per accepted draft (sampling path).
+  std::vector<std::shared_ptr<Tensor>> refeed_multi_;
   std::unique_ptr<OrtValue> logits_fp32_;  // reusable fp32 cast of the main model's raw logits
 
   std::vector<int32_t> sequence_;  // committed tokens (batch 0)
@@ -106,6 +138,26 @@ struct MtpGenerator {
   std::vector<int32_t> drafts_;         // scratch: the N chained draft tokens
   std::vector<int32_t> verify_tokens_;  // scratch: [t, d0..d_{N-1}] for the verify forward
   std::vector<int32_t> verify_argmax_;  // scratch: main argmax of the N+1 verify rows
+
+  // --- Speculative-sampling (do_sample=true) state. ---
+  bool sampling_{false};       // true when do_sample && temperature > 0: use rejection sampling
+  int top_k_{};                // top-k truncation shared by draft (q) and target (p) distributions
+  float top_p_{};              // top-p (nucleus) truncation
+  float temperature_{1.0f};    // sampling temperature
+  std::mt19937 rng_;           // RNG for draft sampling + accept/reject + correction/bonus draws
+  SampledCategorical sampled_scratch_;              // reused truncated-distribution scratch
+  std::vector<std::vector<int32_t>> draft_idx_;     // per draft position: truncated draft support
+  std::vector<std::vector<float>> draft_prob_;      // per draft position: truncated draft probs q_k
+  std::vector<std::vector<int32_t>> target_idx_;    // per verify row: truncated target support
+  std::vector<std::vector<float>> target_prob_;     // per verify row: truncated target probs p_k
+  std::vector<float> dense_target_;                 // full-vocab densify scratch for p (reject only)
+  std::vector<float> dense_draft_;                  // full-vocab densify scratch for q (reject only)
+  std::vector<float> correction_buf_;               // full-vocab residual correction distribution
+  std::vector<float> main_logits_cpu_;              // host fp32 copy of the requested verify rows (CPU fallback)
+  std::vector<int32_t> topk_tok_scratch_;           // device top-k token ids (host, [num_rows*k])
+  std::vector<float> topk_score_scratch_;           // device top-k raw scores (host, [num_rows*k])
+  std::vector<float> topk_prob_scratch_;            // per-row softmax scratch over the k scores
+  int topk_k_{};                                    // effective k used for the last device top-k
 
   // Loop carry state (see the design doc draft/verify invariant):
   int32_t next_token_{};   // token predicted for the current cache length L (not yet committed)
