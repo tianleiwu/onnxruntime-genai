@@ -2264,6 +2264,18 @@ class Qwen35MoeTextModel(Qwen35TextModel):
                 self._mtp_extra_options["use_8bits_moe"] = True
                 for _k in ("use_nvfp4_moe", "use_fp4_moe"):
                     self._mtp_extra_options.pop(_k, None)
+                # OPTIONAL: build the head's lm_head at int4 instead of the main model's int8
+                # placement (int4_algo_config=rtn_last implies last_matmul_weight_int8=true). The
+                # head's lm_head only produces DRAFT logits; speculative rejection sampling corrects
+                # the output to the target distribution regardless, so an int4 draft lm_head cannot
+                # change OUTPUT accuracy -- it only affects draft acceptance. Empirically it preserves
+                # acceptance and gives a small N>1 sampling-decode speedup (~5%): the M=1 lm_head GEMV
+                # over the large vocab is memory-bound but dominated by the FP16 activation reads and
+                # the vocab-sized output write rather than the weight bytes, so halving weight
+                # precision only trims a little. The int4 head lm_head differs from the main's int8
+                # one, so the save-time dedup simply skips it (it only shares byte-identical tensors).
+                if str(extra_options.get("mtp_head_int4_lmhead", "false")).lower() in ("1", "true", "yes"):
+                    self._mtp_extra_options["last_matmul_weight_int8"] = False
 
     def make_model(self, input_path):
         # Build the main decoder model first.
