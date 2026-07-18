@@ -24,6 +24,7 @@ This folder contains the model builder for quickly creating optimized and quanti
     - [Include Last Hidden States Output](#include-last-hidden-states-output)
     - [Enable Shared Embeddings](#enable-shared-embeddings)
     - [Enable CUDA Graph Capture](#enable-cuda-graph-capture)
+    - [Enable MTP Head (Qwen3.6)](#enable-mtp-head-qwen36)
     - [Enable WebGPU Graph Capture](#enable-webgpu-graph-capture)
     - [Disable QKV Projections Fusion](#disable-qkv-projections-fusion)
     - [Disable QK Norm GQA Fusion in CUDA or WebGPU](#disable-qk-norm-gqa-fusion-in-cuda-or-webgpu)
@@ -327,6 +328,27 @@ python -m onnxruntime_genai.models.builder -i path_to_local_folder_on_disk -o pa
 # From source:
 python builder.py -i path_to_local_folder_on_disk -o path_to_output_folder -p precision -e execution_provider -c cache_dir_to_store_temp_files --extra_options enable_cuda_graph=true
 ```
+
+#### Enable MTP Head (Qwen3.6)
+
+This scenario is for when you want to additionally export the multi-token-prediction (MTP) head of a Qwen3.6 MoE model for self-speculative decoding. When enabled, an auxiliary `mtp.onnx` (plus its `mtp.onnx.data`) is generated alongside the main model. The MTP head predicts the next-next token from the main model's last hidden state and the just-emitted token, so the main model must also expose its hidden states (`include_hidden_states=true`).
+
+```
+# From wheel:
+python -m onnxruntime_genai.models.builder -i path_to_local_folder_on_disk -o path_to_output_folder -p precision -e execution_provider -c cache_dir_to_store_temp_files --extra_options enable_mtp=true include_hidden_states=true
+
+# From source:
+python builder.py -i path_to_local_folder_on_disk -o path_to_output_folder -p precision -e execution_provider -c cache_dir_to_store_temp_files --extra_options enable_mtp=true include_hidden_states=true
+```
+
+Note that `enable_mtp` is only supported for Qwen3.6 MoE models (`Qwen3_5MoeForConditionalGeneration`) that ship `mtp.*` weights in their safetensors. The MTP weights are read directly from the source safetensors because Hugging Face `transformers` discards them on load.
+
+By default the MTP head inherits the main model's precision. Two optional overrides trade off draft cost vs. acceptance rate for the small single-layer head:
+
+* `mtp_head_fp16=true` — build the head as a dense fp16 `MoE` op. Highest acceptance rate.
+* `mtp_head_quant_type=int4/int8/mxfp4/nvfp4` — build the head as a `QMoE` op with the given quantization scheme (same style as `moe_quant_type`). For example, `mtp_head_quant_type=int8` is ~2.6x smaller on disk than the fp16 head with comparable acceptance and throughput, so it is preferred when GPU memory matters. (The legacy boolean `mtp_head_int8=true` is deprecated; use `mtp_head_quant_type=int8`.)
+
+`mtp_head_fp16` and `mtp_head_quant_type` are mutually exclusive. Both require the main model to be quantized (`-p int4`).
 
 #### Enable WebGPU Graph Capture
 

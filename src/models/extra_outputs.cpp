@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 #include "../generators.h"
+#include "env_utils.h"
 #include "model.h"
 #include "extra_outputs.h"
 
@@ -14,7 +15,12 @@ void ExtraOutputs::Add(const std::vector<std::string>& all_output_names) {
   // Add() should be called after all the outputs managed by GenAI are initialized
   all_output_names_ = all_output_names;
   extra_outputs_start_ = state_.output_names_.size();
+  const bool skip_state_all = GetEnv("ORT_MTP_STATE_ALL_BINDING") == "none";
   for (const auto& output_name : all_output_names_) {
+    if (skip_state_all &&
+        (output_name.ends_with(".conv_state_all") || output_name.ends_with(".recurrent_state_all"))) {
+      continue;
+    }
     if (std::none_of(state_.output_names_.begin(), state_.output_names_.end(),
                      [&](const std::string& elem) { return elem == output_name; })) {
       state_.output_names_.push_back(output_name.c_str());

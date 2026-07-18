@@ -113,7 +113,7 @@ def check_extra_options(kv_pairs, precision, execution_provider):
 
     # `moe_quant_type` is the single option that selects the MoE quantization scheme. It replaces the
     # older per-type flags (`use_8bits_moe``) so new schemes can be added without a new flag.
-    supported_moe_quant_types = {"int4", "int8", "mxfp4"}
+    supported_moe_quant_types = {"int4", "int8", "mxfp4", "nvfp4"}
 
     # Backward compatibility: `use_8bits_moe` is deprecated in favor of `moe_quant_type`.
     if "use_8bits_moe" in kv_pairs:
@@ -127,16 +127,19 @@ def check_extra_options(kv_pairs, precision, execution_provider):
             raise ValueError(
                 f"moe_quant_type must be one of {sorted(supported_moe_quant_types)}, got '{moe_quant_type}'."
             )
-        if moe_quant_type == "mxfp4":
+        if moe_quant_type in ("mxfp4", "nvfp4"):
+            # MXFP4 and NVFP4 share the CUDA QMoE FP4 op path and both require the int4 build
+            # precision (that is what exports the quantized QMoE op); the FP4 scheme only sets the
+            # MoE expert weights to the FP4 encoding.
             if execution_provider != "cuda":
                 raise ValueError(
-                    f"moe_quant_type=mxfp4 is only supported on the CUDA EP, got ep='{execution_provider}'."
+                    f"moe_quant_type={moe_quant_type} is only supported on the CUDA EP, got ep='{execution_provider}'."
                 )
             if not (precision == "int4" and kv_pairs.get("int4_is_symmetric", True)):
                 raise ValueError(
-                    "moe_quant_type=mxfp4 requires building with precision=int4 (symmetric int4): the int4 build "
-                    "precision is what exports the quantized QMoE op, and mxfp4 only sets the MoE expert weights to "
-                    "the FP4 encoding."
+                    f"moe_quant_type={moe_quant_type} requires building with precision=int4 (symmetric int4): the "
+                    "int4 build precision is what exports the quantized QMoE op, and the FP4 scheme only sets the "
+                    "MoE expert weights to the FP4 encoding."
                 )
 
     if "exclude_lm_head" in kv_pairs and "include_hidden_states" in kv_pairs:

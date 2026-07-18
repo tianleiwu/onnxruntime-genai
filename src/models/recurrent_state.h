@@ -16,10 +16,31 @@ struct RecurrentState {
   void Update();
   void RewindTo(size_t index);
 
+  // Snapshot/restore the recurrent (conv + recurrent) state buffers. Required for
+  // speculative decoding (e.g. MTP): the recurrent state cannot be partially rewound
+  // (unlike the attention KV cache), so a draft/verify step snapshots the state before
+  // a speculative forward and restores it if the draft is rejected. Restore copies back
+  // in place so buffer addresses stay stable (required by CUDA-graph replay).
+  void Snapshot();
+  void RestoreSnapshot();
+
+  // Per-position recurrent-state cropping (lossless multi-token MTP). When the model is
+  // exported with `emit_recurrent_state_all=true`, each LinearAttention / CausalConvWithState
+  // node emits a 3rd output holding the state AFTER every token of the forward
+  // ([B, seq_len, ...]). These are managed as static-buffer outputs (like HiddenStatesOutputs)
+  // so they survive CUDA-graph capture. On a partial-accept MTP step the controller crops the
+  // live recurrent state to the accepted length by copying present_state_all[:, position] into
+  // the live present buffers -- no full-cost main-model replay forward.
+  bool HasStateAll() const { return has_state_all_ && bind_conv_all_ && bind_recurrent_all_; }
+  void UpdateAll(int sequence_length);  // Resize the per-position buffers to this step's seq_len.
+  void CropToPosition(size_t position);  // Copy present_state_all[:, position] -> live present state.
+
   bool IsEmpty() const { return layer_indices_.empty(); }
+  int GraphCaptureVariant() const { return graph_buffer_variant_; }
 
  private:
   void ZeroStates(std::vector<std::unique_ptr<OrtValue>>& states);
+  void CopyStates(const std::vector<std::unique_ptr<OrtValue>>& src, std::vector<std::unique_ptr<OrtValue>>& dst);
 
   State& state_;
   const Model& model_{state_.model_};
@@ -29,10 +50,25 @@ struct RecurrentState {
   // Interleaved as [conv_0, recurrent_0, conv_1, recurrent_1, ...]
   std::vector<std::unique_ptr<OrtValue>> pasts_;
   std::vector<std::unique_ptr<OrtValue>> presents_;
+  std::vector<std::unique_ptr<OrtValue>> snapshot_;  // Lazily-allocated copy of the live state for speculative rollback.
+  bool snapshot_valid_{false};                       // Whether snapshot_ holds a valid captured state.
+
+  // Per-position state outputs (present_state_all), managed as static-buffer outputs so they
+  // survive CUDA-graph capture. Interleaved [conv_all_0, recurrent_all_0, ...], one per state.
+  bool has_state_all_{false};
+  bool bind_conv_all_{true};
+  bool bind_recurrent_all_{true};
+  std::vector<std::string> output_all_name_strings_;
+  std::vector<std::unique_ptr<Tensor>> presents_all_;
+  std::vector<int64_t> conv_all_shape_;       // [B, seq_len, C, K-1] (seq at axis 1)
+  std::vector<int64_t> recurrent_all_shape_;  // [B, seq_len, H_kv, d_k, d_v]
+  size_t output_all_index_{~0U};
 
   // Mirrors past_present_share_buffer config: true means inputs alias outputs (same allocation,
   // stable handles for graph capture). False uses separate past/present buffers with per-step swap.
   bool share_buffers_{false};
+  bool graph_double_buffer_{false};
+  int graph_buffer_variant_{0};
   size_t input_index_{~0U};
   size_t output_index_{~0U};
 
