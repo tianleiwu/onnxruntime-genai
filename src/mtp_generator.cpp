@@ -677,7 +677,14 @@ void MtpGenerator::GenerateStepMultiSample(int32_t t) {
   auto tp1 = prof ? HostPhaseProfiler::now() : HostPhaseProfiler::clk::time_point{};
 
   // --- Verify [t, d0..d_{N-1}] in a single batched main forward. ---
-  main_->SnapshotState();
+  // Snapshot the recurrent state ONLY for the fallback re-run rollback (models WITHOUT
+  // emit_recurrent_state_all). Snapshot() copies every linear-attn layer's conv+recurrent
+  // state (2*num_layers D2D copies + launches) on EVERY step. When the crop fast-path is
+  // available the reject branch uses present_state_all via CropToPosition and NEVER rewinds
+  // the recurrent state (RewindTo/RestoreSnapshot is unreachable), so the snapshot is dead
+  // overhead -- skip it. The predicate matches the reject-path crop-vs-fallback choice below,
+  // so the fallback branch still has its snapshot when it needs one.
+  if (!main_->CanCropRecurrentState()) main_->SnapshotState();
   verify_tokens_[0] = t;
   for (int k = 0; k < N; ++k) verify_tokens_[k + 1] = drafts_[k];
   main_->AppendTokens(cpu_span<const int32_t>(verify_tokens_.data(), N + 1));
