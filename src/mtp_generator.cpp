@@ -11,6 +11,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
+#include <chrono>
+#include <cstdio>
 #include <random>
 
 namespace Generators {
@@ -67,6 +69,39 @@ int32_t SampleCorrectionSparse(const std::vector<int32_t>& p_idx, const std::vec
   // original dense BuildCorrectionDistribution's sum==0 fallback to the target distribution.
   return SampleSparse(p_idx, p_prob, rng);
 }
+
+// Env-gated (ORT_MTP_PROFILE_HOST=1) per-phase host-wall accumulator for the multi-sample step.
+// Attributes each N>1 sampling step's wall time to draft / verify+topk / accept+refeed / finalize
+// (bonus or reject re-run). The phases already synchronize (TopKScores syncs), so wall time per
+// phase captures GPU+host of that phase -- pinpointing whether the ~90% GPU-idle decode is launch-
+// or sync-bound. Zero overhead when the env var is unset.
+struct HostPhaseProfiler {
+  bool on = false;
+  double draft = 0, verify = 0, accept = 0, finalize = 0;
+  long steps = 0;
+  using clk = std::chrono::steady_clock;
+  HostPhaseProfiler() {
+    const char* e = std::getenv("ORT_MTP_PROFILE_HOST");
+    on = e && std::atoi(e) != 0;
+  }
+  static clk::time_point now() { return clk::now(); }
+  static double ms(clk::time_point a, clk::time_point b) {
+    return std::chrono::duration<double, std::milli>(b - a).count();
+  }
+  void report() {
+    if (steps == 0) return;
+    const double tot = draft + verify + accept + finalize;
+    std::fprintf(stderr,
+                 "[MTP host/step last %ld steps] total=%.3fms  draft=%.3f(%.0f%%)  verify+topk=%.3f(%.0f%%)  "
+                 "accept+refeed=%.3f(%.0f%%)  finalize=%.3f(%.0f%%)\n",
+                 steps, tot / steps, draft / steps, 100 * draft / tot, verify / steps, 100 * verify / tot,
+                 accept / steps, 100 * accept / tot, finalize / steps, 100 * finalize / tot);
+    // Reset so each report reflects only the most recent window (excludes one-time warmup/MoE-profiler).
+    draft = verify = accept = finalize = 0;
+    steps = 0;
+  }
+};
+HostPhaseProfiler g_host_prof;
 }  // namespace
 
 MtpGenerator::MtpGenerator(const Model& main_model, const Model& mtp_model, const GeneratorParams& params)
@@ -627,6 +662,8 @@ void MtpGenerator::GenerateStepMulti(int32_t t) {
 void MtpGenerator::GenerateStepMultiSample(int32_t t) {
   const int N = std::min(num_speculative_tokens_, static_cast<int>(max_length_ - length_ - 1));
   const std::string& hs_name = main_model_.config_->model.decoder.outputs.hidden_states;
+  const bool prof = g_host_prof.on;
+  auto tp0 = prof ? HostPhaseProfiler::now() : HostPhaseProfiler::clk::time_point{};
 
   // --- Draft phase: chain the single MTP module N times, SAMPLING each draft d_k from its
   //     truncated distribution q_k (top_k/top_p/temperature) and recording q_k for the accept test.
@@ -637,6 +674,7 @@ void MtpGenerator::GenerateStepMultiSample(int32_t t) {
     mtp_->SetHiddenStates(head_out_hidden_);
     drafts_[k] = DraftHeadStepSample(drafts_[k - 1], k);
   }
+  auto tp1 = prof ? HostPhaseProfiler::now() : HostPhaseProfiler::clk::time_point{};
 
   // --- Verify [t, d0..d_{N-1}] in a single batched main forward. ---
   main_->SnapshotState();
@@ -663,6 +701,7 @@ void MtpGenerator::GenerateStepMultiSample(int32_t t) {
       target_prob_[kk] = sampled_scratch_.probs;
     }
   }
+  auto tp2 = prof ? HostPhaseProfiler::now() : HostPhaseProfiler::clk::time_point{};
 
   // --- Speculative-sampling accept/reject over the N drafts. Accept d_a with probability
   //     min(1, p_a(d_a)/q_a(d_a)); on the first rejection draw a correction from the residual
@@ -720,6 +759,7 @@ void MtpGenerator::GenerateStepMultiSample(int32_t t) {
     mtp_->AppendTokens(cpu_span<const int32_t>(drafts_.data(), a));  // d0..d_{a-1} with main hiddens
     head_len_ = head_start + 1 + static_cast<size_t>(a);
   }
+  auto tp3 = prof ? HostPhaseProfiler::now() : HostPhaseProfiler::clk::time_point{};
 
   if (!rejected) {
     // Every draft accepted: the batched verify already committed [t, d0..d_{N-1}] correctly, so the
@@ -743,6 +783,15 @@ void MtpGenerator::GenerateStepMultiSample(int32_t t) {
     next_token_ = correction;
     CopyHiddenRow(rhidden, a, *hidden_slice_);  // hidden paired with the correction token
     length_ += static_cast<size_t>(a) + 1;
+  }
+
+  if (prof) {
+    auto tp4 = HostPhaseProfiler::now();
+    g_host_prof.draft += HostPhaseProfiler::ms(tp0, tp1);
+    g_host_prof.verify += HostPhaseProfiler::ms(tp1, tp2);
+    g_host_prof.accept += HostPhaseProfiler::ms(tp2, tp3);
+    g_host_prof.finalize += HostPhaseProfiler::ms(tp3, tp4);
+    if (++g_host_prof.steps % 100 == 0) g_host_prof.report();
   }
 }
 
