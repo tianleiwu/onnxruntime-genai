@@ -37,19 +37,35 @@ float SparseProbability(const std::vector<int32_t>& idx, const std::vector<float
   return 0.0f;
 }
 
-// Expand a sparse truncated distribution (kept ids + probs) into a full-vocab dense vector.
-void DensifyRow(const std::vector<int32_t>& idx, const std::vector<float>& prob, int vocab_size,
-                std::vector<float>& dense) {
-  dense.assign(static_cast<size_t>(vocab_size), 0.0f);
-  for (size_t i = 0; i < idx.size(); ++i)
-    dense[static_cast<size_t>(idx[i])] = prob[i];
-}
-
 // Draw a token from a sparse truncated distribution (kept ids + renormalized probs). Cheap: the
 // kept set is only ~top_k tokens, so this avoids any full-vocab (150K+) work on the hot path.
 int32_t SampleSparse(const std::vector<int32_t>& idx, const std::vector<float>& prob, std::mt19937& rng) {
   std::discrete_distribution<int> dist(prob.begin(), prob.end());
   return idx[static_cast<size_t>(dist(rng))];
+}
+
+// Sample the speculative-sampling correction token from the normalized residual
+// norm(max(0, p - q)), where p (target) and q (draft) are truncated sparse distributions.
+// The residual is nonzero only on supp(p): outside it p==0, so max(0, 0 - q) == 0. This lets the
+// (frequent) reject path stay O(top_k) instead of densifying both distributions to full vocab and
+// constructing a full-vocab std::discrete_distribution (a ~150K-entry CDF) on the host.
+int32_t SampleCorrectionSparse(const std::vector<int32_t>& p_idx, const std::vector<float>& p_prob,
+                               const std::vector<int32_t>& q_idx, const std::vector<float>& q_prob,
+                               std::mt19937& rng) {
+  std::vector<float> resid(p_idx.size());
+  float sum = 0.0f;
+  for (size_t i = 0; i < p_idx.size(); ++i) {
+    const float diff = p_prob[i] - SparseProbability(q_idx, q_prob, p_idx[i]);
+    resid[i] = diff > 0.0f ? diff : 0.0f;
+    sum += resid[i];
+  }
+  if (sum > 0.0f) {
+    std::discrete_distribution<int> dist(resid.begin(), resid.end());
+    return p_idx[static_cast<size_t>(dist(rng))];
+  }
+  // Residual collapsed (q >= p on all of supp(p)): fall back to sampling p directly, matching the
+  // original dense BuildCorrectionDistribution's sum==0 fallback to the target distribution.
+  return SampleSparse(p_idx, p_prob, rng);
 }
 }  // namespace
 
@@ -662,15 +678,11 @@ void MtpGenerator::GenerateStepMultiSample(int32_t t) {
     if (uni(rng_) < ComputeAcceptProb(p_t, p_d))
       continue;  // accept d_a
     // Reject at position a: sample the correction from the normalized residual max(0, p_a - q_a).
-    // Densify only here (the rare reject path), never on the hot per-draft accept path.
-    DensifyRow(target_idx_[a], target_prob_[a], vocab_size_, dense_target_);
-    DensifyRow(draft_idx_[a], draft_prob_[a], vocab_size_, dense_draft_);
-    if (correction_buf_.empty()) correction_buf_.assign(static_cast<size_t>(vocab_size_), 0.0f);
-    BuildCorrectionDistribution(std::span<const float>(dense_target_.data(), static_cast<size_t>(vocab_size_)),
-                                std::span<const float>(dense_draft_.data(), static_cast<size_t>(vocab_size_)),
-                                std::span<float>(correction_buf_.data(), static_cast<size_t>(vocab_size_)));
-    std::discrete_distribution<int> dist(correction_buf_.begin(), correction_buf_.end());
-    correction = static_cast<int32_t>(dist(rng_));
+    // The residual lives only on the target's sparse support, so draw it over ~top_k entries
+    // instead of densifying both distributions to full vocab and building a full-vocab
+    // std::discrete_distribution on this (frequent) reject path.
+    correction = SampleCorrectionSparse(target_idx_[a], target_prob_[a],
+                                        draft_idx_[a], draft_prob_[a], rng_);
     rejected = true;
     break;
   }

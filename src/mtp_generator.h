@@ -150,9 +150,6 @@ struct MtpGenerator {
   std::vector<std::vector<float>> draft_prob_;      // per draft position: truncated draft probs q_k
   std::vector<std::vector<int32_t>> target_idx_;    // per verify row: truncated target support
   std::vector<std::vector<float>> target_prob_;     // per verify row: truncated target probs p_k
-  std::vector<float> dense_target_;                 // full-vocab densify scratch for p (reject only)
-  std::vector<float> dense_draft_;                  // full-vocab densify scratch for q (reject only)
-  std::vector<float> correction_buf_;               // full-vocab residual correction distribution
   std::vector<float> main_logits_cpu_;              // host fp32 copy of the requested verify rows (CPU fallback)
   std::vector<int32_t> topk_tok_scratch_;           // device top-k token ids (host, [num_rows*k])
   std::vector<float> topk_score_scratch_;           // device top-k raw scores (host, [num_rows*k])

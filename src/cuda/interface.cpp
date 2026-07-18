@@ -251,8 +251,12 @@ struct CudaInterfaceImplBase : DeviceInterface {
       topk_batch_ = num_rows;
       topk_vocab_ = vocab_size;
     }
-    // select_sort writes exactly k sorted-descending (index, score) pairs per row (stride k).
-    cuda::select_sort::RunTopK(topk_data_.get(), stream, scores, vocab_size, num_rows, k);
+    // Dispatch to the fastest available Top-K algorithm for this (batch, vocab, k). The dispatcher
+    // benchmarks once per shape and caches the choice; select_sort (the previous hardcoded call) is
+    // only efficient for very small k and is ~20x slower than the tuned algorithms at k~20, which
+    // dominated speculative-sampling decode time. All algorithms return k sorted-descending
+    // (index, score) pairs per row; results and their stride are read from topk_data_ below.
+    cuda::RunTopK(topk_data_.get(), stream, scores, vocab_size, num_rows, k);
 
     const size_t result_count = static_cast<size_t>(num_rows) * k;
     if (!topk_indices_host_ || topk_host_count_ < result_count) {
