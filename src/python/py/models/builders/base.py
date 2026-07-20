@@ -936,6 +936,20 @@ class Model:
                     for proj in ("gate_proj", "up_proj", "down_proj"):
                         customized_weight_config[f"/model/layers.{i}/mlp/{proj}/MatMul"] = {"bits": bits}
 
+        # Honor explicit per-node type overrides (match={"name": ...}, type=...) from the
+        # structured/JSON quant_config, in addition to the named presets above. This lets a
+        # caller set arbitrary per-node bit-widths (e.g. all dense MatMuls -> int8) while MoE
+        # stays on its own scheme. Exclusions are handled via quant_attrs["nodes_to_exclude"];
+        # name_regex / preset matches are resolved elsewhere.
+        weights_cfg = getattr(self.quant_config, "weights", None)
+        if weights_cfg is not None:
+            for override in weights_cfg.overrides:
+                if override.exclude or override.type is None:
+                    continue
+                node_name = override.match.get("name")
+                if node_name:
+                    customized_weight_config[node_name] = {"bits": resolve_dtype(override.type).bits}
+
         self.int4_customized_weight_config = customized_weight_config
 
     def make_algo_config(self, quant_method: str, customized_weight_config=None):

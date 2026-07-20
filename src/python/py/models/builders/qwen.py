@@ -10,6 +10,7 @@ import copy
 import glob
 import json
 import os
+import re
 import numpy as np
 import onnx_ir as ir
 import torch
@@ -2175,6 +2176,31 @@ class Qwen35MoeTextModel(Qwen35TextModel):
 
         super().__init__(config, io_dtype, onnx_dtype, ep, cache_dir, extra_options)
 
+        # Keep the checkpoint's original FP8 (E4M3) weights instead of dequantizing them
+        # to fp16 and re-quantizing to int4/int8. The FP8 self-attention q/k/v/o projections
+        # are emitted as the weight-only ``MatMulBlockScaledFp8`` contrib op; the FP8
+        # GatedDeltaNet (linear-attention) projections have no FP8 matmul op wired yet, so
+        # they are kept at fp16 (a lossless widening of FP8) rather than degraded to int4.
+        # Disabled for the MTP head (its ``mtp.*`` weights are BF16 and its basenames would
+        # otherwise misload the main model's tensors).
+        self.use_original_fp8_weights = (
+            bool(extra_options.get("use_original_fp8_weights", False))
+            and not getattr(self, "is_mtp_head", False)
+        )
+
+        # Keep the checkpoint's original NVFP4 (E2M1) *dense* weights instead of dequantizing
+        # them to fp16 and re-quantizing to int4/int8. The shared-expert MLP and lm_head
+        # projections are emitted as the weight-only ``MatMulBlockScaledFp4`` contrib op straight from
+        # the ModelOpt tensors (E2M1 codes + E4M3 block scale + fp32 global scale). NOTE: the
+        # NVFP4 *routed MoE experts* are controlled separately by ``moe_quant_type=nvfp4``
+        # (native NVFP4 QMoE); this flag only covers the dense NVFP4 modules. Disabled for the
+        # MTP head (its ``mtp.*`` weights are BF16 and share the main layer indices, so the
+        # shared-expert basenames would otherwise misload the main model's NVFP4 tensors).
+        self.use_original_nvfp4_weights = (
+            bool(extra_options.get("use_original_nvfp4_weights", False))
+            and not getattr(self, "is_mtp_head", False)
+        )
+
         # The base builder derives the GenAI model.type by stripping the suffix
         # after "For" and lowercasing, matching Qwen3.5 text-only export.
         self.model_type = (
@@ -2219,6 +2245,15 @@ class Qwen35MoeTextModel(Qwen35TextModel):
                     nodes_to_exclude.append(router_node)
                 if shared_gate_node not in nodes_to_exclude:
                     nodes_to_exclude.append(shared_gate_node)
+                # When keeping original FP8 weights, keep the GatedDeltaNet (linear-attention)
+                # projections out of int4/int8 quantization so they stay fp16 (the checkpoint
+                # stores them as FP8 or BF16, both losslessly widened to fp16). Without this
+                # they would be re-quantized to int4, far from the source.
+                if self.use_original_fp8_weights:
+                    for proj in ("in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b", "out_proj"):
+                        linear_node = f"/model/layers.{i}/linear_attn/{proj}/MatMul"
+                        if linear_node not in nodes_to_exclude:
+                            nodes_to_exclude.append(linear_node)
 
         # MTP (multi-token prediction) self-speculative head.
         # When ``enable_mtp`` is set, an auxiliary ``mtp.onnx`` model is exported
@@ -2246,6 +2281,7 @@ class Qwen35MoeTextModel(Qwen35TextModel):
             #     the acceptance, since the tiny single-layer head tolerates int8 well.
             # The two are mutually exclusive.
             supported_mtp_head_quant_types = {"int4", "int8", "mxfp4", "nvfp4"}
+
             _mtp_head_fp16 = str(extra_options.get("mtp_head_fp16", "false")).lower() in ("1", "true", "yes")
             _mtp_head_quant_type = extra_options.get("mtp_head_quant_type")
             # Backward compatibility: `mtp_head_int8` is deprecated in favor of `mtp_head_quant_type=int8`.
@@ -2272,6 +2308,17 @@ class Qwen35MoeTextModel(Qwen35TextModel):
                 # NVFP4 experts. The lm_head / attention int8/int4 placement (int4_algo_config)
                 # is left as the main model's so the two lm_heads stay byte-identical and
                 # can be deduplicated on disk.
+                # When the MAIN model is a float build (fp16/bf16), its onnx_dtype is NOT INT4, so
+                # the head MoE would be emitted as a plain (unquantized) MoE op and moe_quant_type
+                # would be silently ignored (see base.py make_moe: QMoE requires onnx_dtype INT4/INT8).
+                # Promote the head to an INT4 onnx_dtype (io stays fp16) so make_moe emits a QMoE op
+                # whose experts are then quantized to the requested scheme, and supply INT4 defaults
+                # for the head's lm_head/attention placement.
+                if self._mtp_onnx_dtype in (ir.DataType.FLOAT16, ir.DataType.BFLOAT16, ir.DataType.FLOAT):
+                    self._mtp_onnx_dtype = ir.DataType.INT4
+                    self._mtp_io_dtype = ir.DataType.FLOAT16
+                    self._mtp_extra_options.setdefault("int4_block_size", 32)
+                    self._mtp_extra_options.setdefault("int4_algo_config", "rtn_last")
                 self._mtp_extra_options["moe_quant_type"] = _mtp_head_quant_type
                 # OPTIONAL: build the head's lm_head at int4 instead of the main model's int8
                 # placement (int4_algo_config=rtn_last implies last_matmul_weight_int8=true). The
@@ -2285,6 +2332,344 @@ class Qwen35MoeTextModel(Qwen35TextModel):
                 # one, so the save-time dedup simply skips it (it only shares byte-identical tensors).
                 if str(extra_options.get("mtp_head_int4_lmhead", "false")).lower() in ("1", "true", "yes"):
                     self._mtp_extra_options["last_matmul_weight_int8"] = False
+
+    def _gemmfloat8_output_dtype_attr(self):
+        if self.io_dtype == ir.DataType.FLOAT16:
+            return 10  # TensorProto.FLOAT16
+        if self.io_dtype == ir.DataType.BFLOAT16:
+            return 16  # TensorProto.BFLOAT16
+        if self.io_dtype == ir.DataType.FLOAT:
+            return 1  # TensorProto.FLOAT
+        # GemmFloat8 supports float/float16/bfloat16 outputs. Fall back to fp16.
+        return 10
+
+    def _fp8_weight_key_for_matmul(self, basename):
+        m = re.match(r"^/model/layers\.(\d+)/(attn|linear_attn)/([^/]+)/MatMul$", basename)
+        if not m:
+            return None
+        layer_id = int(m.group(1))
+        attn_kind = m.group(2)
+        proj = m.group(3)
+
+        if attn_kind == "attn":
+            if proj not in {"q_proj", "k_proj", "v_proj", "o_proj"}:
+                return None
+            return f"model.language_model.layers.{layer_id}.self_attn.{proj}"
+
+        # linear_attn projections currently hit unsupported cublasLt algo combinations
+        # in GemmFloat8 for common decode/prefill shapes on our runtime build.
+        return None
+
+    def _make_fp8_attention_activation(self, basename, root_input, hidden_size, seq_dim):
+        # Use a single K-block (per-tensor activation scale) rather than block-128.
+        # Rationale: (1) the source ModelOpt checkpoint quantizes these projections with a
+        # per-tensor FP8 activation scale (``input_scale``) and per-tensor weight scale, so a
+        # single block matches the original W8A8 scheme; (2) the MatMulBlockScaledFp8 CUDA
+        # kernel's multi-block (K_blocks > 1) fast path is numerically incorrect at these
+        # shapes, while the single-block path is correct. The block scale is still computed
+        # dynamically per token (absmax), which is at least as accurate as the static
+        # ``input_scale`` and needs no calibration constant.
+        block_size = hidden_size
+        if hidden_size % block_size != 0:
+            return None
+
+        const_dtype = "FLOAT"
+        if self.io_dtype == ir.DataType.FLOAT16:
+            const_dtype = "FLOAT16"
+        elif self.io_dtype == ir.DataType.BFLOAT16:
+            const_dtype = "BFLOAT16"
+        floor_const = f"/model/constants/{const_dtype}/[1e-10]"
+        fp8_max_const = f"/model/constants/{const_dtype}/[448.0]"
+
+        block_count = hidden_size // block_size
+        reshape_blocks_name = f"{basename}/FP8Act/Blocks/Reshape"
+        reshape_blocks_output = f"{reshape_blocks_name}/output_0"
+        self.make_reshape(
+            reshape_blocks_name,
+            [root_input, f"/model/constants/INT64/[0, 0, -1, {block_size}]"],
+            self.io_dtype,
+            ["batch_size", seq_dim, block_count, block_size],
+        )
+
+        abs_name = f"{basename}/FP8Act/Abs"
+        abs_output = f"{abs_name}/output_0"
+        self.make_node("Abs", [reshape_blocks_output], [abs_output], name=abs_name)
+        self.make_value(abs_output, self.io_dtype, ["batch_size", seq_dim, block_count, block_size])
+
+        amax_name = f"{basename}/FP8Act/Amax"
+        amax_output = f"{amax_name}/output_0"
+        self.make_reduce_max(
+            amax_name,
+            [abs_output, "/model/constants/INT64/[-1]"],
+            self.io_dtype,
+            ["batch_size", seq_dim, block_count, 1],
+            keepdims=True,
+        )
+
+        scale_floor_name = f"{basename}/FP8Act/ScaleFloor"
+        scale_floor_output = f"{scale_floor_name}/output_0"
+        self.make_clip(
+            scale_floor_name,
+            [amax_output, floor_const, ""],
+            self.io_dtype,
+            ["batch_size", seq_dim, block_count, 1],
+        )
+
+        scale_name = f"{basename}/FP8Act/Scale"
+        scale_output = f"{scale_name}/output_0"
+        self.make_div(
+            scale_name,
+            [scale_floor_output, fp8_max_const],
+            self.io_dtype,
+            ["batch_size", seq_dim, block_count, 1],
+        )
+
+        scaled_name = f"{basename}/FP8Act/Scaled"
+        scaled_output = f"{scaled_name}/output_0"
+        self.make_div(
+            scaled_name,
+            [reshape_blocks_output, scale_output],
+            self.io_dtype,
+            ["batch_size", seq_dim, block_count, block_size],
+        )
+
+        quant_name = f"{basename}/FP8Act/Quantize/Cast"
+        quant_output = f"{quant_name}/output_0"
+        self.make_cast(
+            quant_name,
+            scaled_output,
+            ir.DataType.FLOAT8E4M3FN,
+            ["batch_size", seq_dim, block_count, block_size],
+        )
+
+        activation_reshape_name = f"{basename}/FP8Act/Activation/Reshape"
+        activation_output = f"{activation_reshape_name}/output_0"
+        self.make_reshape(
+            activation_reshape_name,
+            [quant_output, "/model/constants/INT64/[0, 0, -1]"],
+            ir.DataType.FLOAT8E4M3FN,
+            ["batch_size", seq_dim, hidden_size],
+        )
+
+        scale_cast_name = f"{basename}/FP8Act/Scale/Cast"
+        scale_cast_output = f"{scale_cast_name}/output_0"
+        self.make_cast(
+            scale_cast_name,
+            scale_output,
+            ir.DataType.FLOAT,
+            ["batch_size", seq_dim, block_count, 1],
+        )
+
+        scale_squeeze_name = f"{basename}/FP8Act/Scale/Squeeze/Reshape"
+        scale_squeeze_output = f"{scale_squeeze_name}/output_0"
+        self.make_reshape(
+            scale_squeeze_name,
+            [scale_cast_output, "/model/constants/INT64/[0, 0, -1]"],
+            ir.DataType.FLOAT,
+            ["batch_size", seq_dim, block_count],
+        )
+
+        scale_flat_name = f"{basename}/FP8Act/Scale/Flat/Reshape"
+        scale_flat_output = f"{scale_flat_name}/output_0"
+        self.make_reshape(
+            scale_flat_name,
+            [scale_squeeze_output, f"/model/constants/INT64/[-1, {block_count}]"],
+            ir.DataType.FLOAT,
+            ["batch_seq", block_count],
+        )
+
+        dequant_name = f"{basename}/FP8Act/Dequantize/Cast"
+        dequant_output = f"{dequant_name}/output_0"
+        self.make_cast(
+            dequant_name,
+            quant_output,
+            self.io_dtype,
+            ["batch_size", seq_dim, block_count, block_size],
+        )
+
+        restored_name = f"{basename}/FP8Act/Restored"
+        restored_output = f"{restored_name}/output_0"
+        self.make_mul(
+            restored_name,
+            [dequant_output, scale_output],
+            self.io_dtype,
+            ["batch_size", seq_dim, block_count, block_size],
+        )
+
+        reshape_back_name = f"{basename}/FP8Act/Output/Reshape"
+        self.make_reshape(
+            reshape_back_name,
+            [restored_output, "/model/constants/INT64/[0, 0, -1]"],
+            self.io_dtype,
+            ["batch_size", seq_dim, hidden_size],
+        )
+        return {
+            "activation": activation_output,
+            "scale_a": scale_flat_output,
+            "block_size": block_size,
+            "block_count": block_count,
+            "fallback_activation": f"{reshape_back_name}/output_0",
+        }
+
+    def _prepare_matmul_block_quantized_scales(self, weight_scale, out_features, block_count):
+        # MatMulBlockScaledFp8 expects scaleB of shape [N, ceil(K / block_size)] = [out_features, block_count].
+        scale = weight_scale.float()
+        if scale.numel() == 1:
+            return scale.reshape(1, 1).expand(out_features, block_count).contiguous()
+        if scale.ndim >= 2 and scale.shape[0] == out_features:
+            scale = scale.reshape(out_features, -1)
+            if scale.shape[1] == block_count:
+                return scale.contiguous()
+        if scale.ndim >= 2 and scale.shape[0] == block_count:
+            scale = scale.reshape(block_count, -1)
+            if scale.shape[1] == out_features:
+                return scale.transpose(0, 1).contiguous()
+        if scale.ndim == 1 and scale.numel() == out_features * block_count:
+            return scale.view(out_features, block_count).contiguous()
+        return None
+
+    def _make_fp8_attention_matmul(self, basename, root_input, **kwargs):
+        if not self.use_original_fp8_weights:
+            return None
+
+        key_prefix = self._fp8_weight_key_for_matmul(basename)
+        if key_prefix is None:
+            return None
+
+        try:
+            weight = self._load_nvfp4_tensor(f"{key_prefix}.weight")
+            weight_scale = self._load_nvfp4_tensor(f"{key_prefix}.weight_scale")
+        except Exception:
+            return None
+
+        if weight.dtype != torch.float8_e4m3fn:
+            return None
+
+        output = "logits" if kwargs.get("logits", False) else f"{basename}/output_0"
+        seq_dim = kwargs.get("seq_dim", "sequence_length")
+        in_features = int(weight.shape[1])
+        out_features = int(weight.shape[0])
+
+        fp8_act = self._make_fp8_attention_activation(basename, root_input, in_features, seq_dim)
+        if fp8_act is None:
+            return None
+
+        scale_b = self._prepare_matmul_block_quantized_scales(weight_scale, out_features, fp8_act["block_count"])
+        if scale_b is None:
+            return None
+
+        # MatMulBlockScaledFp8 takes B as [N, K] (row-major weight), so the checkpoint
+        # weight (already [N, K] = [out, in]) is fed through without transposition.
+        weight_name = f"{basename[1:].replace('/', '.')}.fp8_weight"
+        self.make_initializer(weight.contiguous(), weight_name)
+
+        scale_b_name = f"{basename[1:].replace('/', '.')}.fp8_weight_scale"
+        self.make_initializer(scale_b, scale_b_name, to=ir.DataType.FLOAT)
+
+        blockquant_output = output if self.io_dtype == ir.DataType.BFLOAT16 else f"{basename}/MatMulBlockScaledFp8/output_0"
+        blockquant_name = basename if self.io_dtype == ir.DataType.BFLOAT16 else f"{basename}/MatMulBlockScaledFp8"
+        self.make_node(
+            "MatMulBlockScaledFp8",
+            inputs=[fp8_act["activation"], weight_name, fp8_act["scale_a"], scale_b_name],
+            outputs=[blockquant_output],
+            name=blockquant_name,
+            domain="com.microsoft",
+            block_size=fp8_act["block_size"],
+        )
+        self.make_value(blockquant_output, ir.DataType.BFLOAT16, shape=["batch_size", seq_dim, out_features])
+
+        if self.io_dtype == ir.DataType.BFLOAT16:
+            self.make_value(output, self.io_dtype, shape=["batch_size", seq_dim, out_features])
+            return basename
+
+        cast_name = basename
+        self.make_node("Cast", inputs=[blockquant_output], outputs=[output], name=cast_name, to=self.io_dtype)
+        self.make_value(output, self.io_dtype, shape=["batch_size", seq_dim, out_features])
+        return cast_name
+
+    def _nvfp4_dense_key_for_matmul(self, basename):
+        """Map a dense MatMul basename to its ModelOpt NVFP4 checkpoint key prefix.
+
+        Only the modules stored as NVFP4 in the checkpoint (the shared-expert MLP
+        projections and the lm_head) are eligible for the ``MatMulBlockScaledFp4`` op.
+        """
+        if basename == "/lm_head/MatMul":
+            return "lm_head"
+        m = re.match(r"^/model/layers\.(\d+)/shared_expert/(gate_proj|up_proj|down_proj)/MatMul$", basename)
+        if m:
+            layer_id = int(m.group(1))
+            proj = m.group(2)
+            return f"model.language_model.layers.{layer_id}.mlp.shared_expert.{proj}"
+        return None
+
+    def _make_matmul_nvfp4(self, basename, root_input, **kwargs):
+        """Emit a weight-only ``MatMulBlockScaledFp4`` node from the raw ModelOpt NVFP4 tensors.
+
+        The checkpoint stores these projections as packed NVFP4: ``weight`` uint8 ``[N, K/2]``
+        (two E2M1 codes per byte, low nibble first), ``weight_scale`` E4M3 ``[N, K/16]`` block
+        scales, and a scalar ``weight_scale_2`` fp32 global scale -- exactly the layout the
+        ``MatMulBlockScaledFp4`` op consumes, so the tensors are fed through unmodified. Returns the node
+        name, or ``None`` to fall back to the standard (int4/int8/fp16) path when the option is
+        off, the module is not NVFP4-eligible, or the tensors are absent/non-NVFP4 (e.g. the
+        BF16 MTP head).
+        """
+        if not self.use_original_nvfp4_weights:
+            return None
+
+        key_prefix = self._nvfp4_dense_key_for_matmul(basename)
+        if key_prefix is None:
+            return None
+
+        try:
+            weight = self._load_nvfp4_tensor(f"{key_prefix}.weight")
+            weight_scale = self._load_nvfp4_tensor(f"{key_prefix}.weight_scale")
+            weight_scale_2 = self._load_nvfp4_tensor(f"{key_prefix}.weight_scale_2")
+        except Exception:
+            return None
+
+        # Only the packed NVFP4 (uint8) modules take this path. Modules stored as BF16
+        # (e.g. the MTP head's shared expert / lm_head) fall back to the standard path.
+        if weight.dtype != torch.uint8:
+            return None
+
+        out_features = int(weight.shape[0])       # N
+        in_features = int(weight.shape[1]) * 2    # K (two E2M1 codes per packed byte)
+        block_size = 16
+
+        seq_dim = kwargs.get("seq_dim", "sequence_length")
+        output = "logits" if kwargs.get("logits", False) else f"{basename}/output_0"
+
+        prefix = basename[1:].replace("/", ".")
+        weight_name = f"{prefix}.nvfp4_weight"
+        self.make_initializer(weight.to(torch.uint8), weight_name)
+
+        scale_name = f"{prefix}.nvfp4_weight_scale"
+        self.make_initializer(weight_scale.view(torch.uint8), scale_name)
+
+        global_scale_name = f"{prefix}.nvfp4_weight_scale_2"
+        self.make_initializer(weight_scale_2.float().reshape(1), global_scale_name)
+
+        self.make_node(
+            "MatMulBlockScaledFp4",
+            inputs=[root_input, weight_name, scale_name, global_scale_name],
+            outputs=[output],
+            name=basename,
+            domain="com.microsoft",
+            K=in_features,
+            N=out_features,
+            block_size=block_size,
+        )
+        self.make_value(output, self.io_dtype, shape=["batch_size", seq_dim, out_features])
+        return basename
+
+    def make_matmul_op(self, matmul, basename, root_input, **kwargs):
+        fp8_name = self._make_fp8_attention_matmul(basename, root_input, **kwargs)
+        if fp8_name is not None:
+            return fp8_name
+        nvfp4_name = self._make_matmul_nvfp4(basename, root_input, **kwargs)
+        if nvfp4_name is not None:
+            return nvfp4_name
+        return super().make_matmul_op(matmul, basename, root_input, **kwargs)
 
     def make_model(self, input_path):
         # Build the main decoder model first.
