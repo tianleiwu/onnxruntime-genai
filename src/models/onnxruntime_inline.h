@@ -121,6 +121,9 @@ inline size_t SizeOf(ONNXTensorElementDataType type) {
       return sizeof(Ort::Float16_t);
     case Ort::TypeToTensorType<Ort::BFloat16_t>:
       return sizeof(Ort::BFloat16_t);
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E4M3FN:
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E5M2:
+      return 1;
     default:
       throw std::runtime_error("Unsupported ONNXTensorElementDataType in GetTypeSize");
   }

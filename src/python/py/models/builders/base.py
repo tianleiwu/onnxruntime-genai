@@ -2834,11 +2834,20 @@ class Model:
         k_norm_weight = kwargs.get("k_norm_weight", "")
         if bool(q_norm_weight) != bool(k_norm_weight):
             raise ValueError("q_norm_weight and k_norm_weight must be provided together.")
-        if q_norm_weight:
+        # FP8 (E4M3) KV cache: supply a shared per-tensor k/v scale at input indices 12, 13
+        # (these slots precede the fused QK-Norm weights at indices 14, 15 in the GQA schema).
+        fp8_kv_cache = bool(getattr(self, "fp8_kv_cache", False))
+        kv_scale = getattr(self, "kv_cache_scale_name", "") if fp8_kv_cache else ""
+        if kv_scale and not getattr(self, "_kv_cache_scale_created", False):
+            # The checkpoint exports no calibrated k/v scale, so use a unit per-tensor scale
+            # (a straight E4M3 round-trip of the KV cache).
+            self.make_initializer(torch.tensor([1.0], dtype=torch.float32), kv_scale, to=ir.DataType.FLOAT)
+            self._kv_cache_scale_created = True
+        if q_norm_weight or kv_scale:
             inputs.extend(
                 [
-                    "",  # k_scale
-                    "",  # v_scale
+                    kv_scale,  # k_scale
+                    kv_scale,  # v_scale (shared per-tensor scale)
                     q_norm_weight,
                     k_norm_weight,
                 ]
@@ -2855,6 +2864,10 @@ class Model:
             "do_rotary": self.attention_attrs["use_rope_in_attn"],
             "rotary_interleaved": self.rope_attrs["interleaved"],
         }
+        if fp8_kv_cache:
+            attributes["k_quant_type"] = "PER_TENSOR"
+            attributes["v_quant_type"] = "PER_TENSOR"
+            attributes["kv_cache_bit_width"] = 8
         if q_norm_weight:
             attributes["qk_norm_epsilon"] = kwargs.get("qk_norm_epsilon", self.attention_attrs["qk_norm_epsilon"])
         self.make_node(
