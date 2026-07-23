@@ -2206,6 +2206,13 @@ class Qwen35MoeTextModel(Qwen35TextModel):
         self.fp8_attn_static_input_scale = bool(
             extra_options.get("fp8_attn_static_input_scale", False)
         )
+        # Q/K/V projections consume the same activation and, in ModelOpt checkpoints,
+        # commonly share one calibrated input scale. Reuse their static quantization
+        # subgraph to avoid serializing redundant nodes even though ORT can CSE them.
+        self.share_fp8_attn_qkv_activation = str(
+            extra_options.get("share_fp8_attn_qkv_activation", "true")
+        ).lower() in ("1", "true", "yes")
+        self._fp8_attention_activation_cache = {}
 
         # FP8 (E4M3) KV cache to match the ModelOpt checkpoint (kv_cache_quant_algo=FP8).
         # GroupQueryAttention stores past/present KV as Float8E4M3FN with a shared PER_TENSOR
@@ -2449,6 +2456,13 @@ class Qwen35MoeTextModel(Qwen35TextModel):
                 except Exception:
                     static_scale_val = None
 
+        cache_key = None
+        if getattr(self, "share_fp8_attn_qkv_activation", False) and static_scale_val is not None:
+            cache_key = (root_input, hidden_size, seq_dim, static_scale_val)
+            cached_activation = self._fp8_attention_activation_cache.get(cache_key)
+            if cached_activation is not None:
+                return cached_activation
+
         const_dtype = "FLOAT"
         if self.io_dtype == ir.DataType.FLOAT16:
             const_dtype = "FLOAT16"
@@ -2598,13 +2612,16 @@ class Qwen35MoeTextModel(Qwen35TextModel):
             self.io_dtype,
             ["batch_size", seq_dim, hidden_size],
         )
-        return {
+        activation = {
             "activation": activation_output,
             "scale_a": scale_flat_output,
             "block_size": block_size,
             "block_count": block_count,
             "fallback_activation": f"{reshape_back_name}/output_0",
         }
+        if cache_key is not None:
+            self._fp8_attention_activation_cache[cache_key] = activation
+        return activation
 
     def _prepare_matmul_block_quantized_scales(self, weight_scale, out_features, block_count):
         # MatMulBlockScaledFp8 expects scaleB of shape [N, ceil(K / block_size)] = [out_features, block_count].
