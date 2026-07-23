@@ -122,8 +122,16 @@ MtpGenerator::MtpGenerator(const Model& main_model, const Model& mtp_model, cons
   main_ = CreateGenerator(main_model_, params);
   mtp_params_ = std::make_shared<GeneratorParams>(mtp_model_);
   mtp_params_->search = params.search;
-  mtp_params_->max_graph_capture_length = 1;
-  mtp_params_->use_graph_capture = false;
+  // CUDA-graph capture on the MTP head: the head is a single standard-attention layer (KV
+  // share-buffer, NO GatedDeltaNet recurrent state), so it is graph-capture-safe just like GQA.
+  // Its hidden_states input already stages the (per-step rebound) source into a stable static
+  // device buffer under capture (see HiddenStatesInputs::Update), so replay reads a stable
+  // address. Across the draft / batched-refeed / DraftTwo paths the head runs sequence lengths
+  // 1..N+1, so size the captured range to N+1 (matching the main model). GeneratorParams(mtp_model_)
+  // already set use_graph_capture from the head's session_options (enable_cuda_graph); honor it
+  // here instead of the previous unconditional disable.
+  mtp_params_->max_graph_capture_length =
+      mtp_params_->use_graph_capture ? (num_speculative_tokens_ + 1) : 1;
   mtp_ = CreateGenerator(mtp_model_, *mtp_params_);
 
   hidden_size_ = main_model_.config_->model.decoder.hidden_size;

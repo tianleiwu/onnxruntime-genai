@@ -27,13 +27,19 @@ struct HiddenStatesInputs {
   void Update(int sequence_length);
 
  private:
+  // Return the dedicated device buffer for `sequence_length`, allocating it on first use. Under
+  // CUDA-graph capture each length's buffer is a stable-address static allocation, so the captured
+  // graph for that length binds its own memory and replaying a different length never overwrites it.
+  Tensor* GetOrCreateBuffer(int sequence_length);
+
   State& state_;
   const Model& model_{state_.model_};
   size_t input_index_{~0U};
 
   std::array<int64_t, 3> shape_{};
   ONNXTensorElementDataType type_;
-  std::unique_ptr<Tensor> value_;
+  // One dedicated hidden_states buffer per sequence length (1, 2, ..., N+1).
+  std::unordered_map<int, std::unique_ptr<Tensor>> buffers_by_len_;
   OrtValue* pending_source_{};
 };
 
@@ -52,13 +58,19 @@ struct HiddenStatesOutputs {
   void Update(int sequence_length);  // Resize the output buffer to match the step's sequence length.
 
  private:
+  // Return the dedicated output buffer for `sequence_length`, allocating it on first use. Under
+  // CUDA-graph capture each length owns a stable-address static buffer, so the captured graph for
+  // that length writes to its own memory and a different length's output is never overwritten.
+  Tensor* GetOrCreateBuffer(int sequence_length);
+
   State& state_;
   const Model& model_{state_.model_};
   size_t output_index_{~0U};
 
   std::array<int64_t, 3> shape_{};
   ONNXTensorElementDataType type_;
-  std::unique_ptr<Tensor> value_;
+  // One dedicated hidden_states output buffer per sequence length (1, 2, ..., N+1).
+  std::unordered_map<int, std::unique_ptr<Tensor>> buffers_by_len_;
 };
 
 }  // namespace Generators

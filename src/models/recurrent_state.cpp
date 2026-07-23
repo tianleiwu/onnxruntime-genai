@@ -98,7 +98,21 @@ RecurrentState::RecurrentState(State& state)
   // TODO: Remove WebGPU special case once the ORT WebGPU EP adds a
   // LinearAttention kernel with native past/present buffer sharing support.
   const bool is_webgpu = model_.p_device_kvcache_->GetType() == DeviceType::WEBGPU;
-  graph_double_buffer_ = !is_webgpu && GetEnv("ORT_MTP_DOUBLE_BUFFER_RECURRENT_GRAPH") == "1";
+
+  // Under CUDA-graph capture the recurrent (conv + linear-attention) state MUST be
+  // double-buffered, not shared in place. Unlike GroupQueryAttention's KV share-buffer,
+  // the LinearAttention / CausalConvWithState kernels update the recurrent state in place
+  // (present_state aliased onto past_state); capturing that in-place update in a CUDA graph
+  // produces a small but systematic per-step logit bias on replay that derails greedy
+  // decoding (observed MMLU-Pro collapse ~85% -> ~21% with graph on). Double-buffering
+  // (distinct past/present with a per-step swap and two captured graph variants) is proven
+  // bit-faithful to eager, so make it the default whenever graph capture is enabled.
+  // ORT_MTP_DOUBLE_BUFFER_RECURRENT_GRAPH forces the behavior on ("1") or off ("0").
+  const std::string double_buffer_env = GetEnv("ORT_MTP_DOUBLE_BUFFER_RECURRENT_GRAPH");
+  const bool double_buffer_default_on = state_.params_->use_graph_capture;
+  const bool double_buffer_requested =
+      double_buffer_env == "1" || (double_buffer_env != "0" && double_buffer_default_on);
+  graph_double_buffer_ = !is_webgpu && double_buffer_requested;
   share_buffers_ = !is_webgpu && !graph_double_buffer_;
 
   if (!share_buffers_) {
