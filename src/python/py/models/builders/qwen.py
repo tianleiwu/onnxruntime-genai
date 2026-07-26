@@ -2436,9 +2436,9 @@ class Qwen35MoeTextModel(Qwen35TextModel):
         # per-tensor FP8 activation scale (``input_scale``) and per-tensor weight scale, so a
         # single block matches the original W8A8 scheme; (2) the MatMulBlockScaledFp8 CUDA
         # kernel's multi-block (K_blocks > 1) fast path is numerically incorrect at these
-        # shapes, while the single-block path is correct. The block scale is still computed
-        # dynamically per token (absmax), which is at least as accurate as the static
-        # ``input_scale`` and needs no calibration constant.
+        # shapes, while the single-block path is correct. The block scale comes from the
+        # checkpoint when static calibration is enabled, with dynamic per-token absmax as
+        # the fallback.
         block_size = hidden_size
         if hidden_size % block_size != 0:
             return None
@@ -2468,8 +2468,6 @@ class Qwen35MoeTextModel(Qwen35TextModel):
             const_dtype = "FLOAT16"
         elif self.io_dtype == ir.DataType.BFLOAT16:
             const_dtype = "BFLOAT16"
-        floor_const = f"/model/constants/{const_dtype}/[1e-10]"
-        fp8_max_const = f"/model/constants/{const_dtype}/[448.0]"
 
         block_count = hidden_size // block_size
         reshape_blocks_name = f"{basename}/FP8Act/Blocks/Reshape"
@@ -2481,63 +2479,77 @@ class Qwen35MoeTextModel(Qwen35TextModel):
             ["batch_size", seq_dim, block_count, block_size],
         )
 
-        abs_name = f"{basename}/FP8Act/Abs"
-        abs_output = f"{abs_name}/output_0"
-        self.make_node("Abs", [reshape_blocks_output], [abs_output], name=abs_name)
-        self.make_value(abs_output, self.io_dtype, ["batch_size", seq_dim, block_count, block_size])
-
-        amax_name = f"{basename}/FP8Act/Amax"
-        amax_output = f"{amax_name}/output_0"
-        self.make_reduce_max(
-            amax_name,
-            [abs_output, "/model/constants/INT64/[-1]"],
-            self.io_dtype,
-            ["batch_size", seq_dim, block_count, 1],
-            keepdims=True,
-        )
-
-        scale_floor_name = f"{basename}/FP8Act/ScaleFloor"
-        scale_floor_output = f"{scale_floor_name}/output_0"
-        self.make_clip(
-            scale_floor_name,
-            [amax_output, floor_const, ""],
-            self.io_dtype,
-            ["batch_size", seq_dim, block_count, 1],
-        )
-
         scale_name = f"{basename}/FP8Act/Scale"
-        scale_output = f"{scale_name}/output_0"
         if static_scale_val is not None:
-            # Static calibrated per-tensor input_scale: fill a [.,.,block_count,1] tensor with
-            # the constant input_scale (zero out the dynamic amax, then add the constant), so
-            # every token/block shares the checkpoint's calibrated scale (matches vLLM).
-            zeros_name = f"{basename}/FP8Act/Scale/Zeros"
-            zeros_output = f"{zeros_name}/output_0"
-            self.make_mul(
-                zeros_name,
-                [amax_output, f"/model/constants/{const_dtype}/[0.0]"],
-                self.io_dtype,
-                ["batch_size", seq_dim, block_count, 1],
+            scale_const = f"/model/constants/{const_dtype}/[{static_scale_val!r}]"
+            scale_shape_name = f"{scale_name}/Shape"
+            scale_shape_output = f"{scale_shape_name}/output_0"
+            self.make_node(
+                "Shape",
+                [root_input],
+                [scale_shape_output],
+                name=scale_shape_name,
+                start=0,
+                end=2,
             )
-            self.make_add(
+            self.make_value(scale_shape_output, ir.DataType.INT64, [2])
+            self.make_constant_of_shape(
                 scale_name,
-                [zeros_output, f"/model/constants/{const_dtype}/[{static_scale_val!r}]"],
+                scale_shape_output,
+                value=ir.tensor([static_scale_val], dtype=ir.DataType.FLOAT),
+                dtype=ir.DataType.FLOAT,
+                shape=["batch_size", seq_dim],
+            )
+            scale_flat_name = f"{basename}/FP8Act/Scale/Flat/Reshape"
+            scale_flat_output = f"{scale_flat_name}/output_0"
+            self.make_reshape(
+                scale_flat_name,
+                [f"{scale_name}/output_0", f"/model/constants/INT64/[-1, {block_count}]"],
+                ir.DataType.FLOAT,
+                ["batch_seq", block_count],
+            )
+            quant_scale = scale_const
+        else:
+            floor_const = f"/model/constants/{const_dtype}/[1e-10]"
+            fp8_max_const = f"/model/constants/{const_dtype}/[448.0]"
+            abs_name = f"{basename}/FP8Act/Abs"
+            abs_output = f"{abs_name}/output_0"
+            self.make_node("Abs", [reshape_blocks_output], [abs_output], name=abs_name)
+            self.make_value(abs_output, self.io_dtype, ["batch_size", seq_dim, block_count, block_size])
+
+            amax_name = f"{basename}/FP8Act/Amax"
+            amax_output = f"{amax_name}/output_0"
+            self.make_reduce_max(
+                amax_name,
+                [abs_output, "/model/constants/INT64/[-1]"],
+                self.io_dtype,
+                ["batch_size", seq_dim, block_count, 1],
+                keepdims=True,
+            )
+
+            scale_floor_name = f"{basename}/FP8Act/ScaleFloor"
+            scale_floor_output = f"{scale_floor_name}/output_0"
+            self.make_clip(
+                scale_floor_name,
+                [amax_output, floor_const, ""],
                 self.io_dtype,
                 ["batch_size", seq_dim, block_count, 1],
             )
-        else:
+
             self.make_div(
                 scale_name,
                 [scale_floor_output, fp8_max_const],
                 self.io_dtype,
                 ["batch_size", seq_dim, block_count, 1],
             )
+            scale_output = f"{scale_name}/output_0"
+            quant_scale = scale_output
 
         scaled_name = f"{basename}/FP8Act/Scaled"
         scaled_output = f"{scaled_name}/output_0"
         self.make_div(
             scaled_name,
-            [reshape_blocks_output, scale_output],
+            [reshape_blocks_output, quant_scale],
             self.io_dtype,
             ["batch_size", seq_dim, block_count, block_size],
         )
@@ -2560,32 +2572,33 @@ class Qwen35MoeTextModel(Qwen35TextModel):
             ["batch_size", seq_dim, hidden_size],
         )
 
-        scale_cast_name = f"{basename}/FP8Act/Scale/Cast"
-        scale_cast_output = f"{scale_cast_name}/output_0"
-        self.make_cast(
-            scale_cast_name,
-            scale_output,
-            ir.DataType.FLOAT,
-            ["batch_size", seq_dim, block_count, 1],
-        )
+        if static_scale_val is None:
+            scale_cast_name = f"{basename}/FP8Act/Scale/Cast"
+            scale_cast_output = f"{scale_cast_name}/output_0"
+            self.make_cast(
+                scale_cast_name,
+                scale_output,
+                ir.DataType.FLOAT,
+                ["batch_size", seq_dim, block_count, 1],
+            )
 
-        scale_squeeze_name = f"{basename}/FP8Act/Scale/Squeeze/Reshape"
-        scale_squeeze_output = f"{scale_squeeze_name}/output_0"
-        self.make_reshape(
-            scale_squeeze_name,
-            [scale_cast_output, "/model/constants/INT64/[0, 0, -1]"],
-            ir.DataType.FLOAT,
-            ["batch_size", seq_dim, block_count],
-        )
+            scale_squeeze_name = f"{basename}/FP8Act/Scale/Squeeze/Reshape"
+            scale_squeeze_output = f"{scale_squeeze_name}/output_0"
+            self.make_reshape(
+                scale_squeeze_name,
+                [scale_cast_output, "/model/constants/INT64/[0, 0, -1]"],
+                ir.DataType.FLOAT,
+                ["batch_size", seq_dim, block_count],
+            )
 
-        scale_flat_name = f"{basename}/FP8Act/Scale/Flat/Reshape"
-        scale_flat_output = f"{scale_flat_name}/output_0"
-        self.make_reshape(
-            scale_flat_name,
-            [scale_squeeze_output, f"/model/constants/INT64/[-1, {block_count}]"],
-            ir.DataType.FLOAT,
-            ["batch_seq", block_count],
-        )
+            scale_flat_name = f"{basename}/FP8Act/Scale/Flat/Reshape"
+            scale_flat_output = f"{scale_flat_name}/output_0"
+            self.make_reshape(
+                scale_flat_name,
+                [scale_squeeze_output, f"/model/constants/INT64/[-1, {block_count}]"],
+                ir.DataType.FLOAT,
+                ["batch_seq", block_count],
+            )
 
         dequant_name = f"{basename}/FP8Act/Dequantize/Cast"
         dequant_output = f"{dequant_name}/output_0"
@@ -2600,7 +2613,7 @@ class Qwen35MoeTextModel(Qwen35TextModel):
         restored_output = f"{restored_name}/output_0"
         self.make_mul(
             restored_name,
-            [dequant_output, scale_output],
+            [dequant_output, quant_scale],
             self.io_dtype,
             ["batch_size", seq_dim, block_count, block_size],
         )

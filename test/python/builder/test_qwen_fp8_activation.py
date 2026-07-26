@@ -9,10 +9,10 @@ import torch
 from models.builders.qwen import Qwen35MoeTextModel
 
 
-def _make_model(scales):
+def _make_model(scales, use_static_scale=True):
     model = object.__new__(Qwen35MoeTextModel)
     model.io_dtype = ir.DataType.FLOAT16
-    model.fp8_attn_static_input_scale = True
+    model.fp8_attn_static_input_scale = use_static_scale
     model.share_fp8_attn_qkv_activation = True
     model._fp8_attention_activation_cache = {}
     model._fp8_weight_key_for_matmul = MethodType(lambda self, basename: basename, model)
@@ -29,6 +29,7 @@ def _make_model(scales):
         "make_add",
         "make_cast",
         "make_clip",
+        "make_constant_of_shape",
         "make_div",
         "make_mul",
         "make_node",
@@ -51,6 +52,31 @@ def test_static_fp8_activation_is_shared_for_matching_qkv_inputs_and_scales():
     assert k_activation is q_activation
     assert v_activation is q_activation
     assert len(emitted_nodes) == nodes_after_q
+
+
+def test_static_fp8_activation_does_not_emit_dynamic_amax_path():
+    model, emitted_nodes = _make_model({"q": 0.125})
+
+    model._make_fp8_attention_activation("q", "hidden", 2048, "sequence_length")
+
+    emitted_op_types = [args[0] for args, _ in emitted_nodes if args and isinstance(args[0], str)]
+    assert "Abs" not in emitted_op_types
+    assert "Shape" in emitted_op_types
+    assert any("value" in kwargs and kwargs.get("dtype") == ir.DataType.FLOAT for _, kwargs in emitted_nodes)
+    assert all("Amax" not in str(args) for args, _ in emitted_nodes)
+    assert all("ScaleFloor" not in str(args) for args, _ in emitted_nodes)
+
+
+def test_dynamic_fp8_activation_keeps_amax_path():
+    model, emitted_nodes = _make_model({}, use_static_scale=False)
+
+    model._make_fp8_attention_activation("q", "hidden", 2048, "sequence_length")
+
+    emitted_op_types = [args[0] for args, _ in emitted_nodes if args and isinstance(args[0], str)]
+    assert "Abs" in emitted_op_types
+    assert any("Amax" in str(args) for args, _ in emitted_nodes)
+    assert any("ScaleFloor" in str(args) for args, _ in emitted_nodes)
+    assert all("value" not in kwargs for _, kwargs in emitted_nodes)
 
 
 def test_static_fp8_activation_is_not_shared_when_scale_differs():
