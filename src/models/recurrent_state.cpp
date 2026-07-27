@@ -66,15 +66,18 @@ RecurrentState::RecurrentState(State& state)
   conv_type_ = model_.session_info_.GetInputDataType(input_name_strings_[0]);
   recurrent_type_ = model_.session_info_.GetInputDataType(input_name_strings_[1]);
 
-  auto fix_batch_dim = [&](std::vector<int64_t> shape) -> std::vector<int64_t> {
-    if (!shape.empty() && shape[0] <= 0) {
-      shape[0] = state_.params_->BatchBeamSize();
+  // The window axis (when present) leads the batch axis, so the dynamic batch dim is at axis 1 for
+  // a windowed shape (conv_state rank 4, recurrent_state rank 5) and at axis 0 otherwise.
+  auto fix_batch_dim = [&](std::vector<int64_t> shape, size_t unwindowed_rank) -> std::vector<int64_t> {
+    const size_t batch_axis = shape.size() > unwindowed_rank ? 1 : 0;
+    if (shape.size() > batch_axis && shape[batch_axis] <= 0) {
+      shape[batch_axis] = state_.params_->BatchBeamSize();
     }
     return shape;
   };
 
-  conv_shape_ = fix_batch_dim(model_.session_info_.GetInputShape(input_name_strings_[0]));
-  recurrent_shape_ = fix_batch_dim(model_.session_info_.GetInputShape(input_name_strings_[1]));
+  conv_shape_ = fix_batch_dim(model_.session_info_.GetInputShape(input_name_strings_[0]), 3);
+  recurrent_shape_ = fix_batch_dim(model_.session_info_.GetInputShape(input_name_strings_[1]), 4);
 
   // Validate all dims are positive (only batch dim is expected to be dynamic)
   auto validate_shape = [](const std::vector<int64_t>& shape, const std::string& name) {
@@ -86,6 +89,22 @@ RecurrentState::RecurrentState(State& state)
   };
   validate_shape(conv_shape_, "conv_state");
   validate_shape(recurrent_shape_, "recurrent_state");
+
+  // A model built with `recurrent_state_window=W` carries a LEADING window axis (conv_state
+  // becomes rank 4 and recurrent_state rank 5). Only the last W per-token states are kept, which
+  // is what lets the MTP loop crop to an accepted prefix without a replay forward. The window axis
+  // leads the batch axis so each slot is one contiguous block, which makes CropToPosition a single
+  // copy for any batch size. Both node types must agree on W. Rank-3 / rank-4 shapes are the
+  // legacy unwindowed layout (W == 1).
+  const bool conv_windowed = conv_shape_.size() == 4;
+  const bool recurrent_windowed = recurrent_shape_.size() == 5;
+  if (conv_windowed != recurrent_windowed)
+    throw std::runtime_error("RecurrentState: conv_state and recurrent_state must both be windowed or neither");
+  if (conv_windowed) {
+    if (conv_shape_[0] != recurrent_shape_[0])
+      throw std::runtime_error("RecurrentState: conv_state and recurrent_state must use the same state window");
+    state_window_ = conv_shape_[0];
+  }
 
   const int num_layers = static_cast<int>(layer_indices_.size());
 
@@ -135,42 +154,6 @@ RecurrentState::RecurrentState(State& state)
     ZeroStates(pasts_);
   }
   ZeroStates(presents_);
-
-  // Discover the optional per-position state outputs (present_state_all), emitted when the model
-  // is built with emit_recurrent_state_all=true. They enable lossless multi-token MTP by letting
-  // the controller crop the recurrent state to the accepted length (copy present_state_all[:, a]
-  // into the live state) instead of a full main-model replay forward.
-  std::string present_conv_all_template = derive_template(present_key_template, "conv_state_all");
-  std::string present_recurrent_all_template = derive_template(present_key_template, "recurrent_state_all");
-  if (!present_recurrent_all_template.empty()) {
-    const std::string probe = ComposeKeyValueName(present_recurrent_all_template, layer_indices_[0]);
-    has_state_all_ = model_.session_info_.HasOutput(probe);
-  }
-
-  if (has_state_all_) {
-    const std::string binding = GetEnv("ORT_MTP_STATE_ALL_BINDING");
-    if (binding == "conv") {
-      bind_recurrent_all_ = false;
-    } else if (binding == "recurrent") {
-      bind_conv_all_ = false;
-    } else if (binding == "none") {
-      bind_conv_all_ = false;
-      bind_recurrent_all_ = false;
-    } else if (!binding.empty() && binding != "all") {
-      throw std::runtime_error("ORT_MTP_STATE_ALL_BINDING must be all, conv, recurrent, or none");
-    }
-
-    // Per-position shapes: insert the seq_len axis at position 1 of the live-state shapes.
-    conv_all_shape_ = {conv_shape_[0], 0, conv_shape_[1], conv_shape_[2]};
-    recurrent_all_shape_ = {recurrent_shape_[0], 0, recurrent_shape_[1], recurrent_shape_[2], recurrent_shape_[3]};
-    presents_all_.reserve(num_layers * 2);
-    for (int i = 0; i < num_layers; ++i) {
-      output_all_name_strings_.push_back(ComposeKeyValueName(present_conv_all_template, layer_indices_[i]));
-      output_all_name_strings_.push_back(ComposeKeyValueName(present_recurrent_all_template, layer_indices_[i]));
-      presents_all_.push_back(std::make_unique<Tensor>(model_.p_device_kvcache_, conv_type_));
-      presents_all_.push_back(std::make_unique<Tensor>(model_.p_device_kvcache_, recurrent_type_));
-    }
-  }
 }
 
 void RecurrentState::Add() {
@@ -188,70 +171,35 @@ void RecurrentState::Add() {
     state_.outputs_.push_back(presents_[i].get());
     state_.output_names_.push_back(output_name_strings_[i].c_str());
   }
-
-  // Register the per-position state outputs as managed outputs (static-buffer, so they survive
-  // CUDA-graph capture). Their OrtValue is (re)created per step by UpdateAll(); push nullptr here.
-  if (has_state_all_) {
-    output_all_index_ = state_.outputs_.size();
-    for (int i = 0; i < num_layers; ++i) {
-      if (bind_conv_all_) {
-        state_.outputs_.push_back(presents_all_[i * 2]->GetOrtTensor());  // nullptr until UpdateAll()
-        state_.output_names_.push_back(output_all_name_strings_[i * 2].c_str());
-      }
-      if (bind_recurrent_all_) {
-        state_.outputs_.push_back(presents_all_[i * 2 + 1]->GetOrtTensor());
-        state_.output_names_.push_back(output_all_name_strings_[i * 2 + 1].c_str());
-      }
-    }
-  }
 }
 
-void RecurrentState::UpdateAll(int sequence_length) {
-  if (!has_state_all_) return;
-  // Only rebuild when the sequence length changes (matches HiddenStatesOutputs). conv_all_shape_[1]
-  // and recurrent_all_shape_[1] track together.
-  if (static_cast<int64_t>(sequence_length) == conv_all_shape_[1]) return;
-
-  const int max_cap = state_.params_->max_graph_capture_length;
-  // Static buffer when graph capture is active so the captured graph binds a stable output address.
-  // Pre-size to the max captured length (the N+1-token MTP verify shape).
-  const bool use_static = state_.params_->use_graph_capture && sequence_length >= 1 && sequence_length <= max_cap;
-  const int num_layers = static_cast<int>(layer_indices_.size());
-
-  conv_all_shape_[1] = sequence_length;
-  recurrent_all_shape_[1] = sequence_length;
-
-  const size_t conv_pos_elems = static_cast<size_t>(conv_all_shape_[2]) * conv_all_shape_[3];
-  const size_t rec_pos_elems = static_cast<size_t>(recurrent_all_shape_[2]) * recurrent_all_shape_[3] * recurrent_all_shape_[4];
-
-  size_t output_index = output_all_index_;
-  for (int i = 0; i < num_layers; ++i) {
-    if (bind_conv_all_) {
-      const size_t conv_cap = use_static ? static_cast<size_t>(conv_all_shape_[0]) * max_cap * conv_pos_elems * Ort::SizeOf(conv_type_) : 0;
-      presents_all_[i * 2]->CreateTensor(conv_all_shape_, use_static, conv_cap);
-      state_.outputs_[output_index++] = presents_all_[i * 2]->GetOrtTensor();
-    }
-
-    if (bind_recurrent_all_) {
-      const size_t rec_cap = use_static ? static_cast<size_t>(recurrent_all_shape_[0]) * max_cap * rec_pos_elems * Ort::SizeOf(recurrent_type_) : 0;
-      presents_all_[i * 2 + 1]->CreateTensor(recurrent_all_shape_, use_static, rec_cap);
-      state_.outputs_[output_index++] = presents_all_[i * 2 + 1]->GetOrtTensor();
-    }
-  }
+void RecurrentState::SetForwardLength(int sequence_length) {
+  forward_length_ = sequence_length;
 }
 
 void RecurrentState::CropToPosition(size_t position) {
-  if (!HasStateAll())
-    throw std::runtime_error("RecurrentState::CropToPosition requires the model exported with emit_recurrent_state_all=true");
-  // Copy present_state_all[:, position] (the recurrent/conv state AFTER token `position` of the
-  // last forward) into the live present buffers. Assumes batch_size == 1 (MTP is batch 1): each
-  // per-position slice is a contiguous block of size == the live per-layer state.
+  if (!IsWindowed())
+    throw std::runtime_error(
+        "RecurrentState::CropToPosition requires the model exported with recurrent_state_window > 1");
+  // The live state is in presents_ (the buffers the last forward wrote; Update()/the swap has not
+  // run yet at this point). Window slot j holds the state AFTER token (seq_len - W + j), so token
+  // `position` lives in slot position + W - seq_len. Promote it to slot W-1, which is the slot the
+  // ops read back as past_state on the next forward -- that alone commits the accepted prefix.
+  const int64_t signed_slot = static_cast<int64_t>(position) + state_window_ - forward_length_;
+  if (signed_slot < 0)
+    throw std::runtime_error(
+        "RecurrentState::CropToPosition(" + std::to_string(position) + ") is outside the state window of " +
+        std::to_string(state_window_) + " for a forward of length " + std::to_string(forward_length_) +
+        "; rebuild the model with a larger recurrent_state_window");
+  const size_t slot = static_cast<size_t>(signed_slot);
+  if (slot + 1 == static_cast<size_t>(state_window_)) return;  // Already the committed slot.
+
   auto& device = *model_.p_device_;
-  for (size_t j = 0; j < presents_.size(); ++j) {
-    auto dst = ByteWrapTensor(device, *presents_[j]);
-    auto all = ByteWrapTensor(device, *presents_all_[j]->GetOrtTensor());
-    const size_t slice_bytes = dst.size();
-    dst.CopyFrom(all.subspan(position * slice_bytes, slice_bytes));
+  for (auto& present : presents_) {
+    auto window = ByteWrapTensor(device, *present);
+    const size_t slot_bytes = window.size() / static_cast<size_t>(state_window_);
+    window.subspan((static_cast<size_t>(state_window_) - 1) * slot_bytes, slot_bytes)
+        .CopyFrom(window.subspan(slot * slot_bytes, slot_bytes));
   }
 }
 

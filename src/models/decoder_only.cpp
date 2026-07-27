@@ -117,7 +117,7 @@ void DecoderOnly_State::SnapshotState() {
 }
 
 bool DecoderOnly_State::HasCroppableRecurrentState() const {
-  return recurrent_state_ && recurrent_state_->HasStateAll();
+  return recurrent_state_ && recurrent_state_->IsWindowed();
 }
 
 void DecoderOnly_State::CropToAccepted(size_t new_length, size_t recurrent_position) {
@@ -164,7 +164,7 @@ void DecoderOnly_State::UpdateInputsOutputs(DeviceSpan<int32_t>& next_tokens, De
   if (hidden_states_output_)
     hidden_states_output_->Update(static_cast<int>(new_length));
   if (recurrent_state_)
-    recurrent_state_->UpdateAll(static_cast<int>(new_length));
+    recurrent_state_->SetForwardLength(static_cast<int>(new_length));
   logits_.Update(next_tokens, new_length);
 }
 

@@ -77,8 +77,9 @@ int32_t SampleCorrectionSparse(const std::vector<int32_t>& p_idx, const std::vec
 // or sync-bound. Zero overhead when the env var is unset.
 struct HostPhaseProfiler {
   bool on = false;
-  double draft = 0, verify = 0, accept = 0, finalize = 0;
+  double draft = 0, verify = 0, accept = 0, finalize = 0, argmax = 0;
   long steps = 0;
+  long main_fwds = 0, head_fwds = 0, tokens = 0;
   using clk = std::chrono::steady_clock;
   HostPhaseProfiler() {
     const char* e = std::getenv("ORT_MTP_PROFILE_HOST");
@@ -88,17 +89,25 @@ struct HostPhaseProfiler {
   static double ms(clk::time_point a, clk::time_point b) {
     return std::chrono::duration<double, std::milli>(b - a).count();
   }
+  // Phase boundaries only line up with GPU work if the stream is drained; several phases
+  // (head refeed, the accept-all bonus copy) issue async work that would otherwise be billed to
+  // whichever later phase happens to synchronize. Only used when the env var is set.
+  static void sync(DeviceInterface& dev) { dev.Synchronize(); }
   void report() {
     if (steps == 0) return;
     const double tot = draft + verify + accept + finalize;
     std::fprintf(stderr,
-                 "[MTP host/step last %ld steps] total=%.3fms  draft=%.3f(%.0f%%)  verify+topk=%.3f(%.0f%%)  "
-                 "accept+refeed=%.3f(%.0f%%)  finalize=%.3f(%.0f%%)\n",
+                 "[MTP host/step last %ld steps] total=%.3fms  draft=%.3f(%.0f%%)  verify+argmax=%.3f(%.0f%%)  "
+                 "[of which argmax=%.3f]  refeed=%.3f(%.0f%%)  finalize=%.3f(%.0f%%)  | tokens/step=%.2f "
+                 "main_fwd/step=%.2f head_fwd/step=%.2f  ms/token=%.3f\n",
                  steps, tot / steps, draft / steps, 100 * draft / tot, verify / steps, 100 * verify / tot,
-                 accept / steps, 100 * accept / tot, finalize / steps, 100 * finalize / tot);
+                 argmax / steps, accept / steps, 100 * accept / tot, finalize / steps, 100 * finalize / tot,
+                 static_cast<double>(tokens) / steps, static_cast<double>(main_fwds) / steps,
+                 static_cast<double>(head_fwds) / steps, tokens > 0 ? tot / tokens : 0.0);
     // Reset so each report reflects only the most recent window (excludes one-time warmup/MoE-profiler).
-    draft = verify = accept = finalize = 0;
+    draft = verify = accept = finalize = argmax = 0;
     steps = 0;
+    main_fwds = head_fwds = tokens = 0;
   }
 };
 HostPhaseProfiler g_host_prof;
@@ -115,11 +124,28 @@ MtpGenerator::MtpGenerator(const Model& main_model, const Model& mtp_model, cons
     const int v = std::atoi(env);
     if (v >= 1) num_speculative_tokens_ = v;
   }
+  // Opt-in: commit a partial accept straight out of the verify forward's windowed recurrent state
+  // instead of replaying the accepted prefix. Requires a model exported with
+  // recurrent_state_window > 1. Read once -- the greedy step consults it on the
+  // hot path (and uses it to decide whether the recurrent snapshot is needed at all).
+  direct_arena_commit_ = std::getenv("ORT_MTP_DIRECT_ARENA_COMMIT") != nullptr;
+  // Chunked prefill. The windowed recurrent state is a fixed [B, W, ...] buffer, so it no longer
+  // scales with the prompt, but a single-shot forward over a long prompt still blows up the ORT
+  // activation arena (measured: 54 GB chunked vs 94 GB unchunked on a 2.8k-token prompt). Feed
+  // the prompt in chunks so peak memory stays bounded; only the last chunk's outputs are consumed.
+  if (const char* env = std::getenv("ORT_MTP_PREFILL_CHUNK")) {
+    prefill_chunk_ = std::atoi(env);
+    if (prefill_chunk_ < 0) prefill_chunk_ = 0;
+    prefill_chunk_explicit_ = true;
+  }
   // Capture the 1-token decode and the verify shapes up to N+1 tokens.
   auto& main_params = const_cast<GeneratorParams&>(params);
   main_params.max_graph_capture_length = num_speculative_tokens_ + 1;
 
   main_ = CreateGenerator(main_model_, params);
+  // Default the chunking on for windowed-state models only (they are the ones running long
+  // prompts through the MTP loop); 256 tokens/chunk costs a handful of extra forwards.
+  if (!prefill_chunk_explicit_ && main_->CanCropRecurrentState()) prefill_chunk_ = 256;
   mtp_params_ = std::make_shared<GeneratorParams>(mtp_model_);
   mtp_params_->search = params.search;
   // CUDA-graph capture on the MTP head: the head is a single standard-attention layer (KV
@@ -186,13 +212,8 @@ MtpGenerator::MtpGenerator(const Model& main_model, const Model& mtp_model, cons
     drafts_.resize(num_speculative_tokens_);
     verify_tokens_.resize(num_speculative_tokens_ + 1);
     verify_argmax_.resize(num_speculative_tokens_ + 1);
-  }
-  if (sampling_) {
-    draft_idx_.resize(num_speculative_tokens_);
-    draft_prob_.resize(num_speculative_tokens_);
-    target_idx_.resize(num_speculative_tokens_ + 1);
-    target_prob_.resize(num_speculative_tokens_ + 1);
-    // Per-size [1,j,H] hidden buffers (j=1..N) for the batched head refeed (one forward instead of a).
+    // Per-size [1,j,H] hidden buffers (j=1..N) so the post-verify head refeed of the j accepted
+    // drafts runs as ONE batched head forward instead of one forward per token.
     refeed_multi_.resize(static_cast<size_t>(num_speculative_tokens_) + 1);
     for (int j = 1; j <= num_speculative_tokens_; ++j) {
       refeed_multi_[j] = std::make_shared<Tensor>(
@@ -201,6 +222,12 @@ MtpGenerator::MtpGenerator(const Model& main_model, const Model& mtp_model, cons
       const std::array<int64_t, 3> sh{1, j, hidden_size_};
       refeed_multi_[j]->CreateTensor(sh);
     }
+  }
+  if (sampling_) {
+    draft_idx_.resize(num_speculative_tokens_);
+    draft_prob_.resize(num_speculative_tokens_);
+    target_idx_.resize(num_speculative_tokens_ + 1);
+    target_prob_.resize(num_speculative_tokens_ + 1);
   }
 }
 
@@ -448,12 +475,25 @@ int32_t MtpGenerator::DraftTwo(OrtValue* hidden, int32_t tok0, int32_t tok1) {
 }
 
 void MtpGenerator::AppendTokens(cpu_span<const int32_t> input_ids) {
-  main_->AppendTokens(input_ids);
+  // Chunked prefill: bounds the ORT activation arena of the prompt forward (see the constructor).
+  // Off (single forward) when ORT_MTP_PREFILL_CHUNK is 0/unset or the prompt fits in one chunk.
+  const size_t total = input_ids.size();
+  size_t tail = total;
+  if (prefill_chunk_ > 0 && total > static_cast<size_t>(prefill_chunk_)) {
+    const size_t chunk = static_cast<size_t>(prefill_chunk_);
+    for (size_t off = 0; off < total; off += chunk) {
+      const size_t n = std::min(chunk, total - off);
+      main_->AppendTokens(cpu_span<const int32_t>(input_ids.data() + off, n));
+      tail = n;  // outputs below are read from the final chunk's forward
+    }
+  } else {
+    main_->AppendTokens(input_ids);
+  }
   length_ = input_ids.size();
   for (auto t : input_ids) sequence_.push_back(t);
 
   OrtValue* hidden = main_->state_->GetOutput(main_model_.config_->model.decoder.outputs.hidden_states.c_str());
-  const int last = static_cast<int>(input_ids.size()) - 1;
+  const int last = static_cast<int>(tail) - 1;
   ExtractHiddenPosition(hidden, last);             // h for the token we are about to predict
   if (sampling_) {
     // Sample the first generated token from the truncated target distribution at the last prompt
@@ -562,6 +602,8 @@ void MtpGenerator::GenerateStepSingle(int32_t t) {
 void MtpGenerator::GenerateStepMulti(int32_t t) {
   const int N = std::min(num_speculative_tokens_, static_cast<int>(max_length_ - length_ - 1));
   const std::string& hs_name = main_model_.config_->model.decoder.outputs.hidden_states;
+  const bool prof = g_host_prof.on;
+  auto tp0 = prof ? HostPhaseProfiler::now() : HostPhaseProfiler::clk::time_point{};
 
   // --- Draft phase: chain the single MTP module N times. ---
   // Step 0 feeds the main model's hidden (hidden_slice_ holds h paired with t) and appends the
@@ -574,6 +616,11 @@ void MtpGenerator::GenerateStepMulti(int32_t t) {
     mtp_->SetHiddenStates(head_out_hidden_);
     drafts_[k] = DraftHeadStep(drafts_[k - 1]);
   }
+  if (prof) {
+    HostPhaseProfiler::sync(*mtp_model_.p_device_);
+    g_host_prof.head_fwds += N;
+  }
+  auto tp1 = prof ? HostPhaseProfiler::now() : HostPhaseProfiler::clk::time_point{};
 
   // --- Verify [t, d0..d_{N-1}] in a single batched main forward (the whole point of MTP: one
   //     forward validates N+1 tokens). The batched (M=N+1) forward is numerically ~equal but not
@@ -581,13 +628,28 @@ void MtpGenerator::GenerateStepMulti(int32_t t) {
   //     Flash attention), so a greedy argmax can occasionally differ on near-ties. This is the same
   //     tradeoff the N=1 verify already makes; the reject path below re-runs decode-consistently to
   //     bound divergence from plain greedy. ---
-  main_->SnapshotState();
+  // SnapshotState() copies every linear-attention layer's conv+recurrent state (2*num_layers D2D
+  // copies + launches) on EVERY step. It is only needed by the RewindToLength fallback below. With
+  // the direct-arena commit on a croppable model that fallback is unreachable (a==N takes the bonus
+  // branch, a<N takes the crop branch), so the snapshot is dead overhead -- skip it.
+  const bool crop_commit = direct_arena_commit_ && main_->CanCropRecurrentState();
+  if (!crop_commit) main_->SnapshotState();
   verify_tokens_[0] = t;
   for (int k = 0; k < N; ++k) verify_tokens_[k + 1] = drafts_[k];
   main_->AppendTokens(cpu_span<const int32_t>(verify_tokens_.data(), N + 1));
   ++forwards_;
+  // Drain the verify forward before timing the argmax, otherwise the first ArgMax call (which
+  // synchronizes) absorbs the whole forward's GPU time into the argmax bucket.
+  if (prof) HostPhaseProfiler::sync(*main_model_.p_device_);
+  auto tpa = prof ? HostPhaseProfiler::now() : HostPhaseProfiler::clk::time_point{};
   ArgmaxMainRows(0, N + 1, verify_argmax_.data());  // main's real token after each verify position
   OrtValue* vhidden = main_->state_->GetOutput(hs_name.c_str());
+  if (prof) {
+    HostPhaseProfiler::sync(*main_model_.p_device_);
+    ++g_host_prof.main_fwds;
+    g_host_prof.argmax += HostPhaseProfiler::ms(tpa, HostPhaseProfiler::now());
+  }
+  auto tp2 = prof ? HostPhaseProfiler::now() : HostPhaseProfiler::clk::time_point{};
 
   // --- Longest accepted prefix (greedy match against the main model). ---
   int a = 0;
@@ -607,15 +669,29 @@ void MtpGenerator::GenerateStepMulti(int32_t t) {
 
   // --- Roll the MTP head KV back to the committed tokens: keep t (fed with its main hidden), drop
   //     the N-1 speculative drafts, then re-materialize the a accepted drafts with the main model's
-  //     hidden states. Extract the head-refeed hiddens from the verify output BEFORE any main
-  //     rewind overwrites the hidden buffer. ---
+  //     hidden states in ONE batched head forward (instead of a separate forward per token).
+  //     Extract the head-refeed hiddens from the verify output BEFORE any main rewind overwrites
+  //     the hidden buffer. The refeed needs no argmax and no head-feedback hidden: the next step's
+  //     first draft is fed the main model's hidden (hidden_slice_), not the head's own. ---
   mtp_->RewindToLength(head_start + 1);
   head_len_ = head_start + 1;
-  for (int k = 0; k < a; ++k) {
-    CopyHiddenRow(vhidden, k, *refeed_hidden_);  // main hidden that predicted drafts_[k]
-    mtp_->SetHiddenStates(refeed_hidden_);
-    DraftHeadStep(drafts_[k], /*need_draft=*/false);  // re-append with the main hidden (no argmax)
+  if (a > 0) {
+    Tensor& hbuf = *refeed_multi_[a];
+    const size_t row_bytes = refeed_hidden_->GetByteSpan().size();
+    auto dst = hbuf.GetByteSpan();
+    auto src = ByteWrapTensor(*main_model_.p_device_, *vhidden);
+    for (int k = 0; k < a; ++k)
+      dst.subspan(static_cast<size_t>(k) * row_bytes, row_bytes)
+          .CopyFrom(src.subspan(static_cast<size_t>(k) * row_bytes, row_bytes));
+    mtp_->SetHiddenStates(refeed_multi_[a]);
+    mtp_->AppendTokens(cpu_span<const int32_t>(drafts_.data(), a));  // d0..d_{a-1} with main hiddens
+    head_len_ = head_start + 1 + static_cast<size_t>(a);
   }
+  if (prof) {
+    HostPhaseProfiler::sync(*mtp_model_.p_device_);
+    g_host_prof.head_fwds += (a > 0) ? 1 : 0;
+  }
+  auto tp3 = prof ? HostPhaseProfiler::now() : HostPhaseProfiler::clk::time_point{};
 
   if (a == N) {
     // All drafts accepted: the batched verify already committed [t, d0..d_{N-1}] correctly, so the
@@ -624,17 +700,22 @@ void MtpGenerator::GenerateStepMulti(int32_t t) {
     next_token_ = verify_argmax_[a];
     CopyHiddenRow(vhidden, a, *hidden_slice_);
     length_ += static_cast<size_t>(N) + 1;
-  } else if (std::getenv("ORT_MTP_DIRECT_ARENA_COMMIT") != nullptr && main_->CanCropRecurrentState()) {
+  } else if (crop_commit) {
+    // Partial accept, DIRECT ARENA COMMIT: the batched verify already advanced the KV and the
+    // per-position recurrent arena through every verify token, so crop both to the accepted length
+    // and take the bonus from verify row a. No replay forward at all (the reject path is ~30% of
+    // step time otherwise). Row a's argmax is an early row of a wide forward, so it is not
+    // bit-identical to a sequential decode on near-ties; see EXP-023.
     main_->CropToAccepted(length_ + static_cast<size_t>(a) + 1, static_cast<size_t>(a));
     next_token_ = verify_argmax_[a];
     CopyHiddenRow(vhidden, a, *hidden_slice_);
     length_ += static_cast<size_t>(a) + 1;
   } else if (main_->CanCropRecurrentState() && a >= 1) {
-    // Partial accept (a>=1), LOSSLESS CROP fast-path (model exported with emit_recurrent_state_all).
+    // Partial accept (a>=1), LOSSLESS CROP fast-path (model exported with recurrent_state_window).
     // The batched verify's row a is an EARLY row of a wide (M=N+1) forward, whose argmax is NOT
     // decode-consistent (only the LAST row of a forward matches a 1-token decode; §13.1). So we
     // cannot take the bonus straight from the verify. Instead: crop the KV cache + recurrent state
-    // to L+a (state AFTER verify tokens 0..a-1 == present_state_all[:, a-1]) -- avoiding the wide
+    // to L+a (state AFTER verify tokens 0..a-1 == window slot for position a-1) -- avoiding the wide
     // (a+1)-token replay -- then M=1-decode the last committed token (d_{a-1}, at position L+a). Its
     // row-0 logits ARE decode-consistent, giving a lossless bonus. This replaces the §13.5 wide
     // replay (M=a+1) with a cheap M=1 forward.
@@ -645,6 +726,7 @@ void MtpGenerator::GenerateStepMulti(int32_t t) {
     std::array<int32_t, 1> last{drafts_[a - 1]};  // committed token at position L+a
     main_->AppendTokens(cpu_span<const int32_t>(last));
     ++forwards_;
+    if (prof) ++g_host_prof.main_fwds;
     OrtValue* rhidden = main_->state_->GetOutput(hs_name.c_str());
     ArgmaxMainRows(0, 1, &next_token_);         // decode-consistent bonus (M=1 last row)
     CopyHiddenRow(rhidden, 0, *hidden_slice_);  // hidden paired with the bonus token
@@ -664,6 +746,18 @@ void MtpGenerator::GenerateStepMulti(int32_t t) {
     ArgmaxMainRows(a, 1, &next_token_);        // main's token after the committed prefix
     CopyHiddenRow(rhidden, a, *hidden_slice_);  // hidden paired with the bonus token
     length_ += static_cast<size_t>(a) + 1;
+    if (prof) ++g_host_prof.main_fwds;
+  }
+
+  if (prof) {
+    HostPhaseProfiler::sync(*main_model_.p_device_);
+    auto tp4 = HostPhaseProfiler::now();
+    g_host_prof.draft += HostPhaseProfiler::ms(tp0, tp1);
+    g_host_prof.verify += HostPhaseProfiler::ms(tp1, tp2);
+    g_host_prof.accept += HostPhaseProfiler::ms(tp2, tp3);
+    g_host_prof.finalize += HostPhaseProfiler::ms(tp3, tp4);
+    g_host_prof.tokens += static_cast<long>(a) + 1;
+    if (++g_host_prof.steps % 50 == 0) g_host_prof.report();
   }
 }
 
@@ -686,9 +780,9 @@ void MtpGenerator::GenerateStepMultiSample(int32_t t) {
 
   // --- Verify [t, d0..d_{N-1}] in a single batched main forward. ---
   // Snapshot the recurrent state ONLY for the fallback re-run rollback (models WITHOUT
-  // emit_recurrent_state_all). Snapshot() copies every linear-attn layer's conv+recurrent
+  // recurrent_state_window). Snapshot() copies every linear-attn layer's conv+recurrent
   // state (2*num_layers D2D copies + launches) on EVERY step. When the crop fast-path is
-  // available the reject branch uses present_state_all via CropToPosition and NEVER rewinds
+  // available the reject branch uses the state window via CropToPosition and NEVER rewinds
   // the recurrent state (RewindTo/RestoreSnapshot is unreachable), so the snapshot is dead
   // overhead -- skip it. The predicate matches the reject-path crop-vs-fallback choice below,
   // so the fallback branch still has its snapshot when it needs one.
@@ -784,9 +878,9 @@ void MtpGenerator::GenerateStepMultiSample(int32_t t) {
     CopyHiddenRow(vhidden, N, *hidden_slice_);  // hidden that predicted the bonus token
     length_ += static_cast<size_t>(N) + 1;
   } else if (main_->CanCropRecurrentState()) {
-    // Rejected at position a, LOSSLESS-CROP fast path (model exported with emit_recurrent_state_all):
+    // Rejected at position a, LOSSLESS-CROP fast path (model exported with recurrent_state_window):
     // skip the full re-run main forward (~25% of N=3 step time). The batched verify already advanced
-    // the recurrent state through every token (present_state_all[:, a] = state AFTER the committed
+    // the recurrent state through every token (window slot for position a = state AFTER the committed
     // prefix [t, d0..d_{a-1}]) and computed row a's hidden -- which is exactly the hidden that
     // predicts the correction (a causal hidden is independent of the rejected drafts that follow it,
     // so verify row a == the re-run's row a). So crop the KV + recurrent state to L+a+1 and pair the
@@ -800,7 +894,7 @@ void MtpGenerator::GenerateStepMultiSample(int32_t t) {
     CopyHiddenRow(vhidden, a, *hidden_slice_);  // verify row a: hidden that predicts the correction
     length_ += static_cast<size_t>(a) + 1;
   } else {
-    // Fallback (model without emit_recurrent_state_all): the recurrent state cannot be cropped, so
+    // Fallback (model without recurrent_state_window): the recurrent state cannot be cropped, so
     // restore the snapshot at L and re-run only the committed prefix [t, d0..d_{a-1}] so the carried
     // recurrent/KV state is decode-consistent; pair the sampled correction (already drawn from the
     // batched verify's residual) with the re-run's hidden at row a.
@@ -821,6 +915,9 @@ void MtpGenerator::GenerateStepMultiSample(int32_t t) {
     g_host_prof.verify += HostPhaseProfiler::ms(tp1, tp2);
     g_host_prof.accept += HostPhaseProfiler::ms(tp2, tp3);
     g_host_prof.finalize += HostPhaseProfiler::ms(tp3, tp4);
+    g_host_prof.tokens += static_cast<long>(a) + 1;
+    g_host_prof.head_fwds += N + (a > 0 ? 1 : 0);
+    g_host_prof.main_fwds += rejected && !main_->CanCropRecurrentState() ? 2 : 1;
     if (++g_host_prof.steps % 100 == 0) g_host_prof.report();
   }
 }

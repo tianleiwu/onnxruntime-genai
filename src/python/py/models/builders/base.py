@@ -2892,23 +2892,26 @@ class Model:
         output = f"{name}/output_0"
         present_conv = kwargs["present_conv_state"]
         outputs = [output, present_conv]
-        # Optional per-position carry state output(2): [B, seq_len, C, K-1].
-        present_conv_all = kwargs.get("present_conv_state_all", None)
-        if present_conv_all:
-            outputs.append(present_conv_all)
+        attributes = {
+            "ndim": kwargs.get("ndim", 1),
+            "activation": kwargs.get("activation", "silu"),
+        }
+        # state_window=W widens past_conv_state / present_conv_state to [B, W, C, K-1]: the carry
+        # states after the last W positions, right-aligned. Slot W-1 is the state after the final
+        # position (i.e. what the unwindowed op produces) and is the only slot the op reads.
+        state_window = kwargs.get("state_window", 0)
+        if state_window:
+            attributes["state_window"] = state_window
         self.make_node(
             "CausalConvWithState",
             inputs=inputs,
             outputs=outputs,
             name=name,
             domain="com.microsoft",
-            ndim=kwargs.get("ndim", 1),
-            activation=kwargs.get("activation", "silu"),
+            **attributes,
         )
         self.make_value(output, self.io_dtype, shape=kwargs["output_shape"])
         self.make_value(present_conv, self.io_dtype, shape=kwargs["present_conv_shape"])
-        if present_conv_all:
-            self.make_value(present_conv_all, self.io_dtype, shape=kwargs["present_conv_all_shape"])
 
     def make_linear_attention(self, name, **kwargs):
         inputs = [
@@ -2922,25 +2925,28 @@ class Model:
         output = f"{name}/output_0"
         present_recurrent = kwargs["present_recurrent_state"]
         outputs = [output, present_recurrent]
-        # Optional per-position recurrent state output(2): [B, seq_len, H_kv, d_k, d_v].
-        present_recurrent_all = kwargs.get("present_recurrent_state_all", None)
-        if present_recurrent_all:
-            outputs.append(present_recurrent_all)
+        attributes = {
+            "q_num_heads": kwargs["q_num_heads"],
+            "kv_num_heads": kwargs["kv_num_heads"],
+            "update_rule": kwargs.get("update_rule", "gated_delta"),
+            "scale": kwargs.get("scale", 1.0),
+        }
+        # state_window=W widens past/present_recurrent_state to [B, W, H_kv, d_k, d_v]: the
+        # recurrent states after the last W tokens, right-aligned. Slot W-1 is the state after the
+        # final token (i.e. what the unwindowed op produces) and is the only slot the op reads.
+        state_window = kwargs.get("state_window", 0)
+        if state_window:
+            attributes["state_window"] = state_window
         self.make_node(
             "LinearAttention",
             inputs=inputs,
             outputs=outputs,
             name=name,
             domain="com.microsoft",
-            q_num_heads=kwargs["q_num_heads"],
-            kv_num_heads=kwargs["kv_num_heads"],
-            update_rule=kwargs.get("update_rule", "gated_delta"),
-            scale=kwargs.get("scale", 1.0),
+            **attributes,
         )
         self.make_value(output, self.io_dtype, shape=kwargs["output_shape"])
         self.make_value(present_recurrent, self.io_dtype, shape=kwargs["present_recurrent_shape"])
-        if present_recurrent_all:
-            self.make_value(present_recurrent_all, self.io_dtype, shape=kwargs["present_recurrent_all_shape"])
 
     def make_sparse_attention(self, name, **kwargs):
         inputs = [

@@ -24,16 +24,16 @@ struct RecurrentState {
   void Snapshot();
   void RestoreSnapshot();
 
-  // Per-position recurrent-state cropping (lossless multi-token MTP). When the model is
-  // exported with `emit_recurrent_state_all=true`, each LinearAttention / CausalConvWithState
-  // node emits a 3rd output holding the state AFTER every token of the forward
-  // ([B, seq_len, ...]). These are managed as static-buffer outputs (like HiddenStatesOutputs)
-  // so they survive CUDA-graph capture. On a partial-accept MTP step the controller crops the
-  // live recurrent state to the accepted length by copying present_state_all[:, position] into
-  // the live present buffers -- no full-cost main-model replay forward.
-  bool HasStateAll() const { return has_state_all_ && bind_conv_all_ && bind_recurrent_all_; }
-  void UpdateAll(int sequence_length);  // Resize the per-position buffers to this step's seq_len.
-  void CropToPosition(size_t position);  // Copy present_state_all[:, position] -> live present state.
+  // Per-position recurrent-state cropping (lossless multi-token MTP). When the model is exported
+  // with `recurrent_state_window=W`, the past/present conv + recurrent state tensors carry a
+  // window axis at position 1: slot j holds the state AFTER token (seq_len - W + j) of the
+  // forward, right-aligned, so slot W-1 is the state after the last token and is the only slot
+  // the ops read back. On a partial-accept MTP step the controller crops the live state to the
+  // accepted length by copying slot `position` into slot W-1 -- no full-cost main-model replay
+  // forward, and no extra graph outputs to bind or keep alive across CUDA-graph capture.
+  bool IsWindowed() const { return state_window_ > 1; }
+  void SetForwardLength(int sequence_length);  // Record this step's seq_len (maps position -> slot).
+  void CropToPosition(size_t position);        // Copy window slot for `position` -> slot W-1.
 
   bool IsEmpty() const { return layer_indices_.empty(); }
   int GraphCaptureVariant() const { return graph_buffer_variant_; }
@@ -53,16 +53,11 @@ struct RecurrentState {
   std::vector<std::unique_ptr<OrtValue>> snapshot_;  // Lazily-allocated copy of the live state for speculative rollback.
   bool snapshot_valid_{false};                       // Whether snapshot_ holds a valid captured state.
 
-  // Per-position state outputs (present_state_all), managed as static-buffer outputs so they
-  // survive CUDA-graph capture. Interleaved [conv_all_0, recurrent_all_0, ...], one per state.
-  bool has_state_all_{false};
-  bool bind_conv_all_{true};
-  bool bind_recurrent_all_{true};
-  std::vector<std::string> output_all_name_strings_;
-  std::vector<std::unique_ptr<Tensor>> presents_all_;
-  std::vector<int64_t> conv_all_shape_;       // [B, seq_len, C, K-1] (seq at axis 1)
-  std::vector<int64_t> recurrent_all_shape_;  // [B, seq_len, H_kv, d_k, d_v]
-  size_t output_all_index_{~0U};
+  // Per-position state window. When the model declares a rank-4 conv_state / rank-5
+  // recurrent_state, axis 1 is a static window of W per-token states (see IsWindowed above).
+  // 1 means the legacy unwindowed layout (a single state, no window axis).
+  int64_t state_window_{1};
+  int forward_length_{0};  // seq_len of the last SetForwardLength(), needed to map position -> slot.
 
   // Mirrors past_present_share_buffer config: true means inputs alias outputs (same allocation,
   // stable handles for graph capture). False uses separate past/present buffers with per-step swap.
@@ -79,8 +74,8 @@ struct RecurrentState {
   ONNXTensorElementDataType conv_type_{};
   ONNXTensorElementDataType recurrent_type_{};
 
-  std::vector<int64_t> conv_shape_;
-  std::vector<int64_t> recurrent_shape_;
+  std::vector<int64_t> conv_shape_;       // [B, C, K-1], or [B, W, C, K-1] when windowed.
+  std::vector<int64_t> recurrent_shape_;  // [B, H_kv, d_k, d_v], or [B, W, ...] when windowed.
 };
 
 // Factory: returns nullptr if no recurrent layers are found in the session.

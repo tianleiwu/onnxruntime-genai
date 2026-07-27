@@ -1060,15 +1060,23 @@ class Qwen35TextModel(Model):
         # Disable fused RoPE in attention op - we apply mRoPE manually
         self.attention_attrs["use_rope_in_attn"] = False
 
-        # Optionally emit the per-position recurrent/conv state as extra graph outputs
-        # (`present.%d.{conv,recurrent}_state_all`, shape [B, seq_len, ...]). This lets a
-        # multi-token (num_speculative_tokens>1) MTP self-speculative loop CROP the recurrent
-        # state to the accepted prefix length on partial accept -- copying present_state_all[:, a]
-        # into the live state -- instead of a full-cost main-model replay forward. Requires the
-        # ORT LinearAttention / CausalConvWithState kernels built with the optional 3rd output.
-        self._emit_recurrent_state_all = str(
-            extra_options.get("emit_recurrent_state_all", "false")
-        ).lower() in ("1", "true", "yes")
+        # Optionally widen the recurrent/conv state I/O into a window of the last W per-position
+        # states (`state_window=W`): past/present_key_values.%d.{conv,recurrent}_state become
+        # [B, W, ...] instead of [B, ...], right-aligned, with slot W-1 holding the state after the
+        # final token of the forward (i.e. the unwindowed state) and being the only slot the op
+        # reads back. This lets a multi-token (num_speculative_tokens>1) MTP self-speculative loop
+        # CROP the recurrent state to the accepted prefix on partial accept -- copying slot `a`
+        # into slot W-1 -- instead of running a full-cost main-model replay forward.
+        #
+        # W must be at least num_speculative_tokens+1 (the length of a verify forward); the default
+        # of 8 covers every N the MTP loop supports. 0 disables the window entirely and produces
+        # the legacy unwindowed state I/O (no cropping, so MTP falls back to snapshot + replay).
+        # Requires ORT kernels that understand the `state_window` attribute.
+        self._recurrent_state_window = int(extra_options.get("recurrent_state_window", 0))
+        if self._recurrent_state_window < 0:
+            raise ValueError("recurrent_state_window must be >= 0")
+        # Axis-1 window extent to splice into the state shapes, or None when unwindowed.
+        self._state_window_dims = [self._recurrent_state_window] if self._recurrent_state_window else []
 
         # Replace standard KV cache I/O with hybrid cache I/O
         self._setup_hybrid_cache_io()
@@ -1100,61 +1108,39 @@ class Qwen35TextModel(Model):
                 # Fused CausalConvWithState + LinearAttention ops use same dtype as activations.
                 state_dtype = self.io_dtype
 
-                # linear_attention: add conv_state + recurrent_state
-                self.input_names[f"past_state.{i}.conv"] = f"past_key_values.{i}.conv_state"
-                self.input_types[f"past_state.{i}.conv"] = state_dtype
-                self.input_shapes[f"past_state.{i}.conv"] = [
+                # linear_attention: add conv_state + recurrent_state. With state_window=W the
+                # window axis leads the batch axis on both the past and present side (the op
+                # reads slot W-1 and writes the last W positions), so each slot is one
+                # contiguous [batch_size, ...] block.
+                conv_state_shape = [
+                    *self._state_window_dims,
                     "batch_size",
                     self.linear_conv_dim,
                     self.linear_conv_kernel_dim - 1,
                 ]
+                recurrent_state_shape = [
+                    *self._state_window_dims,
+                    "batch_size",
+                    self.linear_num_value_heads,
+                    self.linear_key_head_dim,
+                    self.linear_value_head_dim,
+                ]
+
+                self.input_names[f"past_state.{i}.conv"] = f"past_key_values.{i}.conv_state"
+                self.input_types[f"past_state.{i}.conv"] = state_dtype
+                self.input_shapes[f"past_state.{i}.conv"] = list(conv_state_shape)
 
                 self.input_names[f"past_state.{i}.recurrent"] = f"past_key_values.{i}.recurrent_state"
                 self.input_types[f"past_state.{i}.recurrent"] = state_dtype
-                self.input_shapes[f"past_state.{i}.recurrent"] = [
-                    "batch_size",
-                    self.linear_num_value_heads,
-                    self.linear_key_head_dim,
-                    self.linear_value_head_dim,
-                ]
+                self.input_shapes[f"past_state.{i}.recurrent"] = list(recurrent_state_shape)
 
                 self.output_names[f"present_state.{i}.conv"] = f"present.{i}.conv_state"
                 self.output_types[f"present_state.{i}.conv"] = state_dtype
-                self.output_shapes[f"present_state.{i}.conv"] = [
-                    "batch_size",
-                    self.linear_conv_dim,
-                    self.linear_conv_kernel_dim - 1,
-                ]
+                self.output_shapes[f"present_state.{i}.conv"] = list(conv_state_shape)
 
                 self.output_names[f"present_state.{i}.recurrent"] = f"present.{i}.recurrent_state"
                 self.output_types[f"present_state.{i}.recurrent"] = state_dtype
-                self.output_shapes[f"present_state.{i}.recurrent"] = [
-                    "batch_size",
-                    self.linear_num_value_heads,
-                    self.linear_key_head_dim,
-                    self.linear_value_head_dim,
-                ]
-
-                # Optional per-position state outputs (for MTP N>1 recurrent-state cropping).
-                if getattr(self, "_emit_recurrent_state_all", False):
-                    self.output_names[f"present_state.{i}.conv_all"] = f"present.{i}.conv_state_all"
-                    self.output_types[f"present_state.{i}.conv_all"] = state_dtype
-                    self.output_shapes[f"present_state.{i}.conv_all"] = [
-                        "batch_size",
-                        "sequence_length",
-                        self.linear_conv_dim,
-                        self.linear_conv_kernel_dim - 1,
-                    ]
-
-                    self.output_names[f"present_state.{i}.recurrent_all"] = f"present.{i}.recurrent_state_all"
-                    self.output_types[f"present_state.{i}.recurrent_all"] = state_dtype
-                    self.output_shapes[f"present_state.{i}.recurrent_all"] = [
-                        "batch_size",
-                        "sequence_length",
-                        self.linear_num_value_heads,
-                        self.linear_key_head_dim,
-                        self.linear_value_head_dim,
-                    ]
+                self.output_shapes[f"present_state.{i}.recurrent"] = list(recurrent_state_shape)
 
         self.input_names["past_key_values.key"] = filtered_key_inputs
         self.input_names["past_key_values.value"] = filtered_value_inputs
@@ -1720,9 +1706,8 @@ class Qwen35TextModel(Model):
             past_conv_state=past_conv,
             present_conv_state=present_conv,
             output_shape=["batch_size", conv_dim, "sequence_length"],
-            present_conv_shape=["batch_size", conv_dim, kernel_size - 1],
-            present_conv_state_all=(f"present.{layer_id}.conv_state_all" if getattr(self, "_emit_recurrent_state_all", False) else None),
-            present_conv_all_shape=["batch_size", "sequence_length", conv_dim, kernel_size - 1],
+            present_conv_shape=[*self._state_window_dims, "batch_size", conv_dim, kernel_size - 1],
+            state_window=self._recurrent_state_window,
         )
         silu_output = f"{conv_op_name}/output_0"
 
@@ -1764,9 +1749,8 @@ class Qwen35TextModel(Model):
             update_rule="gated_delta",
             scale=1.0,  # Q is already pre-scaled by 1/sqrt(d_k)
             output_shape=["batch_size", "sequence_length", v_dim],
-            present_recurrent_shape=["batch_size", n_kv, hk, hv],
-            present_recurrent_state_all=(f"present.{layer_id}.recurrent_state_all" if getattr(self, "_emit_recurrent_state_all", False) else None),
-            present_recurrent_all_shape=["batch_size", "sequence_length", n_kv, hk, hv],
+            present_recurrent_shape=[*self._state_window_dims, "batch_size", n_kv, hk, hv],
+            state_window=self._recurrent_state_window,
         )
         la_output = f"{la_op_name}/output_0"
 

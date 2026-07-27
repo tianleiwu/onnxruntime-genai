@@ -131,6 +131,17 @@ struct MtpGenerator {
   // >1 chains the single MTP module N times (Qwen3.6 / vLLM-style). Read from the
   // ORT_MTP_NUM_SPECULATIVE_TOKENS env var at construction (default 1).
   int num_speculative_tokens_{1};
+  // ORT_MTP_DIRECT_ARENA_COMMIT: on a model exported with recurrent_state_window > 1, commit a
+  // partial accept by cropping the KV cache and the recurrent state window to the accepted length
+  // and taking the bonus from the verify forward, instead of replaying the accepted prefix. Also
+  // makes the per-step recurrent SnapshotState unnecessary. Read once at construction.
+  bool direct_arena_commit_{false};
+  // ORT_MTP_PREFILL_CHUNK: max tokens per prompt forward. A one-shot forward over a long prompt
+  // drives the ORT activation arena far past what the chunked path needs (measured 94 GB vs 54 GB
+  // on a 2.8k-token prompt), so 0 = single forward; defaults to 256 on a windowed-state model,
+  // off otherwise.
+  int prefill_chunk_{0};
+  bool prefill_chunk_explicit_{false};
   // Head KV length invariant (multi-token path): number of committed generated tokens currently
   // in the MTP head's KV cache (each fed once with its main hidden). The draft phase temporarily
   // extends this speculatively, then rolls it back to this value + accepted drafts.
