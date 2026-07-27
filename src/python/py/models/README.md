@@ -346,7 +346,8 @@ Note that `enable_mtp` is only supported for Qwen3.6 MoE models (`Qwen3_5MoeForC
 By default the MTP head inherits the main model's precision. Two optional overrides trade off draft cost vs. acceptance rate for the small single-layer head:
 
 * `mtp_head_fp16=true` — build the head as a dense fp16 `MoE` op. Highest acceptance rate.
-* `mtp_head_quant_type=int4/int8/mxfp4/nvfp4` — build the head as a `QMoE` op with the given quantization scheme (same style as `moe_quant_type`). For example, `mtp_head_quant_type=int8` is ~2.6x smaller on disk than the fp16 head with comparable acceptance and throughput, so it is preferred when GPU memory matters. (The legacy boolean `mtp_head_int8=true` is deprecated; use `mtp_head_quant_type=int8`.)
+* `mtp_head_quant_type=int4/int8/mxfp4/nvfp4` — quantize the whole head with the given scheme (same style as `moe_quant_type`): the routed experts become a `QMoE` op **and** the head's dense MatMuls (`mtp.fc`, the attention q/k/v/o projections, the shared expert and the draft lm_head) become `MatMulNBits` at the matching bit width. `int4` -> 4-bit dense + INT4 QMoE, `int8` -> 8-bit dense + INT8 QMoE. `mxfp4`/`nvfp4` are microscaling FP4 schemes that only exist for `QMoE`, so with those the dense MatMuls stay int4 and only the experts use FP4. For example, `mtp_head_quant_type=int8` is ~2.6x smaller on disk than the fp16 head with comparable acceptance and throughput, so it is preferred when GPU memory matters. (The legacy boolean `mtp_head_int8=true` is deprecated; use `mtp_head_quant_type=int8`.)
+* `mtp_head_int4_lmhead=true` — keep the head's draft lm_head at int4 even when the rest of the head is int8. The draft logits are corrected by speculative rejection sampling, so this cannot change output accuracy — only draft acceptance.
 
 `mtp_head_fp16` and `mtp_head_quant_type` are mutually exclusive. Both require the main model to be quantized (`-p int4`).
 
