@@ -1078,6 +1078,17 @@ class Qwen35TextModel(Model):
         # Axis-1 window extent to splice into the state shapes, or None when unwindowed.
         self._state_window_dims = [self._recurrent_state_window] if self._recurrent_state_window else []
 
+        # Collapse the float32 gate glue around LinearAttention into the fused com.microsoft
+        # `LinearAttentionGate` and `GatedRMSNorm` ops. The reference model computes both the decay
+        # and the output gate in float32 (exp(g) in the recurrence exponentially amplifies precision
+        # loss), so the exported graph is a Cast -> ... -> Cast sandwich: 11 launches per layer on
+        # tensors of a few thousand elements. The fused kernels keep the same float32 intermediates
+        # in registers and cut that to 2 launches, which also returns the per-node CUDA-graph replay
+        # overhead of the ~9 removed nodes per layer. Set false for A/B or for EPs without the ops.
+        self.fuse_linear_attn_gates = str(
+            extra_options.get("fuse_linear_attn_gates", "true" if self.ep == "cuda" else "false")
+        ).lower() in ("1", "true", "yes")
+
         # Replace standard KV cache I/O with hybrid cache I/O
         self._setup_hybrid_cache_io()
 
@@ -1850,14 +1861,10 @@ class Qwen35TextModel(Model):
         q_scaled_output = f"{q_scaled_name}/output_0"
 
         # beta = sigmoid(b)
-        beta_name = f"{basename}/beta/Sigmoid"
-        self.make_sigmoid(beta_name, f"{b_name}/output_0", self.io_dtype, ["batch_size", "sequence_length", n_kv])
-        beta_output = f"{beta_name}/output_0"
-
         # g = -exp(A_log) * softplus(a + dt_bias)
-        # The reference model computes this entirely in float32 to prevent
+        # The reference model computes the decay entirely in float32 to prevent
         # precision loss that is exponentially amplified by exp(g) in the
-        # recurrence.  Cast inputs to fp32, compute, then cast result back.
+        # recurrence.
         dt_bias_init = f"model.layers.{layer_id}.linear_attn.dt_bias"
         self.make_initializer(linear_attn.dt_bias, dt_bias_init, to=ir.DataType.FLOAT)
 
@@ -1865,27 +1872,49 @@ class Qwen35TextModel(Model):
         neg_exp_a = (-linear_attn.A_log.data.exp()).detach()
         self.make_initializer(neg_exp_a, neg_exp_a_name, to=ir.DataType.FLOAT)
 
+        gate_shape = ["batch_size", "sequence_length", n_kv]
+
+        if self.fuse_linear_attn_gates:
+            # One kernel for both gates; the float32 intermediates stay in registers.
+            gate_name = f"{basename}/gate/LinearAttentionGate"
+            g_output = f"{gate_name}/output_0"
+            beta_output = f"{gate_name}/output_1"
+            self.make_node(
+                "LinearAttentionGate",
+                [f"{a_name}/output_0", dt_bias_init, neg_exp_a_name, f"{b_name}/output_0"],
+                [g_output, beta_output],
+                name=gate_name,
+                domain="com.microsoft",
+            )
+            self.make_value(g_output, self.io_dtype, gate_shape)
+            self.make_value(beta_output, self.io_dtype, gate_shape)
+            return q_scaled_output, k_norm_out, v_out, g_output, beta_output
+
+        beta_name = f"{basename}/beta/Sigmoid"
+        self.make_sigmoid(beta_name, f"{b_name}/output_0", self.io_dtype, gate_shape)
+        beta_output = f"{beta_name}/output_0"
+
         # Cast a projection output to fp32
         a_cast_name = f"{basename}/decay/a_cast/Cast"
-        self.make_cast(a_cast_name, f"{a_name}/output_0", ir.DataType.FLOAT, ["batch_size", "sequence_length", n_kv])
+        self.make_cast(a_cast_name, f"{a_name}/output_0", ir.DataType.FLOAT, gate_shape)
 
         a_plus_dt_name = f"{basename}/decay/Add"
         self.make_add(
-            a_plus_dt_name, [f"{a_cast_name}/output_0", dt_bias_init], ir.DataType.FLOAT, ["batch_size", "sequence_length", n_kv]
+            a_plus_dt_name, [f"{a_cast_name}/output_0", dt_bias_init], ir.DataType.FLOAT, gate_shape
         )
         a_plus_dt_output = f"{a_plus_dt_name}/output_0"
 
         softplus_name = f"{basename}/decay/Softplus"
-        self.make_softplus(softplus_name, a_plus_dt_output, ir.DataType.FLOAT, ["batch_size", "sequence_length", n_kv])
+        self.make_softplus(softplus_name, a_plus_dt_output, ir.DataType.FLOAT, gate_shape)
         softplus_output = f"{softplus_name}/output_0"
 
         g_fp32_name = f"{basename}/decay/Mul"
-        self.make_mul(g_fp32_name, [neg_exp_a_name, softplus_output], ir.DataType.FLOAT, ["batch_size", "sequence_length", n_kv])
+        self.make_mul(g_fp32_name, [neg_exp_a_name, softplus_output], ir.DataType.FLOAT, gate_shape)
         g_fp32_output = f"{g_fp32_name}/output_0"
 
         # Cast decay back to io_dtype for the kernel
         g_cast_name = f"{basename}/decay/g_cast/Cast"
-        self.make_cast(g_cast_name, g_fp32_output, self.io_dtype, ["batch_size", "sequence_length", n_kv])
+        self.make_cast(g_cast_name, g_fp32_output, self.io_dtype, gate_shape)
         g_output = f"{g_cast_name}/output_0"
 
         return q_scaled_output, k_norm_out, v_out, g_output, beta_output
@@ -1980,6 +2009,27 @@ class Qwen35TextModel(Model):
         hv = self.linear_value_head_dim
         nv = self.linear_num_value_heads
 
+        # Norm weight (NO offset — Qwen3_5RMSNormGated uses raw weight, not 1+w)
+        norm_weight = f"model.layers.{layer_id}.linear_attn.norm.weight"
+        self.make_initializer(norm_module.weight, norm_weight, to=self.io_dtype)
+
+        if self.fuse_linear_attn_gates:
+            # GatedRMSNorm normalizes over each contiguous group of len(scale) elements, so the
+            # per-head norm runs directly on the packed [B, S, nv * hv] tensor and the Reshape
+            # pair, the float32 SiLU chain and the three Casts all disappear.
+            gated_name = f"{basename}/GatedRMSNorm"
+            gated_output = f"{gated_name}/output_0"
+            self.make_node(
+                "GatedRMSNorm",
+                [input_name, norm_weight, gate_name],
+                [gated_output],
+                name=gated_name,
+                domain="com.microsoft",
+                epsilon=self.layernorm_attrs["epsilon"],
+            )
+            self.make_value(gated_output, self.io_dtype, ["batch_size", "sequence_length", v_dim])
+            return gated_output
+
         # Reshape input to [B, S, N, H] for per-head norm (avoids Shape ops
         # that would run on CPU and block CUDA graph capture)
         flat_name = f"{basename}/input_flat/Reshape"
@@ -1990,10 +2040,6 @@ class Qwen35TextModel(Model):
             self.io_dtype,
             ["batch_size", "sequence_length", nv, hv],
         )
-
-        # Norm weight (NO offset — Qwen3_5RMSNormGated uses raw weight, not 1+w)
-        norm_weight = f"model.layers.{layer_id}.linear_attn.norm.weight"
-        self.make_initializer(norm_module.weight, norm_weight, to=self.io_dtype)
 
         # SimplifiedLayerNormalization (com.microsoft, no offset for gated norm)
         norm_name = f"{basename}/SimplifiedLayerNormalization"
