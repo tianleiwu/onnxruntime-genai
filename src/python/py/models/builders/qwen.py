@@ -2162,16 +2162,34 @@ class Qwen35MoeTextModel(Qwen35TextModel):
         super().__init__(config, io_dtype, onnx_dtype, ep, cache_dir, extra_options)
 
         # Keep the checkpoint's original FP8 (E4M3) weights instead of dequantizing them
-        # to fp16 and re-quantizing to int4/int8. The FP8 self-attention q/k/v/o projections
-        # are emitted as the weight-only ``MatMulBlockQuantizedFp8Weight`` contrib op; the FP8
-        # GatedDeltaNet (linear-attention) projections have no FP8 matmul op wired yet, so
-        # they are kept at fp16 (a lossless widening of FP8) rather than degraded to int4.
+        # to fp16 and re-quantizing to int4/int8. Both the self-attention q/k/v/o projections
+        # and the GatedDeltaNet (linear-attention) ``in_proj_qkv`` / ``in_proj_z`` / ``out_proj``
+        # projections are emitted as the weight-only ``MatMulBlockQuantizedFp8Weight`` contrib op.
         # Disabled for the MTP head (its ``mtp.*`` weights are BF16 and its basenames would
         # otherwise misload the main model's tensors).
         self.use_original_fp8_weights = (
             bool(extra_options.get("use_original_fp8_weights", False))
             and not getattr(self, "is_mtp_head", False)
         )
+
+        # Emit the GatedDeltaNet projections as ``MatMulBlockQuantizedFp8Weight`` instead of
+        # widening the checkpoint's FP8 weights to fp16. These are the largest remaining fp16
+        # matmuls in decode (in_proj_qkv 8192x2048, in_proj_z 4096x2048, out_proj 2048x4096,
+        # x30 layers) and halving their weight traffic is worth ~1.26 ms/step of cuBLAS time on
+        # the MTP model. Weight-only FP8 reproduces the checkpoint tensors exactly (the fp16
+        # path was a lossless widening of the same values), so accuracy is unchanged.
+        # Set ``fp8_linear_attn=false`` to fall back to the previous fp16 behavior for A/B runs.
+        self.fp8_linear_attn = str(extra_options.get("fp8_linear_attn", "true")).lower() in ("1", "true", "yes")
+
+        # ``fp8_attn_static_input_scale`` applies the checkpoint's calibrated per-tensor
+        # activation scale (W8A8) to the self-attention projections. The linear-attention
+        # projections default to weight-only (W8A16) even when it is on: W8A16 is strictly more
+        # accurate and avoids paying for activation quantization on a path that was never
+        # validated against the checkpoint's calibration. Opt in with
+        # ``fp8_linear_attn_static_input_scale=true``.
+        self.fp8_linear_attn_static_input_scale = str(
+            extra_options.get("fp8_linear_attn_static_input_scale", "false")
+        ).lower() in ("1", "true", "yes")
 
         # Diagnostic: keep specific attention layers' q/k/v/o projections at fp16 instead
         # of FP8. Given as a comma/space-separated list of layer indices via the
@@ -2282,11 +2300,17 @@ class Qwen35MoeTextModel(Qwen35TextModel):
                 if shared_gate_node not in nodes_to_exclude:
                     nodes_to_exclude.append(shared_gate_node)
                 # When keeping original FP8 weights, keep the GatedDeltaNet (linear-attention)
-                # projections out of int4/int8 quantization so they stay fp16 (the checkpoint
-                # stores them as FP8 or BF16, both losslessly widened to fp16). Without this
-                # they would be re-quantized to int4, far from the source.
+                # projections out of int4/int8 quantization. ``in_proj_a`` / ``in_proj_b`` are
+                # BF16 in the checkpoint (and only 32 elements wide), so they stay fp16. The
+                # FP8 projections are only excluded when ``fp8_linear_attn`` is off; otherwise
+                # they are replaced by ``MatMulBlockQuantizedFp8Weight`` and never reach the
+                # int4/int8 quantizer. Without this they would be re-quantized to int4, far
+                # from the source.
                 if self.use_original_fp8_weights:
-                    for proj in ("in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b", "out_proj"):
+                    linear_projs = ["in_proj_a", "in_proj_b"]
+                    if not self.fp8_linear_attn:
+                        linear_projs += ["in_proj_qkv", "in_proj_z", "out_proj"]
+                    for proj in linear_projs:
                         linear_node = f"/model/layers.{i}/linear_attn/{proj}/MatMul"
                         if linear_node not in nodes_to_exclude:
                             nodes_to_exclude.append(linear_node)
@@ -2446,9 +2470,14 @@ class Qwen35MoeTextModel(Qwen35TextModel):
                 return None
             return f"model.language_model.layers.{layer_id}.self_attn.{proj}"
 
-        # linear_attn projections currently hit unsupported cublasLt algo combinations
-        # in GemmFloat8 for common decode/prefill shapes on our runtime build.
-        return None
+        # GatedDeltaNet: only in_proj_qkv / in_proj_z / out_proj are stored as FP8 in the
+        # ModelOpt checkpoint (they carry .input_scale + .weight_scale). in_proj_a / in_proj_b
+        # are BF16 and only 32 elements wide, so they stay on the float path.
+        if proj not in {"in_proj_qkv", "in_proj_z", "out_proj"}:
+            return None
+        if not getattr(self, "fp8_linear_attn", False):
+            return None
+        return f"model.language_model.layers.{layer_id}.linear_attn.{proj}"
 
     def _fp8_attention_input_scale(self, basename):
         """Return the checkpoint's calibrated static per-tensor FP8 activation scale, or ``None``.
@@ -2468,6 +2497,9 @@ class Qwen35MoeTextModel(Qwen35TextModel):
             return None
         key_prefix = self._fp8_weight_key_for_matmul(basename)
         if key_prefix is None:
+            return None
+        if ".linear_attn." in key_prefix and not getattr(self, "fp8_linear_attn_static_input_scale", False):
+            # Weight-only (W8A16) for the GatedDeltaNet projections; see __init__.
             return None
         try:
             return float(self._load_nvfp4_tensor(f"{key_prefix}.input_scale").float().reshape(-1)[0])
