@@ -1221,6 +1221,12 @@ class Qwen35TextModel(Model):
 
         with open(scale_file, encoding="utf-8") as file:
             scale_data = json.load(file)
+        # The MTP head is a separate graph with its own single KV-cache layer whose activation
+        # distribution differs from the main stack, so it carries its own calibrated scales in an
+        # optional `mtp` section of the same file. This keeps one `kv_cache_scale_file` covering
+        # both `text.onnx` and `mtp.onnx`, which is all the builder CLI accepts.
+        if getattr(self, "is_mtp_head", False) and "mtp" in scale_data:
+            scale_data = scale_data["mtp"]
         try:
             k_scales = scale_data["scales"]["k_scales"]
             v_scales = scale_data["scales"]["v_scales"]
