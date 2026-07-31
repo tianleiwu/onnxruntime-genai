@@ -1,0 +1,35 @@
+[
+    {
+        "config": {
+            "backend": "onnxruntime-genai",
+            "batch_size": 1.0,
+            "precision": "fp16",
+            "warmup_runs": 1,
+            "measured_runs": 10,
+            "model_info": {
+                "full_name": "model_name"
+            },
+            "prompt_length": 512.0,
+            "tokens_generated": 200.0,
+            "max_length": 712.0
+        },
+        "metadata": {
+            "device": "cuda",
+            "package_name": "onnxruntime-genai-cuda",
+            "package_version": "0.15.0.dev0"
+        },
+        "metrics": {
+            "tokenization_throughput_tps": 2948686.4992779214,
+            "tokenization_latency_ms": 0.17363663452366987,
+            "prompt_processing_throughput_tps": 654.1341953685954,
+            "prompt_processing_latency_ms": 1.5287383033637525,
+            "token_generation_throughput_tps": 55.7081790976048,
+            "token_generation_latency_ms": 17.95068545047805,
+            "sampling_throughput_tps": 15469.57838084447,
+            "sampling_latency_ms": 0.06464300289129217,
+            "wall_clock_throughput_tps": 163.45625373016037,
+            "wall_clock_time_s": 4.355905532836914
+        },
+        "trigger_date": "2026-07-20 11:11:21"
+    }
+]

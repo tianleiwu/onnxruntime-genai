@@ -151,6 +151,9 @@ def _load_builder_cli_module(monkeypatch):
         "WhisperModel",
     ):
         setattr(builders_module, class_name, type(class_name, (), {}))
+    # Submodule imports (e.g. `from builders.quant_config import ...`) must resolve to the
+    # real, dependency-free modules rather than the class stubs above.
+    builders_module.__path__ = [str(BUILDERS_DIR)]
     monkeypatch.setitem(sys.modules, "builders", builders_module)
 
     module_name = "builder_cli_under_test"
@@ -161,28 +164,44 @@ def _load_builder_cli_module(monkeypatch):
     return module
 
 
+def _parse_extra_options(builder, extra_options, precision="int4", execution_provider="cuda"):
+    # Parser validation in these tests should not depend on remote/model IO.
+    builder.get_hf_details = lambda *args, **kwargs: {
+        "hf_config": types.SimpleNamespace(tie_word_embeddings=True)
+    }
+    return builder.parse_extra_options(
+        "dummy-model",
+        "",
+        "",
+        precision,
+        execution_provider,
+        "",
+        extra_options,
+    )
+
+
 def test_moe_quant_type_mxfp4_is_accepted(monkeypatch):
     builder = _load_builder_cli_module(monkeypatch)
-    options = builder.parse_extra_options(["moe_quant_type=mxfp4"], "int4", "cuda")
+    options = _parse_extra_options(builder, ["moe_quant_type=mxfp4"], "int4", "cuda")
     assert options["moe_quant_type"] == "mxfp4"
 
 
 def test_moe_quant_type_rejects_invalid_value(monkeypatch):
     builder = _load_builder_cli_module(monkeypatch)
     with pytest.raises(ValueError, match="moe_quant_type must be one of"):
-        builder.parse_extra_options(["moe_quant_type=fp8"], "int4", "cuda")
+        _parse_extra_options(builder, ["moe_quant_type=fp8"], "int4", "cuda")
 
 
 def test_use_8bits_moe_maps_to_moe_quant_type(monkeypatch):
     builder = _load_builder_cli_module(monkeypatch)
-    options = builder.parse_extra_options(["use_8bits_moe=true"], "int4", "cuda")
+    options = _parse_extra_options(builder, ["use_8bits_moe=true"], "int4", "cuda")
     assert options["moe_quant_type"] == "int8"
 
 
 def test_moe_quant_type_mxfp4_requires_qmoe_precision(monkeypatch):
     builder = _load_builder_cli_module(monkeypatch)
     with pytest.raises(ValueError, match="moe_quant_type=mxfp4 requires building with precision=int4"):
-        builder.parse_extra_options(["moe_quant_type=mxfp4"], "fp16", "cuda")
+        _parse_extra_options(builder, ["moe_quant_type=mxfp4"], "fp16", "cuda")
 
 
 def test_gptoss_fp4_rejects_quark_experts_before_emitting_nodes():
@@ -198,7 +217,7 @@ def test_gptoss_fp4_rejects_quark_experts_before_emitting_nodes():
 
 def test_gptoss_original_mxfp4_blocks_pack_to_qmoe_layout():
     blocks = torch.arange(2 * 4 * 2 * 16, dtype=torch.uint8).reshape(2, 4, 2, 16)
-    packed = GPTOSSModel.pack_original_mxfp4_blocks_for_qmoe(blocks)
+    packed = GPTOSSModel.__new__(GPTOSSModel).pack_original_mxfp4_blocks_for_qmoe(blocks)
 
     low_codes = blocks & 0x0F
     high_codes = blocks >> 4

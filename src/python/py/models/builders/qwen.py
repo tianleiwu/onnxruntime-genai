@@ -66,8 +66,9 @@ class Qwen25VLTextModel(Model):
 
         # Check rope type since huggingface model supports yarn but that is not recommended as mentioned in model card. Example:
         #    "rope_scaling": {"type": "mrope", "mrope_section": [16, 24,24]}
-        if config.rope_scaling and "type" in config.rope_scaling:
-            assert config.rope_scaling["type"] in ["mrope", "default"]
+        rope_params = self.get_rope_parameters(config)
+        if rope_params and "type" in rope_params:
+            assert rope_params["type"] in ["mrope", "default"]
 
         # Qwen 2.5 VL applies RoPE manually before attention, not fused in the op
         self.attention_attrs["use_rope_in_attn"] = False
@@ -80,7 +81,7 @@ class Qwen25VLTextModel(Model):
 
         self.mrope_sections = self.rope_attrs.get("mrope", {}).get("sections", [])
         if not self.mrope_sections:
-            raise ValueError("MRoPE sections not found in config.text_config.rope_scaling.mrope_section")
+            raise ValueError("MRoPE sections not found in text_config rope_parameters/rope_scaling mrope_section")
 
         # The HF logic is `mrope_section * 2`, not `[s * 2 for s in mrope_section]`.
         # This results in [16, 24, 24, 16, 24, 24]
@@ -655,6 +656,7 @@ class Qwen25VLTextModel(Model):
         attn_name = f"/model/layers.{layer_id}/attn/{self.attention_attrs['op_type']}"
         self.make_attention_op(
             attn_name,
+            layer_id=layer_id,
             q_path=self.attention_attrs["q_path"],
             k_path=self.attention_attrs["k_path"],
             v_path=self.attention_attrs["v_path"],
@@ -984,15 +986,16 @@ class Qwen35TextModel(Model):
                 if not hasattr(config, key) or getattr(config, key) is None:
                     setattr(config, key, getattr(text_config, key))
 
-        # rope_scaling contains the actual rope_theta for Qwen3.5
-        if hasattr(config, "rope_scaling") and config.rope_scaling is not None:
-            if "rope_theta" in config.rope_scaling:
-                config.rope_theta = config.rope_scaling["rope_theta"]
-            if "partial_rotary_factor" in config.rope_scaling:
-                config.partial_rotary_factor = config.rope_scaling["partial_rotary_factor"]
+        # rope parameters contain the actual rope_theta for Qwen3.5
+        rope_params = self.get_rope_parameters(config)
+        if rope_params is not None:
+            if "rope_theta" in rope_params:
+                config.rope_theta = rope_params["rope_theta"]
+            if "partial_rotary_factor" in rope_params:
+                config.partial_rotary_factor = rope_params["partial_rotary_factor"]
 
         # Parse layer types before super().__init__() because
-        # make_int4_algo_config() is called from the base class init
+        # make_quant_init() (via make_matmul_mixed_precision) is called from the base class init
         # and needs self.layer_types to identify linear attention layers.
         # Mirror base class logic: prefer extra_options["num_hidden_layers"] when present.
         text_config = getattr(config, "text_config", config)
@@ -1006,6 +1009,15 @@ class Qwen35TextModel(Model):
             ]
         else:
             self.layer_types = ["full_attention"] * num_layers
+
+        # FP8 (E4M3) KV cache to match the ModelOpt checkpoint (kv_cache_quant_algo=FP8).
+        # `fp8_kv_cache=true` is a shorthand for `kv_cache_quant_type=fp8_per_tensor` that keeps
+        # working without a calibration file (unit scales, see make_kv_cache_scale_initializers).
+        # Only the full-attention layers own a KV cache; the linear-attention conv/recurrent
+        # states are unaffected. Requires ORT built with onnxruntime_USE_FP8_KV_CACHE=ON and SM89+.
+        self.fp8_kv_cache = bool(extra_options.get("fp8_kv_cache", False))
+        if self.fp8_kv_cache and extra_options.get("kv_cache_quant_type", "none") == "none":
+            extra_options["kv_cache_quant_type"] = "fp8_per_tensor"
 
         super().__init__(config, io_dtype, onnx_dtype, ep, cache_dir, extra_options)
 
@@ -1029,7 +1041,7 @@ class Qwen35TextModel(Model):
         # mRoPE config
         self.mrope_sections = self.rope_attrs.get("mrope", {}).get("sections", [])
         if not self.mrope_sections:
-            raise ValueError("MRoPE sections not found in config.text_config.rope_scaling.mrope_section")
+            raise ValueError("MRoPE sections not found in text_config rope_parameters/rope_scaling mrope_section")
         if len(self.mrope_sections) != 3:
             raise ValueError(
                 f"Expected 3 MRoPE sections [T, H, W], got {len(self.mrope_sections)}: {self.mrope_sections}"
@@ -1157,6 +1169,64 @@ class Qwen35TextModel(Model):
         self.input_names["past_key_values.value"] = filtered_value_inputs
         self.output_names["present.key"] = filtered_key_outputs
         self.output_names["present.value"] = filtered_value_outputs
+
+    def make_kv_cache_scale_initializers(self):
+        """Emit KV cache quantization scales only for the layers that own a KV cache.
+
+        Qwen3.5/3.6 is a hybrid stack, so only ``full_attention`` layers run
+        GroupQueryAttention. The calibration file may therefore be indexed either by absolute
+        layer id (``num_layers`` entries) or by full-attention order (one entry per KV layer).
+        The legacy ``fp8_kv_cache=true`` shorthand keeps working without a file by falling back
+        to unit scales.
+        """
+        kv_layers = [i for i, lt in enumerate(self.layer_types) if lt == "full_attention"]
+        per_channel = self.kv_quant_type == "PER_CHANNEL"
+        scale_size = self.num_kv_heads * self.head_size if per_channel else 1
+
+        scale_file = self.extra_options.get("kv_cache_scale_file", None)
+        if scale_file is None:
+            if not self.fp8_kv_cache:
+                raise ValueError(
+                    "Quantized KV cache requires calibrated scales; provide them via "
+                    "extra_options['kv_cache_scale_file']."
+                )
+            unit_scale = np.ones(scale_size, dtype=np.float32)
+            for layer_id in kv_layers:
+                k_scale_name, v_scale_name = self.get_kv_cache_scale_names(layer_id)
+                self.make_initializer(unit_scale, k_scale_name)
+                self.make_initializer(unit_scale, v_scale_name)
+            return
+
+        with open(scale_file, encoding="utf-8") as file:
+            scale_data = json.load(file)
+        try:
+            k_scales = scale_data["scales"]["k_scales"]
+            v_scales = scale_data["scales"]["v_scales"]
+        except (KeyError, TypeError) as error:
+            raise ValueError("kv_cache_scale_file must contain scales.k_scales and scales.v_scales.") from error
+        if len(k_scales) != len(v_scales) or len(k_scales) not in (self.num_layers, len(kv_layers)):
+            raise ValueError(
+                f"kv_cache_scale_file must provide {self.num_layers} (per layer) or "
+                f"{len(kv_layers)} (per KV layer) scales, got k={len(k_scales)} v={len(v_scales)}"
+            )
+        # Absolute layer ids when the file covers every layer, else full-attention order.
+        by_layer_id = len(k_scales) == self.num_layers
+
+        def make_scale(per_layer, index, layer_id):
+            scale = np.asarray(per_layer[index], dtype=np.float32).reshape(-1)
+            if scale.size != scale_size:
+                raise ValueError(
+                    f"kv_cache scale for layer {layer_id} has size {scale.size}, expected {scale_size}"
+                )
+            if not np.all(np.isfinite(scale)) or np.any(scale <= 0):
+                raise ValueError(f"kv_cache scale for layer {layer_id} must contain finite positive values")
+            return scale
+
+        for order, layer_id in enumerate(kv_layers):
+            index = layer_id if by_layer_id else order
+            k_scale_name, v_scale_name = self.get_kv_cache_scale_names(layer_id)
+            self.make_initializer(make_scale(k_scales, index, layer_id), k_scale_name)
+            self.make_initializer(make_scale(v_scales, index, layer_id), v_scale_name)
 
     def make_position_ids_reformatting(self):
         if self.is_text_only:
@@ -1336,6 +1406,7 @@ class Qwen35TextModel(Model):
         attn_name = f"/model/layers.{layer_id}/attn/{self.attention_attrs['op_type']}"
         self.make_attention_op(
             attn_name,
+            layer_id=layer_id,
             q_path=self.attention_attrs["q_path"],
             k_path=self.attention_attrs["k_path"],
             v_path=self.attention_attrs["v_path"],
@@ -2263,18 +2334,9 @@ class Qwen35MoeTextModel(Qwen35TextModel):
         ).lower() in ("1", "true", "yes")
         self._fp8_attention_activation_cache = {}
 
-        # FP8 (E4M3) KV cache to match the ModelOpt checkpoint (kv_cache_quant_algo=FP8).
-        # GroupQueryAttention stores past/present KV as Float8E4M3FN with a shared PER_TENSOR
-        # k/v scale (see make_group_query_attention). Only the full-attention layers own a KV
-        # cache; the linear-attention conv/recurrent states are unaffected. Requires ORT built
-        # with onnxruntime_USE_FP8_KV_CACHE=ON (default) and SM89+ at runtime.
-        self.fp8_kv_cache = bool(extra_options.get("fp8_kv_cache", False))
-        if self.fp8_kv_cache:
-            self.kv_cache_scale_name = "kv_cache_scale"
-            self.input_types["past_key_values.key"] = ir.DataType.FLOAT8E4M3FN
-            self.input_types["past_key_values.value"] = ir.DataType.FLOAT8E4M3FN
-            self.output_types["present.key"] = ir.DataType.FLOAT8E4M3FN
-            self.output_types["present.value"] = ir.DataType.FLOAT8E4M3FN
+        # FP8 (E4M3) KV cache to match the ModelOpt checkpoint (kv_cache_quant_algo=FP8) is
+        # handled in Qwen35TextModel.__init__, which maps `fp8_kv_cache=true` onto the generic
+        # `kv_cache_quant_type=fp8_per_tensor` machinery before the base class initializes.
 
         # Diagnostic: keep specific layers' NVFP4 dense shared-expert (gate/up/down) projections
         # at fp16 instead of the ``MatMulBlockQuantizedFp4Weight`` op (comma/space-separated layer indices via
@@ -3214,6 +3276,9 @@ class Qwen35MtpHead(Qwen35MoeTextModel):
     def make_model(self, input_path):
         # Inputs/outputs: standard decoder I/O plus the extra hidden_states input.
         self.make_inputs_and_outputs()
+
+        if self.kv_cache_quant_type != "none":
+            self.make_kv_cache_scale_initializers()
 
         # Load MTP-specific weights (discarded by HF ``from_pretrained``).
         self._load_mtp_weights(input_path)
