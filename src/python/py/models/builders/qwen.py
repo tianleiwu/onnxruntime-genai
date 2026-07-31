@@ -1011,11 +1011,14 @@ class Qwen35TextModel(Model):
             self.layer_types = ["full_attention"] * num_layers
 
         # FP8 (E4M3) KV cache to match the ModelOpt checkpoint (kv_cache_quant_algo=FP8).
-        # `fp8_kv_cache=true` is a shorthand for `kv_cache_quant_type=fp8_per_tensor` that keeps
-        # working without a calibration file (unit scales, see make_kv_cache_scale_initializers).
-        # Only the full-attention layers own a KV cache; the linear-attention conv/recurrent
-        # states are unaffected. Requires ORT built with onnxruntime_USE_FP8_KV_CACHE=ON and SM89+.
+        # `fp8_kv_cache=true` is a shorthand for `kv_cache_quant_type=fp8_per_tensor`. Without a
+        # calibration file it keeps the legacy export shape: one shared unit `kv_cache_scale`
+        # initializer for all layers (see get_kv_cache_scale_inputs). Only the full-attention
+        # layers own a KV cache; the linear-attention conv/recurrent states are unaffected.
+        # Requires ORT built with onnxruntime_USE_FP8_KV_CACHE=ON (default) and SM89+ at runtime.
         self.fp8_kv_cache = bool(extra_options.get("fp8_kv_cache", False))
+        self._legacy_fp8_kv_cache = self.fp8_kv_cache and not extra_options.get("kv_cache_scale_file", None)
+        self._kv_cache_scale_created = False
         if self.fp8_kv_cache and extra_options.get("kv_cache_quant_type", "none") == "none":
             extra_options["kv_cache_quant_type"] = "fp8_per_tensor"
 
@@ -1170,32 +1173,51 @@ class Qwen35TextModel(Model):
         self.output_names["present.key"] = filtered_key_outputs
         self.output_names["present.value"] = filtered_value_outputs
 
+    def get_kv_cache_scale_inputs(self, **kwargs):
+        # Legacy `fp8_kv_cache=true`: every layer shares ONE unit PER_TENSOR scale initializer
+        # named `kv_cache_scale`, created lazily at the first GroupQueryAttention node. The
+        # ModelOpt checkpoint exports no calibrated k/v scale, so this is a straight E4M3
+        # round-trip of the KV cache. Keeping the shared name and the lazy creation point keeps
+        # the exported graph (and the external-data layout) identical to the released RC model.
+        if self._legacy_fp8_kv_cache:
+            if not self._kv_cache_scale_created:
+                self.make_initializer(
+                    torch.tensor([1.0], dtype=torch.float32), "kv_cache_scale", to=ir.DataType.FLOAT
+                )
+                self._kv_cache_scale_created = True
+            return "kv_cache_scale", "kv_cache_scale"
+        return super().get_kv_cache_scale_inputs(**kwargs)
+
+    def extend_with_optional_inputs(self, inputs, optional_inputs):
+        # The legacy `fp8_kv_cache` export emitted all four trailing optional GroupQueryAttention
+        # inputs (k_scale, v_scale, q_norm_weight, k_norm_weight), including empty placeholders,
+        # rather than trimming the unused trailing ones. Reproduce that byte-for-byte.
+        if self._legacy_fp8_kv_cache and any(optional_inputs):
+            inputs.extend(optional_inputs)
+            return
+        super().extend_with_optional_inputs(inputs, optional_inputs)
+
     def make_kv_cache_scale_initializers(self):
         """Emit KV cache quantization scales only for the layers that own a KV cache.
 
         Qwen3.5/3.6 is a hybrid stack, so only ``full_attention`` layers run
         GroupQueryAttention. The calibration file may therefore be indexed either by absolute
         layer id (``num_layers`` entries) or by full-attention order (one entry per KV layer).
-        The legacy ``fp8_kv_cache=true`` shorthand keeps working without a file by falling back
-        to unit scales.
         """
+        if self._legacy_fp8_kv_cache:
+            # The single shared scale is created on demand in `get_kv_cache_scale_inputs`.
+            return
+
         kv_layers = [i for i, lt in enumerate(self.layer_types) if lt == "full_attention"]
         per_channel = self.kv_quant_type == "PER_CHANNEL"
         scale_size = self.num_kv_heads * self.head_size if per_channel else 1
 
         scale_file = self.extra_options.get("kv_cache_scale_file", None)
         if scale_file is None:
-            if not self.fp8_kv_cache:
-                raise ValueError(
-                    "Quantized KV cache requires calibrated scales; provide them via "
-                    "extra_options['kv_cache_scale_file']."
-                )
-            unit_scale = np.ones(scale_size, dtype=np.float32)
-            for layer_id in kv_layers:
-                k_scale_name, v_scale_name = self.get_kv_cache_scale_names(layer_id)
-                self.make_initializer(unit_scale, k_scale_name)
-                self.make_initializer(unit_scale, v_scale_name)
-            return
+            raise ValueError(
+                "Quantized KV cache requires calibrated scales; provide them via "
+                "extra_options['kv_cache_scale_file']."
+            )
 
         with open(scale_file, encoding="utf-8") as file:
             scale_data = json.load(file)
