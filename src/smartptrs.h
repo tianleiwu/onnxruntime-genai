@@ -115,6 +115,15 @@ enum struct DeviceType {
   MAX
 };
 
+// One windowed state tensor for DeviceInterface::CopyStateSlots: `base` is the start of the whole
+// [W, ...] buffer and `slot_bytes` is the size of one window slot.
+struct StateSlotDesc {
+  uint8_t* base;
+  uint64_t slot_bytes;
+
+  bool operator==(const StateSlotDesc&) const = default;
+};
+
 struct DeviceInterface {
   virtual ~DeviceInterface() {}
 
@@ -191,6 +200,14 @@ struct DeviceInterface {
   virtual bool MtpGreedyAcceptance(const void* /*logits*/, ONNXTensorElementDataType /*logits_type*/,
                                    int /*num_drafts*/, int /*vocab_size*/, DeviceSpan<int32_t> /*draft_tokens*/,
                                    int32_t* /*accepted*/, int32_t* /*next_token*/) { return false; }
+  // Promote one window slot to another for every descriptor in `descs_device` (device memory,
+  // `count` entries). A hybrid model has 2 state tensors per layer, so the per-tensor memcpy loop
+  // this replaces issues 60+ cudaMemcpyAsync calls on every partial-accept MTP step; each costs a
+  // few microseconds of *host* time, which shows up directly as GPU idle. One kernel launch does
+  // the same work. Returns false on devices without an implementation.
+  // Keep last for vtable/ABI stability.
+  virtual bool CopyStateSlots(const void* /*descs_device*/, int /*count*/, int /*src_slot*/,
+                              int /*dst_slot*/) { return false; }
 };
 
 // A shared_ptr based type that we expose through our C API should inherit from this type.
