@@ -2275,6 +2275,10 @@ class Qwen35TextModel(Model):
             },
         }
 
+        if getattr(self, "mtp_shared_initializers", None):
+            genai_config["model"]["decoder"]["shared_initializers"] = self.mtp_shared_initializers
+            genai_config["model"]["mtp"]["shared_initializers"] = self.mtp_shared_initializers
+
         with open(config_path, "w") as f:
             json.dump(genai_config, f, indent=4)
         print("Added 'mtp' section to genai_config.json")
@@ -2383,13 +2387,10 @@ class Qwen35MoeTextModel(Qwen35TextModel):
         # projections are emitted as the weight-only ``MatMulBlockQuantizedFp4Weight`` contrib op straight from
         # the ModelOpt tensors (E2M1 codes + E4M3 block scale + fp32 global scale). NOTE: the
         # NVFP4 *routed MoE experts* are controlled separately by ``moe_quant_type=nvfp4``
-        # (native NVFP4 QMoE); this flag only covers the dense NVFP4 modules. Disabled for the
-        # MTP head (its ``mtp.*`` weights are BF16 and share the main layer indices, so the
-        # shared-expert basenames would otherwise misload the main model's NVFP4 tensors).
-        self.use_original_nvfp4_weights = (
-            bool(extra_options.get("use_original_nvfp4_weights", False))
-            and not getattr(self, "is_mtp_head", False)
-        )
+        # (native NVFP4 QMoE); this flag only covers dense NVFP4 modules. The MTP head may use
+        # the checkpoint's shared lm_head, but its own BF16 layer weights must stay on the
+        # configured MTP quantization path (see ``_nvfp4_dense_key_for_matmul``).
+        self.use_original_nvfp4_weights = bool(extra_options.get("use_original_nvfp4_weights", False))
 
         # The base builder derives the GenAI model.type by stripping the suffix
         # after "For" and lowercasing, matching Qwen3.5 text-only export.
@@ -2473,6 +2474,7 @@ class Qwen35MoeTextModel(Qwen35TextModel):
         # alongside the main model (see ``Qwen35MtpHead``). It is disabled for the
         # MTP head itself (``is_mtp_head``) to avoid infinite recursion.
         self.mtp_head = None
+        self.mtp_shared_initializers = []
         self.enable_mtp = bool(extra_options.get("enable_mtp", False)) and not getattr(self, "is_mtp_head", False)
         if self.enable_mtp:
             # Stash the constructor arguments so the MTP head can be built from a
@@ -2746,6 +2748,8 @@ class Qwen35MoeTextModel(Qwen35TextModel):
         """
         if basename == "/lm_head/MatMul":
             return "lm_head"
+        if getattr(self, "is_mtp_head", False):
+            return None
         m = re.match(r"^/model/layers\.(\d+)/shared_expert/(gate_proj|up_proj|down_proj)/MatMul$", basename)
         if m:
             layer_id = int(m.group(1))
@@ -2865,7 +2869,7 @@ class Qwen35MoeTextModel(Qwen35TextModel):
             # bit-identically with the main model: redirect mtp.onnx's copies to the
             # main model's external data file and pack them out of mtp.onnx.data
             # (~2 GB on disk; the two sessions then mmap the same bytes on the host).
-            self._share_mtp_embedding_lm_head(
+            self.mtp_shared_initializers = self._share_mtp_embedding_lm_head(
                 out_dir, main_file=self.filename, mtp_file=self.mtp_head.filename
             )
 
@@ -2881,7 +2885,13 @@ class Qwen35MoeTextModel(Qwen35TextModel):
         """
         import onnx
 
-        shared_names = ["model.embed_tokens.weight", "lm_head.MatMul.weight"]
+        shared_names = [
+            "model.embed_tokens.weight",
+            "lm_head.MatMul.weight",
+            "lm_head.MatMul.nvfp4_weight",
+            "lm_head.MatMul.nvfp4_weight_scale",
+            "lm_head.MatMul.nvfp4_weight_scale_2",
+        ]
         main_onnx = os.path.join(out_dir, main_file)
         mtp_onnx = os.path.join(out_dir, mtp_file)
         main_data_name = main_file + ".data"
@@ -2890,7 +2900,7 @@ class Qwen35MoeTextModel(Qwen35TextModel):
         mtp_data = os.path.join(out_dir, mtp_data_name)
         if not (os.path.exists(main_onnx) and os.path.exists(mtp_onnx) and
                 os.path.exists(main_data) and os.path.exists(mtp_data)):
-            return
+            return []
 
         def ext_info(tensor):
             d = {e.key: e.value for e in tensor.external_data}
@@ -2939,7 +2949,7 @@ class Qwen35MoeTextModel(Qwen35TextModel):
                 remove.add((off, ln))
 
             if not redirect:
-                return
+                return []
 
             # Rebuild mtp.onnx.data with the redirected tensors packed out, in
             # ascending-offset order, assigning tight new offsets.
@@ -2971,9 +2981,21 @@ class Qwen35MoeTextModel(Qwen35TextModel):
             saved_mb = sum(ln for _, ln in redirect.values()) / 1e6
             print(f"Shared MTP embedding + lm_head with the main model "
                   f"(saved {saved_mb:.0f} MB from {mtp_data_name})")
+            return [
+                {
+                    "name": name,
+                    "data_file": main_data_name,
+                    "offset": str(offset),
+                    "length": str(length),
+                    "data_type": main_info[name][0],
+                    "shape": list(main_info[name][1]),
+                }
+                for name, (offset, length) in redirect.items()
+            ]
         except Exception as exc:  # noqa: BLE001 - sharing is a best-effort optimization
             print(f"Warning: could not share MTP embedding/lm_head weights ({exc}); "
                   f"the duplicated copies remain in {mtp_data_name}.")
+            return []
 
 
     def make_layer(self, layer_id, layer):
