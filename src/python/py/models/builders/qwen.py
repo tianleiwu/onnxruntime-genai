@@ -2865,7 +2865,9 @@ class Qwen35MoeTextModel(Qwen35TextModel):
             # bit-identically with the main model: redirect mtp.onnx's copies to the
             # main model's external data file and pack them out of mtp.onnx.data
             # (~2 GB on disk; the two sessions then mmap the same bytes on the host).
-            self._share_mtp_embedding_lm_head(out_dir)
+            self._share_mtp_embedding_lm_head(
+                out_dir, main_file=self.filename, mtp_file=self.mtp_head.filename
+            )
 
     @staticmethod
     def _share_mtp_embedding_lm_head(out_dir, main_file="model.onnx", mtp_file="mtp.onnx"):

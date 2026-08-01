@@ -64,6 +64,21 @@ void Launch_GetLastTokens(int32_t* next_tokens, const int32_t* sequences, int ba
   CUDA_CHECK_LAUNCH();
 }
 
+__global__ void MtpGreedyAcceptance(const int32_t* argmax_tokens, int argmax_stride,
+                                    const int32_t* draft_tokens, int num_drafts, int32_t* result) {
+  int accepted = 0;
+  while (accepted < num_drafts && draft_tokens[accepted] == argmax_tokens[accepted * argmax_stride])
+    ++accepted;
+  result[0] = accepted;
+  result[1] = argmax_tokens[accepted * argmax_stride];
+}
+
+void LaunchMtpGreedyAcceptance(const int32_t* argmax_tokens, int argmax_stride, const int32_t* draft_tokens,
+                               int num_drafts, int32_t* result, cudaStream_t stream) {
+  MtpGreedyAcceptance<<<1, 1, 0, stream>>>(argmax_tokens, argmax_stride, draft_tokens, num_drafts, result);
+  CUDA_CHECK_LAUNCH();
+}
+
 __global__ void ArgMax(cub::KeyValuePair<int, float>* argmaxen, int32_t* next_tokens, int batch_size) {
   int batch_index = threadIdx.x;
   next_tokens[batch_index] = argmaxen[batch_index].key;

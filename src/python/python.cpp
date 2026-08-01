@@ -328,6 +328,14 @@ struct PyMtpGenerator {
     d["forwards"] = generator_->GetForwardCount();
     d["accepts"] = generator_->GetAcceptCount();
     d["trials"] = generator_->GetTrialCount();
+    pybind11::list accepts_by_position;
+    pybind11::list trials_by_position;
+    for (size_t position = 0; position < generator_->GetAcceptancePositionCount(); ++position) {
+      accepts_by_position.append(generator_->GetPositionAcceptCount(position));
+      trials_by_position.append(generator_->GetPositionTrialCount(position));
+    }
+    d["accepts_by_position"] = std::move(accepts_by_position);
+    d["trials_by_position"] = std::move(trials_by_position);
     return d;
   }
 

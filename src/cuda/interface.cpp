@@ -141,6 +141,18 @@ struct CudaInterfaceImplBase : DeviceInterface {
     return true;
   }
 
+  void PrepareTopKData(int num_rows, int vocab_size, cudaStream_t stream) {
+    if (!topk_data_ || topk_batch_ < num_rows || topk_vocab_ != vocab_size) {
+      topk_data_ = std::make_unique<cuda::TopkData>(num_rows, vocab_size, stream);
+      topk_batch_ = num_rows;
+      topk_vocab_ = vocab_size;
+      topk_active_batch_ = num_rows;
+    } else if (topk_active_batch_ != num_rows) {
+      topk_data_->local_algo_cache_.fill(cuda::TopkAlgo::UNKNOWN);
+      topk_active_batch_ = num_rows;
+    }
+  }
+
   bool RunArgMax(const void* logits, ONNXTensorElementDataType logits_type, int num_rows, int vocab_size) {
     if (num_rows <= 0 || vocab_size <= 0)
       return false;
@@ -164,12 +176,7 @@ struct CudaInterfaceImplBase : DeviceInterface {
       return false;  // Unsupported logits dtype -> caller falls back to host argmax.
     }
 
-    // (Re)allocate the Top-K working set if the problem size grew.
-    if (!topk_data_ || topk_batch_ < num_rows || topk_vocab_ != vocab_size) {
-      topk_data_ = std::make_unique<cuda::TopkData>(num_rows, vocab_size, stream);
-      topk_batch_ = num_rows;
-      topk_vocab_ = vocab_size;
-    }
+    PrepareTopKData(num_rows, vocab_size, stream);
 
     // k=1 dispatches to distributed_select_sort, the fastest path for argmax over a large vocab.
     cuda::RunTopK(topk_data_.get(), stream, scores, vocab_size, num_rows, /*k=*/1);
@@ -208,6 +215,28 @@ struct CudaInterfaceImplBase : DeviceInterface {
     return true;
   }
 
+  bool MtpGreedyAcceptance(const void* logits, ONNXTensorElementDataType logits_type, int num_drafts,
+                           int vocab_size, DeviceSpan<int32_t> draft_tokens,
+                           int32_t* accepted, int32_t* next_token) override {
+    if (num_drafts <= 0 || draft_tokens.size() < static_cast<size_t>(num_drafts) ||
+        !RunArgMax(logits, logits_type, num_drafts + 1, vocab_size))
+      return false;
+
+    if (!mtp_accept_result_) {
+      mtp_accept_result_ = CudaMallocArray<int32_t>(2);
+      mtp_accept_host_ = CudaMallocHostArray<int32_t>(2);
+    }
+    cuda::LaunchMtpGreedyAcceptance(topk_data_->topk_indices, topk_data_->topk_stride,
+                                    draft_tokens.Span().data(), num_drafts,
+                                    mtp_accept_result_.get(), GetStream());
+    CUDA_CHECK(cudaMemcpyAsync(mtp_accept_host_.get(), mtp_accept_result_.get(), 2 * sizeof(int32_t),
+                               cudaMemcpyDeviceToHost, GetStream()));
+    CUDA_CHECK(cudaStreamSynchronize(GetStream()));
+    *accepted = mtp_accept_host_.get()[0];
+    *next_token = mtp_accept_host_.get()[1];
+    return true;
+  }
+
   bool Top2(const void* logits, ONNXTensorElementDataType logits_type, int num_rows, int vocab_size,
             int32_t* out_tokens, float* out_scores) override {
     if (num_rows <= 0 || vocab_size <= 1) return false;
@@ -228,11 +257,7 @@ struct CudaInterfaceImplBase : DeviceInterface {
       return false;
     }
 
-    if (!topk_data_ || topk_batch_ < num_rows || topk_vocab_ != vocab_size) {
-      topk_data_ = std::make_unique<cuda::TopkData>(num_rows, vocab_size, stream);
-      topk_batch_ = num_rows;
-      topk_vocab_ = vocab_size;
-    }
+    PrepareTopKData(num_rows, vocab_size, stream);
     cuda::select_sort::RunTopK(topk_data_.get(), stream, scores, vocab_size, num_rows, /*k=*/2);
 
     const size_t result_count = static_cast<size_t>(num_rows) * 2;
@@ -275,11 +300,7 @@ struct CudaInterfaceImplBase : DeviceInterface {
       return false;
     }
 
-    if (!topk_data_ || topk_batch_ < num_rows || topk_vocab_ != vocab_size) {
-      topk_data_ = std::make_unique<cuda::TopkData>(num_rows, vocab_size, stream);
-      topk_batch_ = num_rows;
-      topk_vocab_ = vocab_size;
-    }
+    PrepareTopKData(num_rows, vocab_size, stream);
     // Dispatch to the fastest available Top-K algorithm for this (batch, vocab, k). The dispatcher
     // benchmarks once per shape and caches the choice; select_sort (the previous hardcoded call) is
     // only efficient for very small k and is ~20x slower than the tuned algorithms at k~20, which
@@ -357,6 +378,7 @@ struct CudaInterfaceImplBase : DeviceInterface {
   // Cached working set for the on-device ArgMax (Top-K, k=1) path.
   std::unique_ptr<cuda::TopkData> topk_data_;
   int topk_batch_{0};
+  int topk_active_batch_{0};
   int topk_vocab_{0};
   cuda_unique_ptr<float> argmax_fp32_;          // fp16 -> fp32 scratch (device)
   size_t argmax_fp32_count_{0};
@@ -368,6 +390,8 @@ struct CudaInterfaceImplBase : DeviceInterface {
   cuda_host_unique_ptr<int32_t> topk_indices_host_;  // pinned host buffer for the top-k index copy
   cuda_host_unique_ptr<float> topk_scores_host_;     // pinned host buffer for the top-k score copy
   size_t topk_host_count_{0};
+  cuda_unique_ptr<int32_t> mtp_accept_result_;
+  cuda_host_unique_ptr<int32_t> mtp_accept_host_;
 };
 
 struct CudaInterfaceImpl final : CudaInterfaceImplBase {

@@ -624,6 +624,9 @@ struct OgaMtpGenerator : OgaAbstract {
   size_t GetForwardCount() const { return OgaMtpGenerator_GetForwardCount(this); }
   size_t GetAcceptCount() const { return OgaMtpGenerator_GetAcceptCount(this); }
   size_t GetTrialCount() const { return OgaMtpGenerator_GetTrialCount(this); }
+  size_t GetAcceptancePositionCount() const { return OgaMtpGenerator_GetAcceptancePositionCount(this); }
+  size_t GetPositionAcceptCount(size_t position) const { return OgaMtpGenerator_GetPositionAcceptCount(this, position); }
+  size_t GetPositionTrialCount(size_t position) const { return OgaMtpGenerator_GetPositionTrialCount(this, position); }
 
   static void operator delete(void* p) { OgaDestroyMtpGenerator(reinterpret_cast<OgaMtpGenerator*>(p)); }
 };

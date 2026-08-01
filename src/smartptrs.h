@@ -173,6 +173,12 @@ struct DeviceInterface {
   // the host needs to inspect it. Keep last for vtable/ABI stability.
   virtual bool ArgMaxDevice(const void* /*logits*/, ONNXTensorElementDataType /*logits_type*/, int /*num_rows*/,
                             int /*vocab_size*/, DeviceSpan<int32_t> /*out_tokens*/) { return false; }
+  // Batched argmax followed by the greedy MTP longest-prefix match on device. `num_drafts + 1`
+  // logits rows are consumed; only the accepted count and row-at-rejection/bonus token cross to
+  // the host. Keep last for vtable/ABI stability.
+  virtual bool MtpGreedyAcceptance(const void* /*logits*/, ONNXTensorElementDataType /*logits_type*/,
+                                   int /*num_drafts*/, int /*vocab_size*/, DeviceSpan<int32_t> /*draft_tokens*/,
+                                   int32_t* /*accepted*/, int32_t* /*next_token*/) { return false; }
 };
 
 // A shared_ptr based type that we expose through our C API should inherit from this type.

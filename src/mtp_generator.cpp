@@ -124,12 +124,22 @@ MtpGenerator::MtpGenerator(const Model& main_model, const Model& mtp_model, cons
     const int v = std::atoi(env);
     if (v >= 1) num_speculative_tokens_ = v;
   }
+  position_accepts_.resize(num_speculative_tokens_);
+  position_trials_.resize(num_speculative_tokens_);
   const bool cuda_device_draft_chain = mtp_model_.p_device_->GetType() == DeviceType::CUDA;
   device_draft_chain_ = cuda_device_draft_chain;
   if (const char* env = std::getenv("ORT_MTP_DEVICE_DRAFT_CHAIN")) {
     device_draft_chain_ = cuda_device_draft_chain && std::atoi(env) != 0;
   }
   validate_device_draft_chain_ = std::getenv("ORT_MTP_VALIDATE_DEVICE_DRAFT_CHAIN") != nullptr;
+  device_acceptance_ = device_draft_chain_;
+  if (const char* env = std::getenv("ORT_MTP_DEVICE_ACCEPTANCE")) {
+    device_acceptance_ = device_draft_chain_ && std::atoi(env) != 0;
+  }
+  validate_device_acceptance_ = std::getenv("ORT_MTP_VALIDATE_DEVICE_ACCEPTANCE") != nullptr;
+  if (const char* env = std::getenv("ORT_MTP_RECURRENT_CROP")) {
+    recurrent_crop_ = std::atoi(env) != 0;
+  }
   // Opt-in: commit a partial accept straight out of the verify forward's windowed recurrent state
   // instead of replaying the accepted prefix. Requires a model exported with
   // recurrent_state_window > 1. Read once -- the greedy step consults it on the
@@ -488,25 +498,6 @@ void MtpGenerator::ArgmaxMainRows(int first_row, int num_rows, int32_t* out) {
     }
   }
 
-  // The CUDA distributed-select Top-K implementation is batch-1 only. The N=1 MTP verify uses
-  // two rows and is covered by its existing tuned path, but N>1 verifies have 3+ rows. Submit
-  // those rows independently so each invocation uses the proven batch-1 path while keeping the
-  // full logits device-resident. This is a compatibility bridge until Top-K has a native batched
-  // argmax path for the large Qwen vocabulary.
-  if (num_rows > 2) {
-    const uint8_t* base = static_cast<const uint8_t*>(raw->GetTensorRawData());
-    const size_t row_bytes = static_cast<size_t>(vocab_size_) * Ort::SizeOf(type);
-    bool all_device = true;
-    for (int row = 0; row < num_rows; ++row) {
-      const void* row_ptr = base + static_cast<size_t>(first_row + row) * row_bytes;
-      if (!main_model_.p_device_->ArgMax(row_ptr, type, 1, vocab_size_, out + row)) {
-        all_device = false;
-        break;
-      }
-    }
-    if (all_device) return;
-  }
-
   // Fast path: argmax the rows on-device with the high-performance Top-K kernel (k=1). Only the
   // small token ids are copied to the host -- the full [1,S,V] logits never leave the GPU.
   const uint8_t* base = static_cast<const uint8_t*>(raw->GetTensorRawData());
@@ -521,6 +512,58 @@ void MtpGenerator::ArgmaxMainRows(int first_row, int num_rows, int32_t* out) {
   const float* data = reinterpret_cast<const float*>(cpu.data());
   for (int r = 0; r < num_rows; ++r)
     out[r] = ArgmaxRow(data + static_cast<size_t>(first_row + r) * vocab_size_, vocab_size_);
+}
+
+int MtpGenerator::AcceptDraftsMainRows(int first_row, int num_drafts, int32_t& next_token) {
+  OrtValue* raw = main_->state_->GetOutput(main_model_.config_->model.decoder.outputs.logits.c_str());
+  auto info = raw->GetTensorTypeAndShapeInfo();
+  const ONNXTensorElementDataType type = info->GetElementType();
+  const uint8_t* base = static_cast<const uint8_t*>(raw->GetTensorRawData());
+  const void* rows = base + static_cast<size_t>(first_row) * vocab_size_ * Ort::SizeOf(type);
+
+  int accepted = 0;
+  if (device_acceptance_ &&
+      main_model_.p_device_->MtpGreedyAcceptance(rows, type, num_drafts, vocab_size_, drafts_device_,
+                                                 &accepted, &next_token)) {
+    if (validate_device_acceptance_) {
+      std::vector<int32_t> expected_argmax(static_cast<size_t>(num_drafts) + 1);
+      const size_t row_bytes = static_cast<size_t>(vocab_size_) * Ort::SizeOf(type);
+      for (int row = 0; row <= num_drafts; ++row) {
+        const void* row_ptr = base + static_cast<size_t>(first_row + row) * row_bytes;
+        if (!main_model_.p_device_->ArgMax(row_ptr, type, 1, vocab_size_, &expected_argmax[row]))
+          throw std::runtime_error("MtpGenerator: device acceptance validation requires device argmax");
+      }
+      int expected_accepted = 0;
+      while (expected_accepted < num_drafts &&
+             drafts_[expected_accepted] == expected_argmax[expected_accepted])
+        ++expected_accepted;
+      if (accepted != expected_accepted || next_token != expected_argmax[expected_accepted])
+        throw std::runtime_error("MtpGenerator: batched device acceptance differs from row-wise argmax");
+    }
+    return accepted;
+  }
+
+  if (main_model_.p_device_->GetType() == DeviceType::CUDA) {
+    const size_t row_bytes = static_cast<size_t>(vocab_size_) * Ort::SizeOf(type);
+    bool all_device = true;
+    for (int row = 0; row <= num_drafts; ++row) {
+      const void* row_ptr = base + static_cast<size_t>(first_row + row) * row_bytes;
+      if (!main_model_.p_device_->ArgMax(row_ptr, type, 1, vocab_size_, &verify_argmax_[row])) {
+        all_device = false;
+        break;
+      }
+    }
+    if (all_device) {
+      while (accepted < num_drafts && drafts_[accepted] == verify_argmax_[accepted]) ++accepted;
+      next_token = verify_argmax_[accepted];
+      return accepted;
+    }
+  }
+
+  ArgmaxMainRows(first_row, num_drafts + 1, verify_argmax_.data());
+  while (accepted < num_drafts && drafts_[accepted] == verify_argmax_[accepted]) ++accepted;
+  next_token = verify_argmax_[accepted];
+  return accepted;
 }
 
 int32_t MtpGenerator::DraftNextToken(OrtValue* /*unused*/, int32_t token, bool need_draft) {
@@ -657,10 +700,12 @@ void MtpGenerator::GenerateStepSingle(int32_t t) {
   ArgmaxMainRows(0, 2, verify_argmax);
   const int32_t m = verify_argmax[0];
   ++trials_;
+  ++position_trials_[0];
 
   if (d == m) {
     // 2a. Accept: t and d are both correct. Commit d and harvest the free prediction at row 1.
     ++accepts_;
+    ++position_accepts_[0];
     sequence_.push_back(d);
     if (sequence_.size() >= static_cast<size_t>(max_length_)) {
       done_ = true;
@@ -771,7 +816,7 @@ void MtpGenerator::GenerateStepMulti(int32_t t) {
   // copies + launches) on EVERY step. It is only needed by the RewindToLength fallback below. With
   // the direct-arena commit on a croppable model that fallback is unreachable (a==N takes the bonus
   // branch, a<N takes the crop branch), so the snapshot is dead overhead -- skip it.
-  const bool crop_commit = direct_arena_commit_ && main_->CanCropRecurrentState();
+  const bool crop_commit = direct_arena_commit_ && recurrent_crop_ && main_->CanCropRecurrentState();
   if (!crop_commit) main_->SnapshotState();
   verify_tokens_[0] = t;
   for (int k = 0; k < N; ++k) verify_tokens_[k + 1] = drafts_[k];
@@ -781,7 +826,8 @@ void MtpGenerator::GenerateStepMulti(int32_t t) {
   // synchronizes) absorbs the whole forward's GPU time into the argmax bucket.
   if (prof) HostPhaseProfiler::sync(*main_model_.p_device_);
   auto tpa = prof ? HostPhaseProfiler::now() : HostPhaseProfiler::clk::time_point{};
-  ArgmaxMainRows(0, N + 1, verify_argmax_.data());  // main's real token after each verify position
+  int32_t verify_next_token = 0;
+  const int a = AcceptDraftsMainRows(0, N, verify_next_token);
   OrtValue* vhidden = main_->state_->GetOutput(hs_name.c_str());
   if (prof) {
     HostPhaseProfiler::sync(*main_model_.p_device_);
@@ -791,10 +837,13 @@ void MtpGenerator::GenerateStepMulti(int32_t t) {
   auto tp2 = prof ? HostPhaseProfiler::now() : HostPhaseProfiler::clk::time_point{};
 
   // --- Longest accepted prefix (greedy match against the main model). ---
-  int a = 0;
-  while (a < N && drafts_[a] == verify_argmax_[a]) ++a;
   trials_ += (a < N) ? static_cast<size_t>(a + 1) : static_cast<size_t>(N);  // conditional trials
   accepts_ += static_cast<size_t>(a);
+  for (int position = 0; position < a; ++position) {
+    ++position_trials_[position];
+    ++position_accepts_[position];
+  }
+  if (a < N) ++position_trials_[a];
 
   // Commit the a accepted drafts (t was already committed by the caller). Stop at eos/max_length.
   for (int k = 0; k < a; ++k) {
@@ -833,7 +882,7 @@ void MtpGenerator::GenerateStepMulti(int32_t t) {
     // All drafts accepted: the batched verify already committed [t, d0..d_{N-1}] correctly, so the
     // main KV / recurrent state is exactly at L + (N+1). The bonus token is main's prediction at the
     // last verify row (mirrors the N=1 accept path, which likewise commits a batched-forward token).
-    next_token_ = verify_argmax_[a];
+    next_token_ = verify_next_token;
     CopyHiddenRow(vhidden, a, *hidden_slice_);
     length_ += static_cast<size_t>(N) + 1;
   } else if (crop_commit) {
@@ -843,10 +892,10 @@ void MtpGenerator::GenerateStepMulti(int32_t t) {
     // step time otherwise). Row a's argmax is an early row of a wide forward, so it is not
     // bit-identical to a sequential decode on near-ties; see EXP-023.
     main_->CropToAccepted(length_ + static_cast<size_t>(a) + 1, static_cast<size_t>(a));
-    next_token_ = verify_argmax_[a];
+    next_token_ = verify_next_token;
     CopyHiddenRow(vhidden, a, *hidden_slice_);
     length_ += static_cast<size_t>(a) + 1;
-  } else if (main_->CanCropRecurrentState() && a >= 1) {
+  } else if (recurrent_crop_ && main_->CanCropRecurrentState() && a >= 1) {
     // Partial accept (a>=1), LOSSLESS CROP fast-path (model exported with recurrent_state_window).
     // The batched verify's row a is an EARLY row of a wide (M=N+1) forward, whose argmax is NOT
     // decode-consistent (only the LAST row of a forward matches a 1-token decode; §13.1). So we
@@ -933,7 +982,7 @@ void MtpGenerator::GenerateStepMultiSample(int32_t t) {
   // the recurrent state (RewindTo/RestoreSnapshot is unreachable), so the snapshot is dead
   // overhead -- skip it. The predicate matches the reject-path crop-vs-fallback choice below,
   // so the fallback branch still has its snapshot when it needs one.
-  if (!main_->CanCropRecurrentState()) main_->SnapshotState();
+  if (!recurrent_crop_ || !main_->CanCropRecurrentState()) main_->SnapshotState();
   verify_tokens_[0] = t;
   for (int k = 0; k < N; ++k) verify_tokens_[k + 1] = drafts_[k];
   main_->AppendTokens(cpu_span<const int32_t>(verify_tokens_.data(), N + 1));
@@ -984,6 +1033,11 @@ void MtpGenerator::GenerateStepMultiSample(int32_t t) {
 
   trials_ += rejected ? static_cast<size_t>(a + 1) : static_cast<size_t>(N);
   accepts_ += static_cast<size_t>(a);
+  for (int position = 0; position < a; ++position) {
+    ++position_trials_[position];
+    ++position_accepts_[position];
+  }
+  if (rejected) ++position_trials_[a];
 
   // Commit the a accepted drafts (t was already committed by the caller). Stop at eos/max_length.
   for (int k = 0; k < a; ++k) {
@@ -1024,7 +1078,7 @@ void MtpGenerator::GenerateStepMultiSample(int32_t t) {
     next_token_ = SampleSparse(target_idx_[N], target_prob_[N], rng_);
     CopyHiddenRow(vhidden, N, *hidden_slice_);  // hidden that predicted the bonus token
     length_ += static_cast<size_t>(N) + 1;
-  } else if (main_->CanCropRecurrentState()) {
+  } else if (recurrent_crop_ && main_->CanCropRecurrentState()) {
     // Rejected at position a, LOSSLESS-CROP fast path (model exported with recurrent_state_window):
     // skip the full re-run main forward (~25% of N=3 step time). The batched verify already advanced
     // the recurrent state through every token (window slot for position a = state AFTER the committed

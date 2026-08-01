@@ -558,6 +558,12 @@ OGA_EXPORT size_t OGA_API_CALL OgaMtpGenerator_GetForwardCount(const OgaMtpGener
 OGA_EXPORT size_t OGA_API_CALL OgaMtpGenerator_GetAcceptCount(const OgaMtpGenerator* generator);
 /** \brief Number of draft attempts (speculative stats). */
 OGA_EXPORT size_t OGA_API_CALL OgaMtpGenerator_GetTrialCount(const OgaMtpGenerator* generator);
+/** \brief Number of draft positions tracked in the acceptance histogram. */
+OGA_EXPORT size_t OGA_API_CALL OgaMtpGenerator_GetAcceptancePositionCount(const OgaMtpGenerator* generator);
+/** \brief Accepted drafts at a position, conditioned on that position being attempted. */
+OGA_EXPORT size_t OGA_API_CALL OgaMtpGenerator_GetPositionAcceptCount(const OgaMtpGenerator* generator, size_t position);
+/** \brief Draft attempts at a position (only reached after all preceding positions accepted). */
+OGA_EXPORT size_t OGA_API_CALL OgaMtpGenerator_GetPositionTrialCount(const OgaMtpGenerator* generator, size_t position);
 /** \brief Destroys the given MTP generator. */
 OGA_EXPORT void OGA_API_CALL OgaDestroyMtpGenerator(OgaMtpGenerator* generator);
 

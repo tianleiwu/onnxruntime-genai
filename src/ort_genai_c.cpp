@@ -514,6 +514,18 @@ size_t OGA_API_CALL OgaMtpGenerator_GetTrialCount(const OgaMtpGenerator* generat
   return generator->Trials();
 }
 
+size_t OGA_API_CALL OgaMtpGenerator_GetAcceptancePositionCount(const OgaMtpGenerator* generator) {
+  return generator->AcceptancePositionCount();
+}
+
+size_t OGA_API_CALL OgaMtpGenerator_GetPositionAcceptCount(const OgaMtpGenerator* generator, size_t position) {
+  return generator->PositionAccepts(position);
+}
+
+size_t OGA_API_CALL OgaMtpGenerator_GetPositionTrialCount(const OgaMtpGenerator* generator, size_t position) {
+  return generator->PositionTrials(position);
+}
+
 void OGA_API_CALL OgaDestroyMtpGenerator(OgaMtpGenerator* p) { delete p; }
 
 

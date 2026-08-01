@@ -46,6 +46,9 @@ struct MtpGenerator {
   size_t Forwards() const { return forwards_; }
   size_t Accepts() const { return accepts_; }
   size_t Trials() const { return trials_; }
+  size_t AcceptancePositionCount() const { return position_trials_.size(); }
+  size_t PositionAccepts(size_t position) const { return position_accepts_.at(position); }
+  size_t PositionTrials(size_t position) const { return position_trials_.at(position); }
 
  private:
   // Run the MTP head on a single (hidden_state, token) pair. When `need_draft` is true, returns the
@@ -114,6 +117,9 @@ struct MtpGenerator {
   // ([1,S,V]), starting at `first_row`, writing the token ids to `out`. Uses the device's
   // on-device Top-K kernel when available (no full-logits host copy); falls back to a host argmax.
   void ArgmaxMainRows(int first_row, int num_rows, int32_t* out);
+  // Batched argmax of the N+1 verify rows plus longest-prefix draft acceptance. On CUDA both
+  // operations stay on device and only {accepted_count, next_token} return to the host.
+  int AcceptDraftsMainRows(int first_row, int num_drafts, int32_t& next_token);
 
   const Model& main_model_;
   const Model& mtp_model_;
@@ -147,6 +153,9 @@ struct MtpGenerator {
   // controlled performance comparisons; other devices use the existing host-token path by default.
   bool device_draft_chain_{false};
   bool validate_device_draft_chain_{false};
+  bool device_acceptance_{false};
+  bool validate_device_acceptance_{false};
+  bool recurrent_crop_{true};
   // ORT_MTP_DIRECT_ARENA_COMMIT: on a model exported with recurrent_state_window > 1, commit a
   // partial accept by cropping the KV cache and the recurrent state window to the accepted length
   // and taking the bonus from the verify forward, instead of replaying the accepted prefix. Also
@@ -209,6 +218,8 @@ struct MtpGenerator {
   size_t forwards_{};
   size_t accepts_{};
   size_t trials_{};
+  std::vector<size_t> position_accepts_;
+  std::vector<size_t> position_trials_;
 };
 
 }  // namespace Generators
