@@ -999,9 +999,10 @@ class Qwen35TextModel(Model):
         # and needs self.layer_types to identify linear attention layers.
         # Mirror base class logic: prefer extra_options["num_hidden_layers"] when present.
         text_config = getattr(config, "text_config", config)
-        num_layers = extra_options.get("num_hidden_layers", getattr(text_config, "num_hidden_layers", 0))
+        num_layers = int(extra_options.get("num_hidden_layers", getattr(text_config, "num_hidden_layers", 0)))
         if hasattr(config, "layer_types") and config.layer_types is not None:
-            self.layer_types = list(config.layer_types)
+            # Truncated to num_layers so `num_hidden_layers` (layer-count override) stays usable.
+            self.layer_types = list(config.layer_types)[:num_layers]
         elif hasattr(config, "full_attention_interval") and config.full_attention_interval is not None:
             interval = config.full_attention_interval
             self.layer_types = [
@@ -1103,6 +1104,9 @@ class Qwen35TextModel(Model):
         self.fuse_linear_attn_gates = str(
             extra_options.get("fuse_linear_attn_gates", "true" if self.ep == "cuda" else "false")
         ).lower() in ("1", "true", "yes")
+
+        # Reuse the ModelOpt checkpoint's FP8 attention / NVFP4 MLP + lm_head tensors verbatim.
+        self._init_original_checkpoint_weight_options(extra_options)
 
         # Replace standard KV cache I/O with hybrid cache I/O
         self._setup_hybrid_cache_io()
@@ -2197,6 +2201,423 @@ class Qwen35TextModel(Model):
 
         return gated_output
 
+    def _init_original_checkpoint_weight_options(self, extra_options):
+        """Parse the options that reuse the ModelOpt checkpoint's FP8/NVFP4 tensors verbatim.
+
+        Both the dense (Qwen3.5-27B) and MoE (Qwen3.5-35B-A3B) NVFP4 checkpoints quantize the
+        same module classes: FP8 (E4M3) for the self-attention q/k/v/o and GatedDeltaNet
+        in_proj_qkv / in_proj_z / out_proj projections, and NVFP4 (E2M1) for the MLP
+        projections and the lm_head. Only the MLP topology differs (dense gate/up/down vs.
+        routed experts + shared expert), so this setup is shared by both builders.
+        """
+        # Keep the checkpoint's original FP8 (E4M3) weights instead of dequantizing them
+        # to fp16 and re-quantizing to int4/int8. Both the self-attention q/k/v/o projections
+        # and the GatedDeltaNet (linear-attention) ``in_proj_qkv`` / ``in_proj_z`` / ``out_proj``
+        # projections are emitted as the weight-only ``MatMulBlockQuantizedFp8Weight`` contrib op.
+        # Disabled for the MTP head (its ``mtp.*`` weights are BF16 and its basenames would
+        # otherwise misload the main model's tensors).
+        self.use_original_fp8_weights = (
+            bool(extra_options.get("use_original_fp8_weights", False))
+            and not getattr(self, "is_mtp_head", False)
+        )
+
+        # Emit the GatedDeltaNet projections as ``MatMulBlockQuantizedFp8Weight`` instead of
+        # widening the checkpoint's FP8 weights to fp16. These are the largest remaining fp16
+        # matmuls in decode, and halving their weight traffic is worth ~1.26 ms/step of cuBLAS
+        # time on the 35B MTP model. Weight-only FP8 reproduces the checkpoint tensors exactly
+        # (the fp16 path was a lossless widening of the same values), so accuracy is unchanged.
+        # Set ``fp8_linear_attn=false`` to fall back to the previous fp16 behavior for A/B runs.
+        self.fp8_linear_attn = str(extra_options.get("fp8_linear_attn", "true")).lower() in ("1", "true", "yes")
+
+        # ``fp8_attn_static_input_scale`` applies the checkpoint's calibrated per-tensor
+        # activation scale (W8A8) to the self-attention projections. The linear-attention
+        # projections default to weight-only (W8A16) even when it is on: W8A16 is strictly more
+        # accurate and avoids paying for activation quantization on a path that was never
+        # validated against the checkpoint's calibration. Opt in with
+        # ``fp8_linear_attn_static_input_scale=true``.
+        self.fp8_linear_attn_static_input_scale = str(
+            extra_options.get("fp8_linear_attn_static_input_scale", "false")
+        ).lower() in ("1", "true", "yes")
+
+        # Diagnostic: keep specific attention layers' q/k/v/o projections at fp16 instead
+        # of FP8. Given as a comma/space-separated list of layer indices via the
+        # ``fp8_attn_exclude_layers`` extra option. These layers skip the
+        # ``MatMulBlockQuantizedFp8Weight`` op (see ``_fp8_weight_key_for_matmul``) and are added to
+        # ``nodes_to_exclude`` so they stay fp16 rather than being re-quantized to int4.
+        # Used to isolate a single attention layer's FP8 quantization error.
+        _fp8_excl = extra_options.get("fp8_attn_exclude_layers", "")
+        self.fp8_attn_exclude_layers = {
+            int(x) for x in str(_fp8_excl).replace(",", " ").split() if x.strip() != ""
+        }
+
+        # Diagnostic: quantize FP8 attention activations with the checkpoint's static,
+        # calibrated per-tensor ``input_scale`` (ModelOpt W8A8 / vLLM scheme) instead of the
+        # default dynamic per-token absmax scale. Used to test whether matching vLLM's
+        # calibrated activation scale removes the greedy repetition loops.
+        self.fp8_attn_static_input_scale = bool(
+            extra_options.get("fp8_attn_static_input_scale", False)
+        )
+        # Q/K/V projections consume the same activation and, in ModelOpt checkpoints,
+        # commonly share one calibrated input scale. Reuse their static quantization
+        # subgraph to avoid serializing redundant nodes even though ORT can CSE them.
+        self.share_fp8_attn_qkv_activation = str(
+            extra_options.get("share_fp8_attn_qkv_activation", "true")
+        ).lower() in ("1", "true", "yes")
+        self._fp8_attention_activation_cache = {}
+
+        # Diagnostic: keep specific layers' NVFP4 dense MLP (gate/up/down) projections at fp16
+        # instead of the ``MatMulBlockQuantizedFp4Weight`` op (comma/space-separated layer
+        # indices via ``nvfp4_dense_exclude_layers``), and/or keep the NVFP4 lm_head at fp16 via
+        # ``nvfp4_lmhead_fp16``. Excluded modules skip MatMulBlockQuantizedFp4Weight (see
+        # ``_make_matmul_nvfp4``) and are added to ``nodes_to_exclude`` so they stay fp16.
+        _fp4_excl = extra_options.get("nvfp4_dense_exclude_layers", "")
+        self.nvfp4_dense_exclude_layers = {
+            int(x) for x in str(_fp4_excl).replace(",", " ").split() if x.strip() != ""
+        }
+        self.nvfp4_lmhead_fp16 = str(extra_options.get("nvfp4_lmhead_fp16", "false")).lower() in ("1", "true", "yes")
+
+        # Keep the checkpoint's original NVFP4 (E2M1) *dense* weights instead of dequantizing
+        # them to fp16 and re-quantizing to int4/int8. The MLP projections (dense gate/up/down
+        # or, on the MoE model, the shared expert) and the lm_head are emitted as the
+        # weight-only ``MatMulBlockQuantizedFp4Weight`` contrib op straight from the ModelOpt
+        # tensors (E2M1 codes + E4M3 block scale + fp32 global scale). NOTE: the NVFP4 *routed
+        # MoE experts* are controlled separately by ``moe_quant_type=nvfp4`` (native NVFP4
+        # QMoE); this flag only covers dense NVFP4 modules. The MTP head may use the
+        # checkpoint's shared lm_head, but its own BF16 layer weights must stay on the
+        # configured MTP quantization path (see ``_nvfp4_dense_key_for_matmul``).
+        self.use_original_nvfp4_weights = bool(extra_options.get("use_original_nvfp4_weights", False))
+
+        if self.onnx_dtype not in {ir.DataType.INT4, ir.DataType.INT8}:
+            return
+
+        nodes_to_exclude = self.quant_attrs.setdefault("nodes_to_exclude", [])
+
+        def exclude(node_name):
+            if node_name not in nodes_to_exclude:
+                nodes_to_exclude.append(node_name)
+
+        for i in range(self.num_layers):
+            # When keeping original FP8 weights, keep the GatedDeltaNet (linear-attention)
+            # projections out of int4/int8 quantization. ``in_proj_a`` / ``in_proj_b`` are
+            # BF16 in the checkpoint (and only 32 elements wide), so they stay fp16. The
+            # FP8 projections are only excluded when ``fp8_linear_attn`` is off; otherwise
+            # they are replaced by ``MatMulBlockQuantizedFp8Weight`` and never reach the
+            # int4/int8 quantizer. Without this they would be re-quantized to int4, far
+            # from the source.
+            if self.use_original_fp8_weights:
+                linear_projs = ["in_proj_a", "in_proj_b"]
+                if not self.fp8_linear_attn:
+                    linear_projs += ["in_proj_qkv", "in_proj_z", "out_proj"]
+                for proj in linear_projs:
+                    exclude(f"/model/layers.{i}/linear_attn/{proj}/MatMul")
+                # Diagnostic: keep excluded attention layers' q/k/v/o at fp16 (skip both
+                # FP8 and int4), to isolate that layer's FP8 quantization error.
+                if i in self.fp8_attn_exclude_layers:
+                    for proj in ("q_proj", "k_proj", "v_proj", "o_proj"):
+                        exclude(f"/model/layers.{i}/attn/{proj}/MatMul")
+            # Diagnostic: keep excluded layers' NVFP4 MLP projections at fp16 (skip both
+            # MatMulBlockQuantizedFp4Weight and int4).
+            if i in self.nvfp4_dense_exclude_layers:
+                for proj in ("gate_proj", "up_proj", "down_proj"):
+                    exclude(f"/model/layers.{i}/mlp/{proj}/MatMul")
+                    exclude(f"/model/layers.{i}/shared_expert/{proj}/MatMul")
+
+        # Diagnostic: keep the NVFP4 lm_head at fp16 (skip MatMulBlockQuantizedFp4Weight and int4).
+        if self.nvfp4_lmhead_fp16:
+            exclude("/lm_head/MatMul")
+
+    def _fp8_weight_key_for_matmul(self, basename):
+        m = re.match(r"^/model/layers\.(\d+)/(attn|linear_attn)/([^/]+)/MatMul$", basename)
+        if not m:
+            return None
+        layer_id = int(m.group(1))
+        attn_kind = m.group(2)
+        proj = m.group(3)
+
+        if attn_kind == "attn":
+            if proj not in {"q_proj", "k_proj", "v_proj", "o_proj"}:
+                return None
+            if layer_id in getattr(self, "fp8_attn_exclude_layers", ()):
+                return None
+            return f"model.language_model.layers.{layer_id}.self_attn.{proj}"
+
+        # GatedDeltaNet: only in_proj_qkv / in_proj_z / out_proj are stored as FP8 in the
+        # ModelOpt checkpoint (they carry .input_scale + .weight_scale). in_proj_a / in_proj_b
+        # are BF16 and only 32 elements wide, so they stay on the float path.
+        if proj not in {"in_proj_qkv", "in_proj_z", "out_proj"}:
+            return None
+        if not getattr(self, "fp8_linear_attn", False):
+            return None
+        return f"model.language_model.layers.{layer_id}.linear_attn.{proj}"
+
+    def _fp8_attention_input_scale(self, basename):
+        """Return the checkpoint's calibrated static per-tensor FP8 activation scale, or ``None``.
+
+        ``MatMulBlockQuantizedFp8Weight`` consumes the activation in FP16/BF16 and takes an
+        optional fp32 *scalar* ``a_scale``; when present it statically quantizes the activation
+        to FP8 E4M3 and dequantizes it back inside the kernel (``a_deq = fp8(A / a_scale) *
+        a_scale``), reproducing the checkpoint's W8A8 numerics. No ONNX-level quantization
+        subgraph is therefore needed.
+
+        Returns ``None`` when static calibration is disabled or the checkpoint has no
+        ``input_scale`` for this module. The op then runs weight-only (W8A16), keeping the
+        activation at full FP16/BF16 precision -- strictly more accurate than the previous
+        dynamic per-token absmax fallback.
+        """
+        if not getattr(self, "fp8_attn_static_input_scale", False):
+            return None
+        key_prefix = self._fp8_weight_key_for_matmul(basename)
+        if key_prefix is None:
+            return None
+        if ".linear_attn." in key_prefix and not getattr(self, "fp8_linear_attn_static_input_scale", False):
+            # Weight-only (W8A16) for the GatedDeltaNet projections; see __init__.
+            return None
+        try:
+            return float(self._load_nvfp4_tensor(f"{key_prefix}.input_scale").float().reshape(-1)[0])
+        except Exception:
+            return None
+
+    def _make_fp8_activation_scale_initializer(self, basename, scale_val):
+        """Create (or reuse) the fp32 scalar ``a_scale`` initializer for an FP8 attention matmul.
+
+        Q/K/V consume the same activation and, in ModelOpt checkpoints, commonly share one
+        calibrated input scale. ``share_fp8_attn_qkv_activation`` reuses a single initializer
+        for every module with the same scale value instead of serializing one per projection.
+        """
+        share = getattr(self, "share_fp8_attn_qkv_activation", False)
+        if share:
+            cached = self._fp8_attention_activation_cache.get(scale_val)
+            if cached is not None:
+                return cached
+            name = f"model.fp8_attn_input_scale.{len(self._fp8_attention_activation_cache)}"
+        else:
+            name = f"{basename[1:].replace('/', '.')}.fp8_input_scale"
+        self.make_initializer(torch.tensor([scale_val], dtype=torch.float32), name, to=ir.DataType.FLOAT)
+        if share:
+            self._fp8_attention_activation_cache[scale_val] = name
+        return name
+
+    def _prepare_matmul_block_quantized_scales(self, weight_scale, out_features, block_count):
+        # MatMulBlockQuantizedFp8Weight expects b_scale of shape [N, ceil(K / block_size)] = [out_features, block_count].
+        scale = weight_scale.float()
+        if scale.numel() == 1:
+            return scale.reshape(1, 1).expand(out_features, block_count).contiguous()
+        if scale.ndim >= 2 and scale.shape[0] == out_features:
+            scale = scale.reshape(out_features, -1)
+            if scale.shape[1] == block_count:
+                return scale.contiguous()
+        if scale.ndim >= 2 and scale.shape[0] == block_count:
+            scale = scale.reshape(block_count, -1)
+            if scale.shape[1] == out_features:
+                return scale.transpose(0, 1).contiguous()
+        if scale.ndim == 1 and scale.numel() == out_features * block_count:
+            return scale.view(out_features, block_count).contiguous()
+        return None
+
+    def _make_fp8_attention_matmul(self, basename, root_input, **kwargs):
+        if not self.use_original_fp8_weights:
+            return None
+
+        key_prefix = self._fp8_weight_key_for_matmul(basename)
+        if key_prefix is None:
+            return None
+
+        try:
+            weight = self._load_nvfp4_tensor(f"{key_prefix}.weight")
+            weight_scale = self._load_nvfp4_tensor(f"{key_prefix}.weight_scale")
+        except Exception:
+            return None
+
+        if weight.dtype != torch.float8_e4m3fn:
+            return None
+
+        output = "logits" if kwargs.get("logits", False) else f"{basename}/output_0"
+        seq_dim = kwargs.get("seq_dim", "sequence_length")
+        in_features = int(weight.shape[1])
+        out_features = int(weight.shape[0])
+
+        # Per-tensor weight scale: block_size == K, so ceil(K / block_size) == 1 K-block.
+        # The source ModelOpt checkpoint quantizes these projections with a per-tensor FP8
+        # weight scale and a per-tensor activation ``input_scale``, so a single block matches
+        # the original W8A8 scheme exactly.
+        block_size = in_features
+        block_count = 1
+
+        scale_b = self._prepare_matmul_block_quantized_scales(weight_scale, out_features, block_count)
+        if scale_b is None:
+            return None
+
+        # MatMulBlockQuantizedFp8Weight takes B as [N, K] (row-major weight), so the checkpoint
+        # weight (already [N, K] = [out, in]) is fed through without transposition.
+        weight_name = f"{basename[1:].replace('/', '.')}.fp8_weight"
+        self.make_initializer(weight.contiguous(), weight_name)
+
+        scale_b_name = f"{basename[1:].replace('/', '.')}.fp8_weight_scale"
+        self.make_initializer(scale_b, scale_b_name, to=ir.DataType.FLOAT)
+
+        # The activation is passed through unquantized; the op applies the optional scalar
+        # ``a_scale`` internally. Output type follows A, so no bf16 -> io_dtype cast is needed.
+        inputs = [root_input, weight_name, scale_b_name]
+        static_scale_val = self._fp8_attention_input_scale(basename)
+        if static_scale_val is not None:
+            inputs.append(self._make_fp8_activation_scale_initializer(basename, static_scale_val))
+
+        self.make_node(
+            "MatMulBlockQuantizedFp8Weight",
+            inputs=inputs,
+            outputs=[output],
+            name=basename,
+            domain="com.microsoft",
+            block_size=block_size,
+        )
+        self.make_value(output, self.io_dtype, shape=["batch_size", seq_dim, out_features])
+        return basename
+
+    def _nvfp4_dense_key_for_matmul(self, basename):
+        """Map a dense MatMul basename to its ModelOpt NVFP4 checkpoint key prefix.
+
+        Only the modules stored as NVFP4 in the checkpoint are eligible for the
+        ``MatMulBlockQuantizedFp4Weight`` op: the lm_head plus the MLP projections -- the dense
+        ``mlp.{gate,up,down}_proj`` on Qwen3.5-27B, or the always-on ``mlp.shared_expert.*`` on
+        the MoE models (whose routed experts go through QMoE instead).
+        """
+        if basename == "/lm_head/MatMul":
+            return "lm_head"
+        if getattr(self, "is_mtp_head", False):
+            return None
+        m = re.match(r"^/model/layers\.(\d+)/(mlp|shared_expert)/(gate_proj|up_proj|down_proj)/MatMul$", basename)
+        if m:
+            layer_id = int(m.group(1))
+            module = "" if m.group(2) == "mlp" else "shared_expert."
+            return f"model.language_model.layers.{layer_id}.mlp.{module}{m.group(3)}"
+        return None
+
+    def _make_matmul_nvfp4(self, basename, root_input, **kwargs):
+        """Emit a weight-only ``MatMulBlockQuantizedFp4Weight`` node from the raw ModelOpt NVFP4 tensors.
+
+        The checkpoint stores these projections as packed NVFP4: ``weight`` uint8 ``[N, K/2]``
+        (two E2M1 codes per byte, low nibble first), ``weight_scale`` E4M3 ``[N, K/16]`` block
+        scales, and a scalar ``weight_scale_2`` fp32 global scale -- exactly the layout the
+        ``MatMulBlockQuantizedFp4Weight`` op consumes, so the tensors are fed through unmodified. Returns the node
+        name, or ``None`` to fall back to the standard (int4/int8/fp16) path when the option is
+        off, the module is not NVFP4-eligible, or the tensors are absent/non-NVFP4 (e.g. the
+        BF16 MTP head).
+        """
+        if not self.use_original_nvfp4_weights:
+            return None
+
+        key_prefix = self._nvfp4_dense_key_for_matmul(basename)
+        if key_prefix is None:
+            return None
+
+        # Diagnostic: keep excluded MLP layers / lm_head at fp16 (skip MatMulBlockQuantizedFp4Weight).
+        if key_prefix == "lm_head":
+            if self.nvfp4_lmhead_fp16:
+                return None
+        else:
+            m = re.match(r"^model\.language_model\.layers\.(\d+)\.mlp\.", key_prefix)
+            if m and int(m.group(1)) in self.nvfp4_dense_exclude_layers:
+                return None
+
+        try:
+            weight = self._load_nvfp4_tensor(f"{key_prefix}.weight")
+            weight_scale = self._load_nvfp4_tensor(f"{key_prefix}.weight_scale")
+            weight_scale_2 = self._load_nvfp4_tensor(f"{key_prefix}.weight_scale_2")
+        except Exception:
+            return None
+
+        # Only the packed NVFP4 (uint8) modules take this path. Modules stored as BF16
+        # (e.g. the MTP head's shared expert / lm_head) fall back to the standard path.
+        if weight.dtype != torch.uint8:
+            return None
+
+        out_features = int(weight.shape[0])       # N
+        block_size = 16
+
+        seq_dim = kwargs.get("seq_dim", "sequence_length")
+        output = "logits" if kwargs.get("logits", False) else f"{basename}/output_0"
+
+        prefix = basename[1:].replace("/", ".")
+        weight_name = f"{prefix}.nvfp4_weight"
+        self.make_initializer(weight.to(torch.uint8), weight_name)
+
+        scale_name = f"{prefix}.nvfp4_weight_scale"
+        self.make_initializer(weight_scale.view(torch.uint8), scale_name)
+
+        global_scale_name = f"{prefix}.nvfp4_weight_scale_2"
+        self.make_initializer(weight_scale_2.float().reshape(1), global_scale_name)
+
+        # ``N`` and ``K`` are derived by the op from the weight shape (N = B.shape[0],
+        # K = 2 * B.shape[1]), so only ``block_size`` is passed as an attribute.
+        self.make_node(
+            "MatMulBlockQuantizedFp4Weight",
+            inputs=[root_input, weight_name, scale_name, global_scale_name],
+            outputs=[output],
+            name=basename,
+            domain="com.microsoft",
+            block_size=block_size,
+        )
+        self.make_value(output, self.io_dtype, shape=["batch_size", seq_dim, out_features])
+        return basename
+
+    def make_matmul_op(self, matmul, basename, root_input, **kwargs):
+        fp8_name = self._make_fp8_attention_matmul(basename, root_input, **kwargs)
+        if fp8_name is not None:
+            return fp8_name
+        nvfp4_name = self._make_matmul_nvfp4(basename, root_input, **kwargs)
+        if nvfp4_name is not None:
+            return nvfp4_name
+        return super().make_matmul_op(matmul, basename, root_input, **kwargs)
+
+    def _nvfp4_snapshot_dir(self):
+        """Locate the source checkpoint directory (local dir or HF snapshot)."""
+        cached = getattr(self, "_nvfp4_snapshot_dir_cache", None)
+        if cached is not None:
+            return cached
+        from pathlib import Path
+
+        model_path = Path(self.model_name_or_path)
+        if model_path.is_dir():
+            self._nvfp4_snapshot_dir_cache = model_path
+            return model_path
+        from huggingface_hub import snapshot_download
+
+        self._nvfp4_snapshot_dir_cache = Path(
+            snapshot_download(self.model_name_or_path, cache_dir=self.cache_dir, token=self.hf_token, local_files_only=True)
+        )
+        return self._nvfp4_snapshot_dir_cache
+
+    def _nvfp4_weight_map(self):
+        cached = getattr(self, "_nvfp4_weight_map_cache", "unset")
+        if cached != "unset":
+            return cached
+        import json
+
+        index_path = self._nvfp4_snapshot_dir() / "model.safetensors.index.json"
+        self._nvfp4_weight_map_cache = json.load(open(index_path))["weight_map"] if index_path.exists() else None
+        return self._nvfp4_weight_map_cache
+
+    def _load_nvfp4_tensor(self, tensor_name):
+        """Read a raw tensor from the source safetensors (bypasses transformers)."""
+        from safetensors import safe_open
+
+        snapshot_dir = self._nvfp4_snapshot_dir()
+        weight_map = self._nvfp4_weight_map()
+        handles = getattr(self, "_nvfp4_handles", None)
+        if handles is None:
+            handles = self._nvfp4_handles = {}
+            self._nvfp4_handle_keys = {}
+        files = [snapshot_dir / weight_map[tensor_name]] if weight_map is not None else sorted(snapshot_dir.glob("*.safetensors"))
+        for f in files:
+            key = str(f)
+            handle = handles.get(key)
+            if handle is None:
+                handle = handles[key] = safe_open(f, framework="pt", device="cpu")
+                self._nvfp4_handle_keys[key] = set(handle.keys())
+            if tensor_name in self._nvfp4_handle_keys[key]:
+                return handle.get_tensor(tensor_name)
+        raise RuntimeError(f"NVFP4 tensor '{tensor_name}' not found under {snapshot_dir}.")
+
     def make_genai_config(self, model_name_or_path, extra_kwargs, out_dir):
         """Generate genai_config.json for the decoder (text-only) model.
 
@@ -2310,87 +2731,9 @@ class Qwen35MoeTextModel(Qwen35TextModel):
 
         super().__init__(config, io_dtype, onnx_dtype, ep, cache_dir, extra_options)
 
-        # Keep the checkpoint's original FP8 (E4M3) weights instead of dequantizing them
-        # to fp16 and re-quantizing to int4/int8. Both the self-attention q/k/v/o projections
-        # and the GatedDeltaNet (linear-attention) ``in_proj_qkv`` / ``in_proj_z`` / ``out_proj``
-        # projections are emitted as the weight-only ``MatMulBlockQuantizedFp8Weight`` contrib op.
-        # Disabled for the MTP head (its ``mtp.*`` weights are BF16 and its basenames would
-        # otherwise misload the main model's tensors).
-        self.use_original_fp8_weights = (
-            bool(extra_options.get("use_original_fp8_weights", False))
-            and not getattr(self, "is_mtp_head", False)
-        )
-
-        # Emit the GatedDeltaNet projections as ``MatMulBlockQuantizedFp8Weight`` instead of
-        # widening the checkpoint's FP8 weights to fp16. These are the largest remaining fp16
-        # matmuls in decode (in_proj_qkv 8192x2048, in_proj_z 4096x2048, out_proj 2048x4096,
-        # x30 layers) and halving their weight traffic is worth ~1.26 ms/step of cuBLAS time on
-        # the MTP model. Weight-only FP8 reproduces the checkpoint tensors exactly (the fp16
-        # path was a lossless widening of the same values), so accuracy is unchanged.
-        # Set ``fp8_linear_attn=false`` to fall back to the previous fp16 behavior for A/B runs.
-        self.fp8_linear_attn = str(extra_options.get("fp8_linear_attn", "true")).lower() in ("1", "true", "yes")
-
-        # ``fp8_attn_static_input_scale`` applies the checkpoint's calibrated per-tensor
-        # activation scale (W8A8) to the self-attention projections. The linear-attention
-        # projections default to weight-only (W8A16) even when it is on: W8A16 is strictly more
-        # accurate and avoids paying for activation quantization on a path that was never
-        # validated against the checkpoint's calibration. Opt in with
-        # ``fp8_linear_attn_static_input_scale=true``.
-        self.fp8_linear_attn_static_input_scale = str(
-            extra_options.get("fp8_linear_attn_static_input_scale", "false")
-        ).lower() in ("1", "true", "yes")
-
-        # Diagnostic: keep specific attention layers' q/k/v/o projections at fp16 instead
-        # of FP8. Given as a comma/space-separated list of layer indices via the
-        # ``fp8_attn_exclude_layers`` extra option. These layers skip the
-        # ``MatMulBlockQuantizedFp8Weight`` op (see ``_fp8_weight_key_for_matmul``) and are added to
-        # ``nodes_to_exclude`` so they stay fp16 rather than being re-quantized to int4.
-        # Used to isolate a single attention layer's FP8 quantization error.
-        _fp8_excl = extra_options.get("fp8_attn_exclude_layers", "")
-        self.fp8_attn_exclude_layers = {
-            int(x) for x in str(_fp8_excl).replace(",", " ").split() if x.strip() != ""
-        }
-
-        # Diagnostic: quantize FP8 attention activations with the checkpoint's static,
-        # calibrated per-tensor ``input_scale`` (ModelOpt W8A8 / vLLM scheme) instead of the
-        # default dynamic per-token absmax scale. Used to test whether matching vLLM's
-        # calibrated activation scale removes the greedy repetition loops.
-        self.fp8_attn_static_input_scale = bool(
-            extra_options.get("fp8_attn_static_input_scale", False)
-        )
-        # Q/K/V projections consume the same activation and, in ModelOpt checkpoints,
-        # commonly share one calibrated input scale. Reuse their static quantization
-        # subgraph to avoid serializing redundant nodes even though ORT can CSE them.
-        self.share_fp8_attn_qkv_activation = str(
-            extra_options.get("share_fp8_attn_qkv_activation", "true")
-        ).lower() in ("1", "true", "yes")
-        self._fp8_attention_activation_cache = {}
-
-        # FP8 (E4M3) KV cache to match the ModelOpt checkpoint (kv_cache_quant_algo=FP8) is
-        # handled in Qwen35TextModel.__init__, which maps `fp8_kv_cache=true` onto the generic
-        # `kv_cache_quant_type=fp8_per_tensor` machinery before the base class initializes.
-
-        # Diagnostic: keep specific layers' NVFP4 dense shared-expert (gate/up/down) projections
-        # at fp16 instead of the ``MatMulBlockQuantizedFp4Weight`` op (comma/space-separated layer indices via
-        # ``nvfp4_dense_exclude_layers``), and/or keep the NVFP4 lm_head at fp16 via
-        # ``nvfp4_lmhead_fp16``. Excluded modules skip MatMulBlockQuantizedFp4Weight (see ``_make_matmul_nvfp4``)
-        # and are added to ``nodes_to_exclude`` so they stay fp16. Used to isolate the shared-expert
-        # (MatMulBlockQuantizedFp4Weight) contribution from the routed experts (QMoE).
-        _fp4_excl = extra_options.get("nvfp4_dense_exclude_layers", "")
-        self.nvfp4_dense_exclude_layers = {
-            int(x) for x in str(_fp4_excl).replace(",", " ").split() if x.strip() != ""
-        }
-        self.nvfp4_lmhead_fp16 = str(extra_options.get("nvfp4_lmhead_fp16", "false")).lower() in ("1", "true", "yes")
-
-        # Keep the checkpoint's original NVFP4 (E2M1) *dense* weights instead of dequantizing
-        # them to fp16 and re-quantizing to int4/int8. The shared-expert MLP and lm_head
-        # projections are emitted as the weight-only ``MatMulBlockQuantizedFp4Weight`` contrib op straight from
-        # the ModelOpt tensors (E2M1 codes + E4M3 block scale + fp32 global scale). NOTE: the
-        # NVFP4 *routed MoE experts* are controlled separately by ``moe_quant_type=nvfp4``
-        # (native NVFP4 QMoE); this flag only covers dense NVFP4 modules. The MTP head may use
-        # the checkpoint's shared lm_head, but its own BF16 layer weights must stay on the
-        # configured MTP quantization path (see ``_nvfp4_dense_key_for_matmul``).
-        self.use_original_nvfp4_weights = bool(extra_options.get("use_original_nvfp4_weights", False))
+        # The FP8 attention / NVFP4 dense-MLP / NVFP4 lm_head options and their
+        # ``nodes_to_exclude`` entries are parsed by ``Qwen35TextModel.__init__``; the MoE
+        # checkpoint quantizes the same module classes as the dense one.
 
         # The base builder derives the GenAI model.type by stripping the suffix
         # after "For" and lowercasing, matching Qwen3.5 text-only export.
@@ -2436,38 +2779,6 @@ class Qwen35MoeTextModel(Qwen35TextModel):
                     nodes_to_exclude.append(router_node)
                 if shared_gate_node not in nodes_to_exclude:
                     nodes_to_exclude.append(shared_gate_node)
-                # When keeping original FP8 weights, keep the GatedDeltaNet (linear-attention)
-                # projections out of int4/int8 quantization. ``in_proj_a`` / ``in_proj_b`` are
-                # BF16 in the checkpoint (and only 32 elements wide), so they stay fp16. The
-                # FP8 projections are only excluded when ``fp8_linear_attn`` is off; otherwise
-                # they are replaced by ``MatMulBlockQuantizedFp8Weight`` and never reach the
-                # int4/int8 quantizer. Without this they would be re-quantized to int4, far
-                # from the source.
-                if self.use_original_fp8_weights:
-                    linear_projs = ["in_proj_a", "in_proj_b"]
-                    if not self.fp8_linear_attn:
-                        linear_projs += ["in_proj_qkv", "in_proj_z", "out_proj"]
-                    for proj in linear_projs:
-                        linear_node = f"/model/layers.{i}/linear_attn/{proj}/MatMul"
-                        if linear_node not in nodes_to_exclude:
-                            nodes_to_exclude.append(linear_node)
-                    # Diagnostic: keep excluded attention layers' q/k/v/o at fp16 (skip both
-                    # FP8 and int4), to isolate that layer's FP8 quantization error.
-                    if i in self.fp8_attn_exclude_layers:
-                        for proj in ("q_proj", "k_proj", "v_proj", "o_proj"):
-                            attn_node = f"/model/layers.{i}/attn/{proj}/MatMul"
-                            if attn_node not in nodes_to_exclude:
-                                nodes_to_exclude.append(attn_node)
-                # Diagnostic: keep excluded layers' NVFP4 shared-expert projections at fp16
-                # (skip both MatMulBlockQuantizedFp4Weight and int4), to isolate the shared expert from QMoE.
-                if i in self.nvfp4_dense_exclude_layers:
-                    for proj in ("gate_proj", "up_proj", "down_proj"):
-                        se_node = f"/model/layers.{i}/shared_expert/{proj}/MatMul"
-                        if se_node not in nodes_to_exclude:
-                            nodes_to_exclude.append(se_node)
-            # Diagnostic: keep the NVFP4 lm_head at fp16 (skip MatMulBlockQuantizedFp4Weight and int4).
-            if self.nvfp4_lmhead_fp16 and "/lm_head/MatMul" not in nodes_to_exclude:
-                nodes_to_exclude.append("/lm_head/MatMul")
 
         # MTP (multi-token prediction) self-speculative head.
         # When ``enable_mtp`` is set, an auxiliary ``mtp.onnx`` model is exported
@@ -2592,247 +2903,6 @@ class Qwen35MoeTextModel(Qwen35TextModel):
             return 1  # TensorProto.FLOAT
         # GemmFloat8 supports float/float16/bfloat16 outputs. Fall back to fp16.
         return 10
-
-    def _fp8_weight_key_for_matmul(self, basename):
-        m = re.match(r"^/model/layers\.(\d+)/(attn|linear_attn)/([^/]+)/MatMul$", basename)
-        if not m:
-            return None
-        layer_id = int(m.group(1))
-        attn_kind = m.group(2)
-        proj = m.group(3)
-
-        if attn_kind == "attn":
-            if proj not in {"q_proj", "k_proj", "v_proj", "o_proj"}:
-                return None
-            if layer_id in getattr(self, "fp8_attn_exclude_layers", ()):
-                return None
-            return f"model.language_model.layers.{layer_id}.self_attn.{proj}"
-
-        # GatedDeltaNet: only in_proj_qkv / in_proj_z / out_proj are stored as FP8 in the
-        # ModelOpt checkpoint (they carry .input_scale + .weight_scale). in_proj_a / in_proj_b
-        # are BF16 and only 32 elements wide, so they stay on the float path.
-        if proj not in {"in_proj_qkv", "in_proj_z", "out_proj"}:
-            return None
-        if not getattr(self, "fp8_linear_attn", False):
-            return None
-        return f"model.language_model.layers.{layer_id}.linear_attn.{proj}"
-
-    def _fp8_attention_input_scale(self, basename):
-        """Return the checkpoint's calibrated static per-tensor FP8 activation scale, or ``None``.
-
-        ``MatMulBlockQuantizedFp8Weight`` consumes the activation in FP16/BF16 and takes an
-        optional fp32 *scalar* ``a_scale``; when present it statically quantizes the activation
-        to FP8 E4M3 and dequantizes it back inside the kernel (``a_deq = fp8(A / a_scale) *
-        a_scale``), reproducing the checkpoint's W8A8 numerics. No ONNX-level quantization
-        subgraph is therefore needed.
-
-        Returns ``None`` when static calibration is disabled or the checkpoint has no
-        ``input_scale`` for this module. The op then runs weight-only (W8A16), keeping the
-        activation at full FP16/BF16 precision — strictly more accurate than the previous
-        dynamic per-token absmax fallback.
-        """
-        if not getattr(self, "fp8_attn_static_input_scale", False):
-            return None
-        key_prefix = self._fp8_weight_key_for_matmul(basename)
-        if key_prefix is None:
-            return None
-        if ".linear_attn." in key_prefix and not getattr(self, "fp8_linear_attn_static_input_scale", False):
-            # Weight-only (W8A16) for the GatedDeltaNet projections; see __init__.
-            return None
-        try:
-            return float(self._load_nvfp4_tensor(f"{key_prefix}.input_scale").float().reshape(-1)[0])
-        except Exception:
-            return None
-
-    def _make_fp8_activation_scale_initializer(self, basename, scale_val):
-        """Create (or reuse) the fp32 scalar ``a_scale`` initializer for an FP8 attention matmul.
-
-        Q/K/V consume the same activation and, in ModelOpt checkpoints, commonly share one
-        calibrated input scale. ``share_fp8_attn_qkv_activation`` reuses a single initializer
-        for every module with the same scale value instead of serializing one per projection.
-        """
-        share = getattr(self, "share_fp8_attn_qkv_activation", False)
-        if share:
-            cached = self._fp8_attention_activation_cache.get(scale_val)
-            if cached is not None:
-                return cached
-            name = f"model.fp8_attn_input_scale.{len(self._fp8_attention_activation_cache)}"
-        else:
-            name = f"{basename[1:].replace('/', '.')}.fp8_input_scale"
-        self.make_initializer(torch.tensor([scale_val], dtype=torch.float32), name, to=ir.DataType.FLOAT)
-        if share:
-            self._fp8_attention_activation_cache[scale_val] = name
-        return name
-
-    def _prepare_matmul_block_quantized_scales(self, weight_scale, out_features, block_count):
-        # MatMulBlockQuantizedFp8Weight expects b_scale of shape [N, ceil(K / block_size)] = [out_features, block_count].
-        scale = weight_scale.float()
-        if scale.numel() == 1:
-            return scale.reshape(1, 1).expand(out_features, block_count).contiguous()
-        if scale.ndim >= 2 and scale.shape[0] == out_features:
-            scale = scale.reshape(out_features, -1)
-            if scale.shape[1] == block_count:
-                return scale.contiguous()
-        if scale.ndim >= 2 and scale.shape[0] == block_count:
-            scale = scale.reshape(block_count, -1)
-            if scale.shape[1] == out_features:
-                return scale.transpose(0, 1).contiguous()
-        if scale.ndim == 1 and scale.numel() == out_features * block_count:
-            return scale.view(out_features, block_count).contiguous()
-        return None
-
-    def _make_fp8_attention_matmul(self, basename, root_input, **kwargs):
-        if not self.use_original_fp8_weights:
-            return None
-
-        key_prefix = self._fp8_weight_key_for_matmul(basename)
-        if key_prefix is None:
-            return None
-
-        try:
-            weight = self._load_nvfp4_tensor(f"{key_prefix}.weight")
-            weight_scale = self._load_nvfp4_tensor(f"{key_prefix}.weight_scale")
-        except Exception:
-            return None
-
-        if weight.dtype != torch.float8_e4m3fn:
-            return None
-
-        output = "logits" if kwargs.get("logits", False) else f"{basename}/output_0"
-        seq_dim = kwargs.get("seq_dim", "sequence_length")
-        in_features = int(weight.shape[1])
-        out_features = int(weight.shape[0])
-
-        # Per-tensor weight scale: block_size == K, so ceil(K / block_size) == 1 K-block.
-        # The source ModelOpt checkpoint quantizes these projections with a per-tensor FP8
-        # weight scale and a per-tensor activation ``input_scale``, so a single block matches
-        # the original W8A8 scheme exactly.
-        block_size = in_features
-        block_count = 1
-
-        scale_b = self._prepare_matmul_block_quantized_scales(weight_scale, out_features, block_count)
-        if scale_b is None:
-            return None
-
-        # MatMulBlockQuantizedFp8Weight takes B as [N, K] (row-major weight), so the checkpoint
-        # weight (already [N, K] = [out, in]) is fed through without transposition.
-        weight_name = f"{basename[1:].replace('/', '.')}.fp8_weight"
-        self.make_initializer(weight.contiguous(), weight_name)
-
-        scale_b_name = f"{basename[1:].replace('/', '.')}.fp8_weight_scale"
-        self.make_initializer(scale_b, scale_b_name, to=ir.DataType.FLOAT)
-
-        # The activation is passed through unquantized; the op applies the optional scalar
-        # ``a_scale`` internally. Output type follows A, so no bf16 -> io_dtype cast is needed.
-        inputs = [root_input, weight_name, scale_b_name]
-        static_scale_val = self._fp8_attention_input_scale(basename)
-        if static_scale_val is not None:
-            inputs.append(self._make_fp8_activation_scale_initializer(basename, static_scale_val))
-
-        self.make_node(
-            "MatMulBlockQuantizedFp8Weight",
-            inputs=inputs,
-            outputs=[output],
-            name=basename,
-            domain="com.microsoft",
-            block_size=block_size,
-        )
-        self.make_value(output, self.io_dtype, shape=["batch_size", seq_dim, out_features])
-        return basename
-
-    def _nvfp4_dense_key_for_matmul(self, basename):
-        """Map a dense MatMul basename to its ModelOpt NVFP4 checkpoint key prefix.
-
-        Only the modules stored as NVFP4 in the checkpoint (the shared-expert MLP
-        projections and the lm_head) are eligible for the ``MatMulBlockQuantizedFp4Weight`` op.
-        """
-        if basename == "/lm_head/MatMul":
-            return "lm_head"
-        if getattr(self, "is_mtp_head", False):
-            return None
-        m = re.match(r"^/model/layers\.(\d+)/shared_expert/(gate_proj|up_proj|down_proj)/MatMul$", basename)
-        if m:
-            layer_id = int(m.group(1))
-            proj = m.group(2)
-            return f"model.language_model.layers.{layer_id}.mlp.shared_expert.{proj}"
-        return None
-
-    def _make_matmul_nvfp4(self, basename, root_input, **kwargs):
-        """Emit a weight-only ``MatMulBlockQuantizedFp4Weight`` node from the raw ModelOpt NVFP4 tensors.
-
-        The checkpoint stores these projections as packed NVFP4: ``weight`` uint8 ``[N, K/2]``
-        (two E2M1 codes per byte, low nibble first), ``weight_scale`` E4M3 ``[N, K/16]`` block
-        scales, and a scalar ``weight_scale_2`` fp32 global scale -- exactly the layout the
-        ``MatMulBlockQuantizedFp4Weight`` op consumes, so the tensors are fed through unmodified. Returns the node
-        name, or ``None`` to fall back to the standard (int4/int8/fp16) path when the option is
-        off, the module is not NVFP4-eligible, or the tensors are absent/non-NVFP4 (e.g. the
-        BF16 MTP head).
-        """
-        if not self.use_original_nvfp4_weights:
-            return None
-
-        key_prefix = self._nvfp4_dense_key_for_matmul(basename)
-        if key_prefix is None:
-            return None
-
-        # Diagnostic: keep excluded shared-expert layers / lm_head at fp16 (skip MatMulBlockQuantizedFp4Weight).
-        if key_prefix == "lm_head":
-            if self.nvfp4_lmhead_fp16:
-                return None
-        else:
-            m = re.match(r"^model\.language_model\.layers\.(\d+)\.mlp\.shared_expert\.", key_prefix)
-            if m and int(m.group(1)) in self.nvfp4_dense_exclude_layers:
-                return None
-
-        try:
-            weight = self._load_nvfp4_tensor(f"{key_prefix}.weight")
-            weight_scale = self._load_nvfp4_tensor(f"{key_prefix}.weight_scale")
-            weight_scale_2 = self._load_nvfp4_tensor(f"{key_prefix}.weight_scale_2")
-        except Exception:
-            return None
-
-        # Only the packed NVFP4 (uint8) modules take this path. Modules stored as BF16
-        # (e.g. the MTP head's shared expert / lm_head) fall back to the standard path.
-        if weight.dtype != torch.uint8:
-            return None
-
-        out_features = int(weight.shape[0])       # N
-        block_size = 16
-
-        seq_dim = kwargs.get("seq_dim", "sequence_length")
-        output = "logits" if kwargs.get("logits", False) else f"{basename}/output_0"
-
-        prefix = basename[1:].replace("/", ".")
-        weight_name = f"{prefix}.nvfp4_weight"
-        self.make_initializer(weight.to(torch.uint8), weight_name)
-
-        scale_name = f"{prefix}.nvfp4_weight_scale"
-        self.make_initializer(weight_scale.view(torch.uint8), scale_name)
-
-        global_scale_name = f"{prefix}.nvfp4_weight_scale_2"
-        self.make_initializer(weight_scale_2.float().reshape(1), global_scale_name)
-
-        # ``N`` and ``K`` are derived by the op from the weight shape (N = B.shape[0],
-        # K = 2 * B.shape[1]), so only ``block_size`` is passed as an attribute.
-        self.make_node(
-            "MatMulBlockQuantizedFp4Weight",
-            inputs=[root_input, weight_name, scale_name, global_scale_name],
-            outputs=[output],
-            name=basename,
-            domain="com.microsoft",
-            block_size=block_size,
-        )
-        self.make_value(output, self.io_dtype, shape=["batch_size", seq_dim, out_features])
-        return basename
-
-    def make_matmul_op(self, matmul, basename, root_input, **kwargs):
-        fp8_name = self._make_fp8_attention_matmul(basename, root_input, **kwargs)
-        if fp8_name is not None:
-            return fp8_name
-        nvfp4_name = self._make_matmul_nvfp4(basename, root_input, **kwargs)
-        if nvfp4_name is not None:
-            return nvfp4_name
-        return super().make_matmul_op(matmul, basename, root_input, **kwargs)
 
     def make_model(self, input_path):
         # Build the main decoder model first.
@@ -3122,55 +3192,6 @@ class Qwen35MoeTextModel(Qwen35TextModel):
     # ------------------------------------------------------------------
     # NVFP4 (Model Optimizer) pre-quantized expert loading
     # ------------------------------------------------------------------
-    def _nvfp4_snapshot_dir(self):
-        """Locate the source checkpoint directory (local dir or HF snapshot)."""
-        cached = getattr(self, "_nvfp4_snapshot_dir_cache", None)
-        if cached is not None:
-            return cached
-        from pathlib import Path
-
-        model_path = Path(self.model_name_or_path)
-        if model_path.is_dir():
-            self._nvfp4_snapshot_dir_cache = model_path
-            return model_path
-        from huggingface_hub import snapshot_download
-
-        self._nvfp4_snapshot_dir_cache = Path(
-            snapshot_download(self.model_name_or_path, cache_dir=self.cache_dir, token=self.hf_token, local_files_only=True)
-        )
-        return self._nvfp4_snapshot_dir_cache
-
-    def _nvfp4_weight_map(self):
-        cached = getattr(self, "_nvfp4_weight_map_cache", "unset")
-        if cached != "unset":
-            return cached
-        import json
-
-        index_path = self._nvfp4_snapshot_dir() / "model.safetensors.index.json"
-        self._nvfp4_weight_map_cache = json.load(open(index_path))["weight_map"] if index_path.exists() else None
-        return self._nvfp4_weight_map_cache
-
-    def _load_nvfp4_tensor(self, tensor_name):
-        """Read a raw tensor from the source safetensors (bypasses transformers)."""
-        from safetensors import safe_open
-
-        snapshot_dir = self._nvfp4_snapshot_dir()
-        weight_map = self._nvfp4_weight_map()
-        handles = getattr(self, "_nvfp4_handles", None)
-        if handles is None:
-            handles = self._nvfp4_handles = {}
-            self._nvfp4_handle_keys = {}
-        files = [snapshot_dir / weight_map[tensor_name]] if weight_map is not None else sorted(snapshot_dir.glob("*.safetensors"))
-        for f in files:
-            key = str(f)
-            handle = handles.get(key)
-            if handle is None:
-                handle = handles[key] = safe_open(f, framework="pt", device="cpu")
-                self._nvfp4_handle_keys[key] = set(handle.keys())
-            if tensor_name in self._nvfp4_handle_keys[key]:
-                return handle.get_tensor(tensor_name)
-        raise RuntimeError(f"NVFP4 tensor '{tensor_name}' not found under {snapshot_dir}.")
-
     def make_nvfp4_moe_initializers(
         self, layer_id,
         gate_up_weight_name, gate_up_scales_name, gate_up_global_name,

@@ -1701,6 +1701,28 @@ class ModeloptDecoderLayer:
         return self.input_layernorm.weight is None
 
 
+class _LazyDequantLinear:
+    """Linear module whose ``weight`` is dequantized from the checkpoint on first access.
+
+    Builders that emit the checkpoint's NVFP4/FP8 tensors verbatim (``use_original_nvfp4_weights``
+    / ``use_original_fp8_weights``) never read ``weight``, so materializing every projection in
+    fp16 up front would cost tens of GB of host memory and a full dequantization pass for
+    nothing.
+    """
+
+    def __init__(self, owner, base):
+        self._owner = owner
+        self._base = base
+        self.bias = None
+
+    @property
+    def weight(self):
+        cached = self.__dict__.get("_weight")
+        if cached is None:
+            cached = self.__dict__["_weight"] = self._owner._dequant_linear(self._base)
+        return cached
+
+
 class ModeloptModel(QuantizedModel):
     """Loader for NVIDIA Model Optimizer NVFP4 + FP8 mixed-precision checkpoints."""
 
@@ -1772,11 +1794,9 @@ class ModeloptModel(QuantizedModel):
         return weight.to(torch.bfloat16)
 
     def _linear_module(self, base):
-        weight = self._dequant_linear(base)
-        if weight is None:
+        if self._get(f"{base}.weight") is None:
             return None
-        module = TensorModule()
-        module.weight = weight
+        module = _LazyDequantLinear(self, base)
         bias = self._get(f"{base}.bias")
         if bias is not None:
             module.bias = bias
@@ -1817,16 +1837,23 @@ class ModeloptModel(QuantizedModel):
             layer.self_attn = sa
 
         mlp = ns()
-        mlp.gate = self._tensor_module(f"{p}.mlp.gate.weight")
-        shared = ns()
-        shared.gate_proj = self._linear_module(f"{p}.mlp.shared_expert.gate_proj")
-        shared.up_proj = self._linear_module(f"{p}.mlp.shared_expert.up_proj")
-        shared.down_proj = self._linear_module(f"{p}.mlp.shared_expert.down_proj")
-        mlp.shared_expert = shared
-        mlp.shared_expert_gate = self._tensor_module(f"{p}.mlp.shared_expert_gate.weight")
-        # Routed experts are streamed from raw safetensors by the builder's
-        # make_nvfp4_moe_initializers(); nothing to materialize here.
-        mlp.experts = None
+        if self._get(f"{p}.mlp.gate_proj.weight") is not None:
+            # Dense SwiGLU MLP (e.g. Qwen3.6-27B).
+            mlp.gate_proj = self._linear_module(f"{p}.mlp.gate_proj")
+            mlp.up_proj = self._linear_module(f"{p}.mlp.up_proj")
+            mlp.down_proj = self._linear_module(f"{p}.mlp.down_proj")
+        else:
+            # MoE: router + always-on shared expert (e.g. Qwen3.6-35B-A3B).
+            mlp.gate = self._tensor_module(f"{p}.mlp.gate.weight")
+            shared = ns()
+            shared.gate_proj = self._linear_module(f"{p}.mlp.shared_expert.gate_proj")
+            shared.up_proj = self._linear_module(f"{p}.mlp.shared_expert.up_proj")
+            shared.down_proj = self._linear_module(f"{p}.mlp.shared_expert.down_proj")
+            mlp.shared_expert = shared
+            mlp.shared_expert_gate = self._tensor_module(f"{p}.mlp.shared_expert_gate.weight")
+            # Routed experts are streamed from raw safetensors by the builder's
+            # make_nvfp4_moe_initializers(); nothing to materialize here.
+            mlp.experts = None
         layer.mlp = mlp
         return layer
 
