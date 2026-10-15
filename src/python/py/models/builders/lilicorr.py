@@ -220,21 +220,26 @@ class LiLiCorrBuilder(DFlash2Builder):
         name = "/lm_head/MatMul"
         output = self.out(name)
         q8 = self.weights.get("lm_head.q8_0")
-        if q8 is not None and self.lm_head_precision == "int8":
+        if q8 is not None and self.lm_head_precision in ("int8", "int8_bolt"):
             q, d = q8
             self.make_initializer(q, "lm_head.MatMul.weight_Q8")
             self.make_initializer(d, "lm_head.MatMul.weight_scales", to=self.io_dtype)
-            self.make_node(
-                "MatMulNBits",
-                [root, "lm_head.MatMul.weight_Q8", "lm_head.MatMul.weight_scales"],
-                [output],
-                name=name,
-                domain="com.microsoft",
-                bits=8,
-                block_size=32,
-                K=self.hidden_size,
-                N=self.vocab_size,
-            )
+            if self.lm_head_precision == "int8_bolt":
+                # tensor-core skinny GEMM of nemotron_ops (libbolt_ops.so); ORT's MatMulNBits dequantises the whole head for M > 1
+                self.graph.opset_imports["bolt"] = 1
+                self.make_node("Q8Gemv", [root, "lm_head.MatMul.weight_Q8", "lm_head.MatMul.weight_scales"], [output], name=name, domain="bolt")
+            else:
+                self.make_node(
+                    "MatMulNBits",
+                    [root, "lm_head.MatMul.weight_Q8", "lm_head.MatMul.weight_scales"],
+                    [output],
+                    name=name,
+                    domain="com.microsoft",
+                    bits=8,
+                    block_size=32,
+                    K=self.hidden_size,
+                    N=self.vocab_size,
+                )
         else:
             if q8 is not None:
                 q, d = q8
@@ -500,7 +505,7 @@ def main():
     ap.add_argument("--paged_block_size", type=int, default=256)
     ap.add_argument("--num_draft_tokens", type=int, default=None)
     ap.add_argument("--precision", default="bf16", choices=["bf16", "int4", "int8"])
-    ap.add_argument("--lm_head_precision", default="int8", choices=["int8", "bf16"])
+    ap.add_argument("--lm_head_precision", default="int8", choices=["int8", "int8_bolt", "bf16"], help="int8_bolt needs libbolt_ops.so at runtime")
     ap.add_argument("--filename", default="dflash2.onnx")
     a = ap.parse_args()
     os.makedirs(a.output_dir, exist_ok=True)
