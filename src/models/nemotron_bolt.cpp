@@ -4,6 +4,7 @@
 #include "engine/request.h"
 #include "search.h"
 
+#include <array>
 #include <limits>
 #include <set>
 
@@ -265,7 +266,7 @@ NemotronBoltState::NemotronBoltState(const NemotronBoltModel& model, const Gener
 
   // The view is zero-copy: DFlash2 packs only the committed rows, never the padded/rejected ones.
   auto& aux = *tensors_.at("aux_hidden_states");
-  const int64_t shape[]{8, static_cast<int64_t>(model.aux_width_)};
+  const std::array<int64_t, 2> shape{8, static_cast<int64_t>(model.aux_width_)};
   aux_view_ = std::make_unique<Tensor>(OrtValue::CreateTensor(
       *model.p_device_->GetMemoryInfo(), aux.GetMutableRawData(), aux.GetByteSpan().size(),
       shape, aux.GetType()));
@@ -276,7 +277,8 @@ NemotronBoltState::NemotronBoltState(const NemotronBoltModel& model, const Gener
   const size_t max_prefill_rows =
       ((std::max(drafter_->ContextWindow(), kBoltVerifyRows) + kBoltVerifyRows - 1) / kBoltVerifyRows + 1) *
       kBoltVerifyRows;
-  const int64_t prefill_shape[]{static_cast<int64_t>(max_prefill_rows), static_cast<int64_t>(model.aux_width_)};
+  const std::array<int64_t, 2> prefill_shape{static_cast<int64_t>(max_prefill_rows),
+                                             static_cast<int64_t>(model.aux_width_)};
   prefill_aux_ = std::make_unique<Tensor>(model.p_device_, aux.GetType());
   prefill_aux_->CreateTensor(prefill_shape, true);
   Reset();

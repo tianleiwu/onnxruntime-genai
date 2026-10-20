@@ -594,10 +594,10 @@ Dflash2Drafter::Dflash2Drafter(std::shared_ptr<Dflash2Model> model, size_t paged
       t->p_device_ = device;
       return t;
     };
-    const int64_t block_shape[]{static_cast<int64_t>(block_size)};
-    const int64_t one_shape[]{1};
-    const int64_t two_shape[]{2};
-    const int64_t tok_shape[]{static_cast<int64_t>(fixed_tokens)};
+    const std::array<int64_t, 1> block_shape{static_cast<int64_t>(block_size)};
+    const std::array<int64_t, 1> one_shape{1};
+    const std::array<int64_t, 1> two_shape{2};
+    const std::array<int64_t, 1> tok_shape{static_cast<int64_t>(fixed_tokens)};
     step_tensors_.fixed_input_ids = make_view(
         base, block_size * sizeof(int64_t), block_shape, Ort::TypeToTensorType<int64_t>);
     step_tensors_.fixed_block_row_index = make_view(
@@ -619,9 +619,9 @@ Dflash2Drafter::Dflash2Drafter(std::shared_ptr<Dflash2Model> model, size_t paged
     step_tensors_.fixed_outputs_span = device->Allocate<uint32_t>(cand_stride + score_words);
     step_tensors_.fixed_outputs_span.CpuSpan();
     uint32_t* out_base = step_tensors_.fixed_outputs_span.Span().data();
-    const int64_t cand_shape[]{1, static_cast<int64_t>(num_spec), static_cast<int64_t>(top_k)};
-    const int64_t score_shape[]{1, static_cast<int64_t>(num_spec), static_cast<int64_t>(top_k),
-                                static_cast<int64_t>(top_k)};
+    const std::array<int64_t, 3> cand_shape{1, static_cast<int64_t>(num_spec), static_cast<int64_t>(top_k)};
+    const std::array<int64_t, 4> score_shape{1, static_cast<int64_t>(num_spec), static_cast<int64_t>(top_k),
+                                             static_cast<int64_t>(top_k)};
     step_tensors_.candidate_ids = make_view(
         out_base, cand_words * sizeof(int32_t), cand_shape, int32_type);
     step_tensors_.scores = make_view(
