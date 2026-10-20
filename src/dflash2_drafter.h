@@ -136,6 +136,7 @@ struct Dflash2Drafter {
 
   size_t NumDraftTokens() const { return static_cast<size_t>(config_.num_draft_tokens); }
   size_t AdmissionMisses() const { return admission_misses_; }
+  size_t ContextWindow() const noexcept { return context_window_; }
 
   /**
    * @brief Ingests every served feed's context and drafts for the ones that asked.
@@ -214,6 +215,17 @@ struct Dflash2Drafter {
     std::unique_ptr<Tensor> attention_metadata;
     std::unique_ptr<Tensor> candidate_ids;
     std::unique_ptr<Tensor> scores;
+    DeviceSpan<int32_t> fixed_inputs_span;
+    std::unique_ptr<Tensor> fixed_input_ids;
+    std::unique_ptr<Tensor> fixed_block_row_index;
+    std::unique_ptr<Tensor> fixed_anchor_row_index;
+    std::unique_ptr<Tensor> fixed_cumulative_sequence_lengths;
+    std::unique_ptr<Tensor> fixed_past_sequence_lengths;
+    std::unique_ptr<Tensor> fixed_q_row_map;
+    std::unique_ptr<Tensor> fixed_qkv_row_map;
+    DeviceSpan<uint32_t> fixed_outputs_span;
+    std::vector<int32_t> last_block_table_ring;
+    size_t last_block_table_columns{};
   } step_tensors_;
   // Block-table widths are bucketed to powers of two up to this cap so that a growing context
   // reuses a captured graph instead of retiring one per block boundary.
